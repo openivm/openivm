@@ -2805,6 +2805,27 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 	return metadata_op;
 }
 
+static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &facts) {
+	unordered_set<string> sources;
+	for (auto *join : facts.outer_joins) {
+		for (idx_t child = 0; child < 2; child++) {
+			if ((join->join_type == JoinType::LEFT && child == 0) ||
+			    (join->join_type == JoinType::RIGHT && child == 1)) {
+				continue;
+			}
+			auto *subtree = GetPlanNodeFacts(facts, join->children[child].get());
+			D_ASSERT(subtree);
+			for (auto index : subtree->subtree_table_indices) {
+				auto source = facts.occurrence_by_index.find(index);
+				if (source != facts.occurrence_by_index.end()) {
+					sources.insert(OccurrenceKey(source->second.table, source->second.occurrence));
+				}
+			}
+		}
+	}
+	return sources;
+}
+
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
@@ -2915,8 +2936,24 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 	}
 
+	// A lookup only sees matching base rows. It cannot report a NULL partition
+	// introduced on the nullable side. Each occurrence also needs coverage, even
+	// when several aliases share a single recorded delta table.
+	unordered_map<string, unordered_set<string>> covered;
 	for (auto &op : ops) {
-		out.push_back(ToMetadataWindowLineageOp(op));
+		covered[StringUtil::Lower(op.output_col)].insert(OccurrenceKey(op.source_table, op.source_occurrence));
+	}
+	auto nullable_sources = NullExtendedWindowSources(facts);
+	for (auto &op : direct_ops) {
+		if (nullable_sources.count(OccurrenceKey(op.source_table, op.source_occurrence))) {
+			covered.erase(StringUtil::Lower(op.output_col));
+		}
+	}
+	for (auto &op : ops) {
+		auto coverage = covered.find(StringUtil::Lower(op.output_col));
+		if (coverage != covered.end() && coverage->second.size() == facts.source_occurrences.size()) {
+			out.push_back(ToMetadataWindowLineageOp(op));
+		}
 	}
 	return !out.empty();
 }

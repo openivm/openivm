@@ -886,3 +886,36 @@ WHERE operation = 'refresh' AND sql LIKE '%openivm_changed_rows%'
 AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_window_cross_mv');
 ----
 true
+
+# Looking up a preserved row on the nullable side cannot discover the NULL
+# partition when the join has no match.
+statement ok
+CREATE TABLE nullable_window_left (id INT, v INT);
+CREATE TABLE nullable_window_right (id INT, "p=key" INT);
+INSERT INTO nullable_window_left VALUES (1,10),(2,20);
+INSERT INTO nullable_window_right VALUES (2,200);
+CREATE VIEW nullable_window_expected AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id;
+CREATE MATERIALIZED VIEW nullable_window_mv AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id;
+
+statement ok
+INSERT INTO nullable_window_left VALUES (3,30),(4,40);
+UPDATE nullable_window_left SET v=111 WHERE id=1;
+DELETE FROM nullable_window_left WHERE id=4;
+
+statement ok
+PRAGMA refresh('nullable_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM nullable_window_mv EXCEPT ALL FROM nullable_window_expected)
+    UNION ALL
+    (FROM nullable_window_expected EXCEPT ALL FROM nullable_window_mv)
+);
+----
+0
