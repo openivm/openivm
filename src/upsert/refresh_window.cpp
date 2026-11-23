@@ -395,13 +395,12 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
                                                 const vector<string> &delta_table_names,
                                                 const vector<string> &partition_cols, const string &view_catalog_name,
                                                 const string &view_schema_name, const string &attached_db_catalog_name,
-                                                const string &attached_db_schema_name, string &affected_keys_sql,
-                                                string &key_cols) {
+                                                const string &attached_db_schema_name, string &affected_keys_sql) {
 	if (partition_cols.size() != 1) {
 		return false;
 	}
 	auto parsed = RefreshMetadata::ParseWindowColumn(partition_cols[0]);
-	key_cols = SqlUtils::QuoteIdentifier(parsed.first);
+	auto key_cols = SqlUtils::QuoteIdentifier(parsed.first);
 
 	vector<DuckLakeSourceSpec> specs;
 	if (!BuildDuckLakeSourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name, view_schema_name,
@@ -496,17 +495,31 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 	return upsert_query;
 }
 
-static string BuildMultiSourceDuckLakeWindowRefresh(
+static string BuildChangedWindowPartitionsSQL(const string &data_table, const string &view_query_sql,
+                                              const vector<string> &partition_cols) {
+	auto key_cols = SqlUtils::JoinQuotedColumns(PartitionOutputColumns(partition_cols));
+	// Read the previous result from the backing table. EXCEPT ALL also
+	// detects changes in duplicate counts when the distinct rows are equal.
+	return "WITH openivm_window_current AS (" + view_query_sql + "), openivm_window_previous AS (SELECT * FROM " +
+	       data_table + " openivm_old_rows) SELECT DISTINCT " + key_cols +
+	       " FROM ((SELECT * FROM openivm_window_current EXCEPT ALL SELECT * FROM openivm_window_previous) UNION ALL "
+	       "(SELECT * FROM openivm_window_previous EXCEPT ALL SELECT * FROM openivm_window_current)) "
+	       "openivm_changed_rows";
+}
+
+static string BuildDuckLakeWindowRefreshWithLineage(
     RefreshMetadata &metadata, Connection &con, const string &view_name, const string &view_query_sql,
     const vector<string> &delta_table_names, const vector<string> &partition_cols, const string &data_table,
     const string &view_catalog_name, const string &view_schema_name, const string &attached_db_catalog_name,
     const string &attached_db_schema_name, RefreshPublicationScope *publication_scope) {
-	string key_cols;
 	string affected_keys;
 	string qtemp_affected = AffectedPartitionsTempTable(view_name);
-	if (BuildLineageDuckLakeAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition_cols,
+	// One tracked table can stand for several aliases of a self-join.
+	// Table-level lineage coverage cannot prove coverage for all aliases.
+	if (delta_table_names.size() > 1 &&
+	    BuildLineageDuckLakeAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition_cols,
 	                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
-	                                        attached_db_schema_name, affected_keys, key_cols)) {
+	                                        attached_db_schema_name, affected_keys)) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake lineage change-feed, %zu "
 		                    "sources)\n",
 		                    delta_table_names.size());
@@ -516,14 +529,7 @@ static string BuildMultiSourceDuckLakeWindowRefresh(
 		                                        partition_cols, publication_scope);
 	}
 
-	key_cols = SqlUtils::JoinQuotedColumns(PartitionOutputColumns(partition_cols));
-	string current_rows = "SELECT * FROM (" + view_query_sql + ") openivm_current_rows";
-	// At refresh start the MV data table is the last committed result. Diffing against it
-	// avoids replaying every DuckLake source at its previous snapshot just to find changed partitions.
-	string old_rows = "SELECT * FROM " + data_table + " openivm_old_rows";
-	string changed_rows = "((" + current_rows + ") EXCEPT ALL (" + old_rows + ")) UNION ALL ((" + old_rows +
-	                      ") EXCEPT ALL (" + current_rows + "))";
-	string fallback_affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") openivm_changed_rows";
+	auto fallback_affected_keys = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 	                    "partition cols, %zu sources)\n",
 	                    partition_cols.size(), delta_table_names.size());
@@ -539,28 +545,25 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system, bool emit_cascade_delta, bool running_window_incremental,
-                                   bool *uses_running_suffix, RefreshPublicationScope *publication_scope) {
+                                   bool cross_system, bool has_join, bool emit_cascade_delta,
+                                   bool running_window_incremental, bool *uses_running_suffix,
+                                   RefreshPublicationScope *publication_scope) {
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
 	auto partition_cols = metadata.GetWindowPartitionColumns(view_name);
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
-	auto partition_delta_specs =
-	    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);
 	bool any_ducklake = AnyDuckLakeSource(metadata, view_name, delta_table_names);
 	bool safe_for_snapdiff = IsSafeForDuckLakeSnapshotDiff(partition_cols, column_names, any_ducklake);
-	string affected_keys_sql;
-	bool have_lineage_affected_keys = false;
 
-	if (safe_for_snapdiff && delta_table_names.size() == 1) {
+	if (safe_for_snapdiff && delta_table_names.size() == 1 && !has_join) {
 		return BuildSingleSourceDuckLakeWindowRefresh(metadata, con, view_name, view_query_sql, partition_cols,
 		                                              order_cols, column_names, data_table, view_catalog_name,
 		                                              view_schema_name, attached_db_catalog_name,
 		                                              attached_db_schema_name, delta_table_names[0], publication_scope);
 	}
 	if (safe_for_snapdiff && any_ducklake) {
-		return BuildMultiSourceDuckLakeWindowRefresh(
+		return BuildDuckLakeWindowRefreshWithLineage(
 		    metadata, con, view_name, view_query_sql, delta_table_names, partition_cols, data_table, view_catalog_name,
 		    view_schema_name, attached_db_catalog_name, attached_db_schema_name, publication_scope);
 	}
@@ -569,16 +572,30 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		    "[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake, full recompute fallback)\n");
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
-	auto lineage_result = BuildLineageStandardAffectedKeysSQL(
-	    metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
-	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
-	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
+	string affected_keys_sql;
+	auto lineage_result =
+	    has_join && delta_table_names.size() == 1
+	        ? LineageAffectedKeysResult::UNAVAILABLE
+	        : BuildLineageStandardAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition_cols,
+	                                              delta_ts_filter, view_catalog_name, view_schema_name,
+	                                              attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
+	bool use_result_diff =
+	    has_join && lineage_result != LineageAffectedKeysResult::AVAILABLE && !partition_cols.empty();
+	if (use_result_diff) {
+		// Matching column names in delta tables do not prove a partition relationship.
+		affected_keys_sql = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols);
+		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION uses result-diff keys for '%s'\n", view_name.c_str());
+	} else if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",
 		                    view_name.c_str());
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
-	have_lineage_affected_keys = lineage_result == LineageAffectedKeysResult::AVAILABLE;
-	if (!have_lineage_affected_keys && delta_table_names.size() > 1 &&
+	vector<WindowPartitionDeltaSpec> partition_delta_specs;
+	if (!use_result_diff) {
+		partition_delta_specs =
+		    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);
+	}
+	if (affected_keys_sql.empty() && delta_table_names.size() > 1 &&
 	    !AllWindowPartitionSourcesCovered(delta_table_names, partition_delta_specs)) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage incomplete for '%s' (%zu sources) — full recompute "
 		                    "fallback\n",
@@ -586,7 +603,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols, lineage keys: %s)\n",
-	                    partition_cols.size(), have_lineage_affected_keys ? "yes" : "no");
+	                    partition_cols.size(), lineage_result == LineageAffectedKeysResult::AVAILABLE ? "yes" : "no");
 	vector<string> running_window_column_names = column_names;
 	if (running_window_incremental) {
 		auto internal_location = metadata.GetInternalLocation(view_name, view_catalog_name, view_schema_name);

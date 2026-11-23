@@ -1227,7 +1227,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	RefreshMetadata metadata(metadata_con);
 	auto delta_tables = metadata.GetDeltaTables(view_name);
 	DeltaActivityResult conservative_activity;
-	conservative_activity.has_join = metadata.HasJoin(view_name) || delta_tables.size() > 1;
+	conservative_activity.has_join = metadata.HasJoin(view_name);
 	conservative_activity.tables_with_changes = delta_tables.size();
 	conservative_activity.any_has_deletes = true;
 	conservative_activity.all_ducklake = false;

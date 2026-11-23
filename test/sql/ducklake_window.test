@@ -1532,3 +1532,35 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# A parent update in a self-join affects the child partitions even though the
+# lake tracks one physical source and the parent's own partition is unrelated.
+statement ok
+CREATE TABLE dl.quoted_window_hierarchy (id INT, parent INT, "p=key" INT, v INT);
+INSERT INTO dl.quoted_window_hierarchy VALUES (1,100,1,10),(2,100,1,20),(3,100,2,30),
+    (4,200,3,40),(100,NULL,999,99),(200,NULL,998,199);
+CREATE VIEW quoted_window_self_expected AS
+    SELECT a."p=key" AS pk, a.id, b.v,
+           row_number() OVER (PARTITION BY a."p=key" ORDER BY a.id) AS rn
+    FROM dl.quoted_window_hierarchy a JOIN dl.quoted_window_hierarchy b ON a.parent = b.id;
+CREATE MATERIALIZED VIEW dl.quoted_window_self_mv AS
+    SELECT a."p=key" AS pk, a.id, b.v,
+           row_number() OVER (PARTITION BY a."p=key" ORDER BY a.id) AS rn
+    FROM dl.quoted_window_hierarchy a JOIN dl.quoted_window_hierarchy b ON a.parent = b.id;
+
+statement ok
+INSERT INTO dl.quoted_window_hierarchy VALUES (101,NULL,997,100),(102,NULL,996,101);
+UPDATE dl.quoted_window_hierarchy SET v=105 WHERE id=100;
+DELETE FROM dl.quoted_window_hierarchy WHERE id=102;
+
+statement ok
+PRAGMA refresh('dl.quoted_window_self_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_window_self_mv EXCEPT ALL FROM quoted_window_self_expected)
+    UNION ALL
+    (FROM quoted_window_self_expected EXCEPT ALL FROM dl.quoted_window_self_mv)
+);
+----
+0
