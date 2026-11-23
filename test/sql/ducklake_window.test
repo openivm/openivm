@@ -1502,3 +1502,33 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Older versions stored an unprojected order column as a bare name in the list.
+statement ok
+CREATE TABLE dl.legacy_window_order (k INT, v INT, "json:sort" INT);
+INSERT INTO dl.legacy_window_order VALUES (1,10,1),(1,20,2),(2,30,3);
+CREATE VIEW legacy_window_expected AS
+    SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY "json:sort") AS rn
+    FROM dl.legacy_window_order;
+CREATE MATERIALIZED VIEW dl.legacy_window_mv AS
+    SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY "json:sort") AS rn
+    FROM dl.legacy_window_order;
+UPDATE openivm_views SET window_order_columns = 'json:["json:sort"]'
+WHERE view_sql_name = 'legacy_window_mv';
+
+statement ok
+INSERT INTO dl.legacy_window_order VALUES (1,5,0),(2,40,4);
+UPDATE dl.legacy_window_order SET v=25 WHERE v=20;
+DELETE FROM dl.legacy_window_order WHERE v IN (10,40);
+
+statement ok
+PRAGMA refresh('dl.legacy_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.legacy_window_mv EXCEPT ALL FROM legacy_window_expected)
+    UNION ALL
+    (FROM legacy_window_expected EXCEPT ALL FROM dl.legacy_window_mv)
+);
+----
+0

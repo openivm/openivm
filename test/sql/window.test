@@ -779,3 +779,70 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# A cast-only projection cannot identify the raw decimal partition.
+statement ok
+CREATE TABLE quoted_window_decimal ("p=key" DECIMAL(4,1), v INT);
+INSERT INTO quoted_window_decimal VALUES (1.1,10),(1.1,20),(1.2,17),(2,30);
+CREATE VIEW quoted_window_cast_expected AS
+    SELECT "p=key"::INT AS projected, v, row_number() OVER (PARTITION BY "p=key" ORDER BY v) AS rn
+    FROM quoted_window_decimal;
+CREATE MATERIALIZED VIEW quoted_window_cast_mv AS
+    SELECT "p=key"::INT AS projected, v, row_number() OVER (PARTITION BY "p=key" ORDER BY v) AS rn
+    FROM quoted_window_decimal;
+
+statement ok
+INSERT INTO quoted_window_decimal VALUES (1.1,5),(1.1,15);
+UPDATE quoted_window_decimal SET v=23 WHERE v=20;
+DELETE FROM quoted_window_decimal WHERE v=15;
+
+statement ok
+PRAGMA refresh('quoted_window_cast_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM quoted_window_cast_mv EXCEPT ALL FROM quoted_window_cast_expected)
+    UNION ALL
+    (FROM quoted_window_cast_expected EXCEPT ALL FROM quoted_window_cast_mv)
+);
+----
+0
+
+# The stored partition key must follow the bound left column even when a
+# different column with the same name is projected first.
+statement ok
+CREATE TABLE quoted_window_left (id INT, "p=key" INT);
+CREATE TABLE quoted_window_right (id INT, "p=key" INT, v INT);
+INSERT INTO quoted_window_left VALUES (1,1),(2,1),(3,2);
+INSERT INTO quoted_window_right VALUES (1,10,10),(2,20,20),(3,30,30);
+CREATE VIEW quoted_window_join_expected AS
+    SELECT b."p=key" AS unrelated, a."p=key" AS pk, b.v,
+           row_number() OVER (PARTITION BY a."p=key" ORDER BY b.v) AS rn
+    FROM quoted_window_left a JOIN quoted_window_right b USING (id);
+CREATE MATERIALIZED VIEW quoted_window_join_mv AS
+    SELECT b."p=key" AS unrelated, a."p=key" AS pk, b.v,
+           row_number() OVER (PARTITION BY a."p=key" ORDER BY b.v) AS rn
+    FROM quoted_window_left a JOIN quoted_window_right b USING (id);
+
+query T
+SELECT group_columns FROM openivm_views WHERE view_sql_name = 'quoted_window_join_mv';
+----
+pk=p=key
+
+statement ok
+INSERT INTO quoted_window_left VALUES (4,1),(5,2);
+INSERT INTO quoted_window_right VALUES (4,40,5),(5,50,50);
+UPDATE quoted_window_right SET v=23 WHERE id=2;
+DELETE FROM quoted_window_right WHERE id=5;
+
+statement ok
+PRAGMA refresh('quoted_window_join_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM quoted_window_join_mv EXCEPT ALL FROM quoted_window_join_expected)
+    UNION ALL
+    (FROM quoted_window_join_expected EXCEPT ALL FROM quoted_window_join_mv)
+);
+----
+0
