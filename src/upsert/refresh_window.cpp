@@ -544,7 +544,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
-	auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
+	auto partition_cols = metadata.GetWindowPartitionColumns(view_name);
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
 	auto partition_delta_specs =
 	    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);

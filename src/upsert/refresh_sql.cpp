@@ -880,7 +880,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
-	auto group_cols = metadata.GetGroupColumns(view_name);
+	auto group_cols = dispatch_refresh_type == RefreshType::WINDOW_PARTITION
+	                      ? metadata.GetWindowPartitionColumns(view_name)
+	                      : metadata.GetGroupColumns(view_name);
 	RefreshPublicationScope retained_publication_scope;
 	auto publication_scope = !publication_query.empty() && !global_publication && target_is_ducklake &&
 	                                 active_facts.target_dialect == SqlDialect::DUCKDB

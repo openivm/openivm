@@ -37,11 +37,13 @@ bool CanCreateGroupIndex(const vector<string> &groups, const vector<string> &nam
 	return true;
 }
 
-string ViewListSqlLiteralOrNull(const vector<string> &values) {
+string ViewListSqlLiteralOrNull(const vector<string> &values, bool window_columns) {
 	if (values.empty()) {
 		return "null";
 	}
-	return Value(RefreshMetadata::SerializeViewList(values)).ToSQLString();
+	return Value(window_columns ? RefreshMetadata::SerializeWindowColumns(values)
+	                            : RefreshMetadata::SerializeViewList(values))
+	    .ToSQLString();
 }
 
 // Read the caller's snapshot, including metadata inserted earlier in this

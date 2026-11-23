@@ -1710,6 +1710,7 @@ bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_p
 }
 
 static constexpr char VIEW_LIST_JSON_PREFIX[] = "json:";
+static constexpr char WINDOW_COLUMN_LIST_PREFIX[] = "json:{\"window_columns\":";
 
 string RefreshMetadata::SerializeViewList(const vector<string> &values) {
 	// Keep the original spelling of ordinary lists for readers of openivm_views.
@@ -1722,8 +1723,7 @@ string RefreshMetadata::SerializeViewList(const vector<string> &values) {
 	return StringUtil::Join(values, ",");
 }
 
-vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
-	auto text = ReadViewString(view_name, column);
+static vector<string> DecodeViewList(const string &text) {
 	if (StringUtil::StartsWith(text, VIEW_LIST_JSON_PREFIX)) {
 		return SqlUtils::ParseColumnList(text.substr(sizeof(VIEW_LIST_JSON_PREFIX) - 1));
 	}
@@ -1738,6 +1738,10 @@ vector<string> RefreshMetadata::ReadViewList(const string &view_name, const stri
 	return values;
 }
 
+vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
+	return DecodeViewList(ReadViewString(view_name, column));
+}
+
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
 	return ReadViewList(view_name, "group_columns");
 }
@@ -1749,6 +1753,12 @@ string RefreshMetadata::SerializeWindowColumn(const string &output, const string
 	return output + "=" + source;
 }
 
+static pair<string, string> ParseLegacyWindowColumn(const string &spec) {
+	auto separator = spec.find('=');
+	return separator == string::npos ? make_pair(spec, spec)
+	                                 : make_pair(spec.substr(0, separator), spec.substr(separator + 1));
+}
+
 pair<string, string> RefreshMetadata::ParseWindowColumn(const string &spec) {
 	if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
 		auto columns = SqlUtils::ParseColumnList(spec.substr(sizeof(VIEW_LIST_JSON_PREFIX) - 1));
@@ -1757,13 +1767,45 @@ pair<string, string> RefreshMetadata::ParseWindowColumn(const string &spec) {
 		}
 		return {std::move(columns[0]), std::move(columns[1])};
 	}
-	auto separator = spec.find('=');
-	return separator == string::npos ? make_pair(spec, spec)
-	                                 : make_pair(spec.substr(0, separator), spec.substr(separator + 1));
+	return ParseLegacyWindowColumn(spec);
+}
+
+string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns) {
+	for (const auto &spec : columns) {
+		if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
+			// Identify the format at the list level. A legacy column name can
+			// itself have exactly the same spelling as an encoded mapping.
+			return WINDOW_COLUMN_LIST_PREFIX + SqlUtils::JsonArray(columns) + "}";
+		}
+	}
+	return SerializeViewList(columns);
+}
+
+vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const string &column) {
+	auto text = ReadViewString(view_name, column);
+	if (StringUtil::StartsWith(text, WINDOW_COLUMN_LIST_PREFIX)) {
+		vector<string> columns;
+		if (!MetadataJson::ExtractJsonStringArray(text, "window_columns", columns)) {
+			throw InvalidInputException("Invalid OpenIVM window column list for view '%s'", view_name);
+		}
+		return columns;
+	}
+	auto columns = DecodeViewList(text);
+	for (auto &spec : columns) {
+		if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
+			auto legacy = ParseLegacyWindowColumn(spec);
+			spec = SerializeWindowColumn(legacy.first, legacy.second);
+		}
+	}
+	return columns;
+}
+
+vector<string> RefreshMetadata::GetWindowPartitionColumns(const string &view_name) {
+	return ReadWindowColumns(view_name, "group_columns");
 }
 
 vector<string> RefreshMetadata::GetWindowOrderColumns(const string &view_name) {
-	return ReadViewList(view_name, "window_order_columns");
+	return ReadWindowColumns(view_name, "window_order_columns");
 }
 
 vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {

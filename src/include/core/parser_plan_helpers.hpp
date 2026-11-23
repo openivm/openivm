@@ -150,8 +150,8 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                                bool include_first_aggregate);
-void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
-                                       const vector<string> &output_names);
+void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
+                              const vector<string> &output_names, bool order);
 string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,

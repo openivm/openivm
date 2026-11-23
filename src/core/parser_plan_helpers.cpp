@@ -2921,8 +2921,76 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	return !out.empty();
 }
 
-void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
-                                       const vector<string> &output_names) {
+// Scope refresh only when the stored output passes through the same source
+// value as the window key. A cast or a like-named join column can miss rows.
+static string FindQuotedWindowOutput(const CreateMVPlanFacts &facts, const LogicalProjection &projection,
+                                     const vector<string> &output_names, const string &name, bool order,
+                                     string &source_column) {
+	LogicalGet *source = nullptr;
+	ProjectionIndex source_index;
+	auto record_key = [&](const Expression &expr) {
+		if (!StringUtil::CIEquals(expr.GetName().GetIdentifierName(), name)) {
+			return true;
+		}
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		LogicalGet *get = nullptr;
+		ProjectionIndex index;
+		string column, cast;
+		if (!ResolveBindingToGetColumn(expr.Cast<BoundColumnRefExpression>().Binding(), facts, get, column, &index,
+		                               &cast) ||
+		    !cast.empty() || (source && (source != get || source_index != index))) {
+			return false;
+		}
+		source = get;
+		source_index = index;
+		source_column = std::move(column);
+		return true;
+	};
+	for (auto *window : facts.windows) {
+		for (auto &expression : window->expressions) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+				continue;
+			}
+			auto &bound = expression->Cast<BoundWindowExpression>();
+			if (order) {
+				for (auto &entry : bound.OrderBy()) {
+					if (!record_key(*entry.expression)) {
+						return "";
+					}
+				}
+			} else {
+				for (auto &entry : bound.Partitions()) {
+					if (!record_key(*entry)) {
+						return "";
+					}
+				}
+			}
+		}
+	}
+	for (idx_t i = 0; source && i < projection.expressions.size(); i++) {
+		auto &expr = *projection.expressions[i];
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
+		LogicalGet *get = nullptr;
+		ProjectionIndex index;
+		string column, cast;
+		if (ResolveBindingToGetColumn(column_ref.Binding(), facts, get, column, &index, &cast) && get == source &&
+		    index == source_index && cast.empty()) {
+			auto output = ProjectionOutputName(projection, i, facts, output_names, column_ref);
+			if (!output.empty() && !IncrementalTableNames::IsInternalColumn(output)) {
+				return output;
+			}
+		}
+	}
+	return "";
+}
+
+void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
+                              const vector<string> &output_names, bool order) {
 	if (partition_columns.empty()) {
 		return;
 	}
@@ -2931,7 +2999,23 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 		return;
 	}
 
+	vector<string> resolved;
 	for (auto &partition_column : partition_columns) {
+		if (partition_column.find('=') != string::npos) {
+			string source;
+			auto spine = ViewOutputSpine(facts.root);
+			auto output = spine.projections.empty()
+			                  ? string()
+			                  : FindQuotedWindowOutput(facts, *spine.projections.front(), output_names,
+			                                           partition_column, order, source);
+			if (!output.empty()) {
+				resolved.push_back(RefreshMetadata::SerializeWindowColumn(output, source));
+			} else if (order) {
+				partition_columns.clear();
+				return;
+			}
+			continue;
+		}
 		string output_column = partition_column;
 		for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
 			auto &expr = top_projection->expressions[expr_i];
@@ -2950,8 +3034,9 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 			}
 			break;
 		}
-		partition_column = RefreshMetadata::SerializeWindowColumn(output_column, partition_column);
+		resolved.push_back(RefreshMetadata::SerializeWindowColumn(output_column, partition_column));
 	}
+	partition_columns = std::move(resolved);
 }
 
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,

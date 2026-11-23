@@ -543,7 +543,7 @@ static bool RewriteLineageMeta(Connection &con, RefreshMetadata &metadata, const
 
 static bool RewriteWindowGroupColumnSources(Connection &con, RefreshMetadata &metadata, const string &view_name,
                                             const string &old_name, const string &new_name) {
-	auto group_columns = metadata.GetGroupColumns(view_name);
+	auto group_columns = metadata.GetWindowPartitionColumns(view_name);
 	if (group_columns.empty()) {
 		return false;
 	}
@@ -559,7 +559,7 @@ static bool RewriteWindowGroupColumnSources(Connection &con, RefreshMetadata &me
 		}
 	}
 	if (changed) {
-		UpdateViewMetadataValue(con, view_name, "group_columns", RefreshMetadata::SerializeViewList(rewritten));
+		UpdateViewMetadataValue(con, view_name, "group_columns", RefreshMetadata::SerializeWindowColumns(rewritten));
 	}
 	return changed;
 }

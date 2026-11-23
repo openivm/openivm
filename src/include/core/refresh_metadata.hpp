@@ -23,6 +23,7 @@ class RefreshMetadata {
 	// One column of a view's openivm_delta_tables row for `table_name`; NULL when missing.
 	Value ReadDeltaValue(const string &view_name, const string &table_name, const string &column);
 	vector<string> ReadViewList(const string &view_name, const string &column);
+	vector<string> ReadWindowColumns(const string &view_name, const string &column);
 
 public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
@@ -254,6 +255,8 @@ public:
 	// Window partition and order specs map a stored output column to its source column.
 	static string SerializeWindowColumn(const string &output, const string &source);
 	static pair<string, string> ParseWindowColumn(const string &spec);
+	static string SerializeWindowColumns(const vector<string> &columns);
+	vector<string> GetWindowPartitionColumns(const string &view_name);
 
 	// Get common window ORDER BY output/source mappings. Empty means the view
 	// predates this metadata or its window specifications do not share a simple key.
