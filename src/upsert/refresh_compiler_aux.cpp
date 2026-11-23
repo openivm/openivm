@@ -27,12 +27,6 @@ static string DeltaSourceRef(const string &source, const string &catalog_prefix)
 	return catalog_prefix + SqlUtils::QuoteIdentifier(source);
 }
 
-static string PartitionOutputColumn(const string &input) {
-	auto pos = input.find('=');
-	// Metadata stores a column name, not a qualified SQL identifier.
-	return pos == string::npos ? input : input.substr(0, pos);
-}
-
 static string BuildAffectedTableFilter(const vector<string> &columns, const string &outer_alias,
                                        const string &affected_table) {
 	string match = SqlUtils::BuildNullSafeMatch(columns, "openivm_aff", outer_alias);
@@ -173,7 +167,7 @@ static bool TryParseRunningWindowPlan(SelectNode &select, const vector<string> &
 	if (partition_columns.size() != 1 || !select.cte_map.map.empty()) {
 		return false;
 	}
-	plan.partition_column = PartitionOutputColumn(partition_columns[0]);
+	plan.partition_column = RefreshMetadata::ParseWindowColumn(partition_columns[0]).first;
 	for (auto &item : select.select_list) {
 		if (item->GetExpressionClass() == ExpressionClass::WINDOW) {
 			RunningWindowExpr expr;
@@ -269,7 +263,8 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 	}
 	auto window_count = output_names.size() - plan.passthrough_columns.size();
 	idx_t window_idx = 0;
-	string expected_partition = partition_columns.empty() ? "" : PartitionOutputColumn(partition_columns[0]);
+	string expected_partition =
+	    partition_columns.empty() ? "" : RefreshMetadata::ParseWindowColumn(partition_columns[0]).first;
 	string parsed_partition;
 	string parsed_order;
 	for (auto &entry : select.cte_map.map) {
@@ -819,7 +814,7 @@ vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
 	vector<string> output_columns;
 	output_columns.reserve(partition_columns.size());
 	for (auto &partition_column : partition_columns) {
-		output_columns.push_back(PartitionOutputColumn(partition_column));
+		output_columns.push_back(RefreshMetadata::ParseWindowColumn(partition_column).first);
 	}
 	return output_columns;
 }

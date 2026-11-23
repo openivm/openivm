@@ -1742,6 +1742,26 @@ vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
 	return ReadViewList(view_name, "group_columns");
 }
 
+string RefreshMetadata::SerializeWindowColumn(const string &output, const string &source) {
+	if (output.find('=') != string::npos || StringUtil::StartsWith(output, VIEW_LIST_JSON_PREFIX)) {
+		return VIEW_LIST_JSON_PREFIX + SqlUtils::JsonArray({output, source});
+	}
+	return output + "=" + source;
+}
+
+pair<string, string> RefreshMetadata::ParseWindowColumn(const string &spec) {
+	if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
+		auto columns = SqlUtils::ParseColumnList(spec.substr(sizeof(VIEW_LIST_JSON_PREFIX) - 1));
+		if (columns.size() != 2) {
+			throw InvalidInputException("Invalid OpenIVM window column metadata: %s", spec);
+		}
+		return {std::move(columns[0]), std::move(columns[1])};
+	}
+	auto separator = spec.find('=');
+	return separator == string::npos ? make_pair(spec, spec)
+	                                 : make_pair(spec.substr(0, separator), spec.substr(separator + 1));
+}
+
 vector<string> RefreshMetadata::GetWindowOrderColumns(const string &view_name) {
 	return ReadViewList(view_name, "window_order_columns");
 }
@@ -2201,6 +2221,14 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Projecti
 }
 
 template <class IO>
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::ProjectionKeyLineageStep> &m) {
+	io.Str("table", m.table);
+	io.Index("occ", m.occurrence);
+	io.Str("lookup_col", m.lookup_col);
+	io.Str("lookup_out", m.lookup_out);
+}
+
+template <class IO>
 static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoinKeySource> &m) {
 	io.Tag("k", "left_join_key_source");
 	io.Str("table", m.table);
@@ -2402,25 +2430,33 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "arms")) {
 		ProjectionKeyLineageArm arm;
 		if (!MetadataJson::Read(object, arm)) {
-			continue;
+			return false;
 		}
-		// Each step is "table|occurrence|lookup_col|lookup_out".
+		// Older arms store each step as "table|occurrence|lookup_col|lookup_out".
 		vector<string> steps;
-		MetadataJson::ExtractJsonStringArray(object, "steps", steps);
-		for (auto &step_text : steps) {
-			vector<string> parts(1);
-			for (char c : step_text) {
-				if (c == '|') {
-					parts.emplace_back();
-				} else {
-					parts.back() += c;
+		if (MetadataJson::ExtractJsonStringArray(object, "steps", steps)) {
+			for (auto &step_text : steps) {
+				auto parts = StringUtil::Split(step_text, '|');
+				ProjectionKeyLineageStep step;
+				if (parts.size() != 4 || !MetadataJson::ParseIndex(parts[1], step.occurrence)) {
+					return false;
 				}
+				step.table = std::move(parts[0]);
+				step.lookup_col = std::move(parts[2]);
+				step.lookup_out = std::move(parts[3]);
+				arm.steps.push_back(std::move(step));
 			}
-			ProjectionKeyLineageStep step;
-			if (parts.size() == 4 && MetadataJson::ParseIndex(parts[1], step.occurrence)) {
-				step.table = parts[0];
-				step.lookup_col = parts[2];
-				step.lookup_out = parts[3];
+		} else {
+			bool complete;
+			auto path = MetadataJson::ExtractJsonObjectsFromArray(object, "path", complete);
+			if (!complete || path.empty()) {
+				return false;
+			}
+			for (auto &entry : path) {
+				ProjectionKeyLineageStep step;
+				if (!MetadataJson::Read(entry, step)) {
+					return false;
+				}
 				arm.steps.push_back(std::move(step));
 			}
 		}
@@ -2434,12 +2470,19 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 	for (auto &arm : lineage.arms) {
 		MetadataJson::Writer arm_writer;
 		Fields(arm_writer, arm);
-		vector<string> steps;
-		for (auto &step : arm.steps) {
-			steps.push_back(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
-			                step.lookup_out);
+		if (std::any_of(arm.steps.begin(), arm.steps.end(), [](const ProjectionKeyLineageStep &step) {
+			    return step.table.find('|') != string::npos || step.lookup_col.find('|') != string::npos ||
+			           step.lookup_out.find('|') != string::npos;
+		    })) {
+			arm_writer.Objects("path", WriteEach(arm.steps));
+		} else {
+			vector<string> steps;
+			for (auto &step : arm.steps) {
+				steps.push_back(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
+				                step.lookup_out);
+			}
+			arm_writer.Arr("steps", steps);
 		}
-		arm_writer.Arr("steps", steps);
 		arms.push_back(arm_writer.Finish());
 	}
 	MetadataJson::Writer writer;

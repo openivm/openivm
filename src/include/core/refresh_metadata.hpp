@@ -251,6 +251,10 @@ public:
 	static string SerializeViewList(const vector<string> &values);
 	vector<string> GetGroupColumns(const string &view_name);
 
+	// Window partition and order specs map a stored output column to its source column.
+	static string SerializeWindowColumn(const string &output, const string &source);
+	static pair<string, string> ParseWindowColumn(const string &spec);
+
 	// Get common window ORDER BY output/source mappings. Empty means the view
 	// predates this metadata or its window specifications do not share a simple key.
 	vector<string> GetWindowOrderColumns(const string &view_name);

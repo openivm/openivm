@@ -743,3 +743,39 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# An equals sign can occur in either side of a window column mapping.
+statement ok
+CREATE TABLE quoted_window_source (id INT, "k=1" INT, "sort=order" INT);
+INSERT INTO quoted_window_source VALUES (1,1,10),(2,1,20),(3,2,30),(4,NULL,40);
+CREATE VIEW quoted_window_expected AS
+    SELECT id, "k=1" AS "=", "sort=order" AS ord,
+           row_number() OVER (PARTITION BY "k=1" ORDER BY "sort=order", id) AS rn
+    FROM quoted_window_source;
+CREATE MATERIALIZED VIEW quoted_window_mv AS
+    SELECT id, "k=1" AS "=", "sort=order" AS ord,
+           row_number() OVER (PARTITION BY "k=1" ORDER BY "sort=order", id) AS rn
+    FROM quoted_window_source;
+
+query I
+SELECT group_columns IS NOT NULL AND lineage_json LIKE '%"source_col":"k=1"%'
+FROM openivm_views WHERE view_sql_name = 'quoted_window_mv';
+----
+true
+
+statement ok
+INSERT INTO quoted_window_source VALUES (5,1,15),(6,NULL,5);
+UPDATE quoted_window_source SET "k=1" = NULL, "sort=order" = 1 WHERE id = 5;
+DELETE FROM quoted_window_source WHERE id IN (2, 6);
+
+statement ok
+PRAGMA refresh('quoted_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM quoted_window_mv EXCEPT ALL SELECT * FROM quoted_window_expected)
+    UNION ALL
+    (SELECT * FROM quoted_window_expected EXCEPT ALL SELECT * FROM quoted_window_mv)
+);
+----
+0

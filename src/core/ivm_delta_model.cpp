@@ -27,16 +27,11 @@ static void AddStringCI(vector<string> &values, const string &candidate) {
 	}
 }
 
-static string WindowPartitionOutputColumn(const string &partition_column) {
-	auto separator = partition_column.find('=');
-	return separator == string::npos ? partition_column : partition_column.substr(0, separator);
-}
-
 static vector<string> ProjectedWindowPartitionColumns(const vector<string> &partition_columns,
                                                       const vector<string> &output_names) {
 	vector<string> projected;
 	for (auto &partition_column : partition_columns) {
-		auto output_column = WindowPartitionOutputColumn(partition_column);
+		auto output_column = RefreshMetadata::ParseWindowColumn(partition_column).first;
 		if (!IncrementalTableNames::IsInternalColumn(output_column) && ContainsStringCI(output_names, output_column)) {
 			AddStringCI(projected, partition_column);
 		}

@@ -9,14 +9,6 @@
 
 namespace duckdb {
 
-static std::pair<string, string> SplitPartitionSpec(const string &raw) {
-	auto pos = raw.find('=');
-	if (pos == string::npos) {
-		return std::make_pair(raw, raw);
-	}
-	return std::make_pair(raw.substr(0, pos), raw.substr(pos + 1));
-}
-
 // `SELECT DISTINCT <key_cols>` over the UNION ALL of the per-source changed-key arms.
 static string ChangedPartitionKeysSQL(const string &key_cols, const vector<string> &arms) {
 	return "SELECT DISTINCT " + key_cols + " FROM (" + StringUtil::Join(arms, " UNION ALL ") +
@@ -43,7 +35,7 @@ static vector<WindowPartitionDeltaSpec> BuildWindowPartitionDeltaSpecs(RefreshMe
                                                                        bool cross_system) {
 	vector<WindowPartitionDeltaSpec> partition_delta_specs;
 	for (auto &raw_partition_col : partition_cols) {
-		auto parsed = SplitPartitionSpec(raw_partition_col);
+		auto parsed = RefreshMetadata::ParseWindowColumn(raw_partition_col);
 		for (auto &dt : delta_table_names) {
 			if (metadata.IsDuckLakeTable(view_name, dt)) {
 				continue;
@@ -81,7 +73,7 @@ static bool IsSafeForDuckLakeSnapshotDiff(const vector<string> &partition_cols, 
 		return false;
 	}
 	for (auto &pc : partition_cols) {
-		auto parsed = SplitPartitionSpec(pc);
+		auto parsed = RefreshMetadata::ParseWindowColumn(pc);
 		if (std::find(column_names.begin(), column_names.end(), parsed.first) == column_names.end()) {
 			return false;
 		}
@@ -198,7 +190,7 @@ BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, 
 	if (partition_cols.size() != 1) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
-	auto parsed = SplitPartitionSpec(partition_cols[0]);
+	auto parsed = RefreshMetadata::ParseWindowColumn(partition_cols[0]);
 	string key_cols = SqlUtils::QuoteIdentifier(parsed.first);
 
 	vector<RefreshMetadata::WindowPartitionLineageOp> lineage_ops;
@@ -293,7 +285,7 @@ static string BuildAffectedPartitionRefreshSQL(const string &data_table, const s
 static bool AddWindowRowKeyColumns(const vector<string> &specs, const vector<string> &visible_columns,
                                    vector<string> &row_keys) {
 	for (auto &spec : specs) {
-		auto output_column = SplitPartitionSpec(spec).first;
+		auto output_column = RefreshMetadata::ParseWindowColumn(spec).first;
 		auto visible = std::find_if(visible_columns.begin(), visible_columns.end(),
 		                            [&](const string &column) { return StringUtil::CIEquals(column, output_column); });
 		if (visible == visible_columns.end()) {
@@ -408,7 +400,7 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
 	if (partition_cols.size() != 1) {
 		return false;
 	}
-	auto parsed = SplitPartitionSpec(partition_cols[0]);
+	auto parsed = RefreshMetadata::ParseWindowColumn(partition_cols[0]);
 	key_cols = SqlUtils::QuoteIdentifier(parsed.first);
 
 	vector<DuckLakeSourceSpec> specs;
@@ -477,7 +469,7 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 
 	string affected_cols = SqlUtils::JoinQuotedColumns(PartitionOutputColumns(partition_cols));
 	string affected_select = StringUtil::Join(partition_cols, partition_cols.size(), ", ", [](const string &spec) {
-		auto parsed = SplitPartitionSpec(spec);
+		auto parsed = RefreshMetadata::ParseWindowColumn(spec);
 		return SqlUtils::QuoteIdentifier(parsed.second) + " AS " + SqlUtils::QuoteIdentifier(parsed.first);
 	});
 	string qtemp_affected = AffectedPartitionsTempTable(view_name);

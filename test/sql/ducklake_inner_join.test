@@ -1961,3 +1961,40 @@ query I
 SELECT COUNT(*) FROM ((SELECT * FROM expected_concat_scope) EXCEPT ALL (SELECT * FROM dl.concat_scope));
 ----
 0
+
+# A changed join key whose lookup column contains a pipe must still reach the
+# projected key through every step of the affected-key lineage.
+statement ok
+CREATE TABLE dl.quoted_lineage_dim (id INT, "join|key" INT);
+CREATE TABLE dl.quoted_lineage_bridge (k INT, other_key INT);
+CREATE TABLE dl.quoted_lineage_fact (k INT, amount INT);
+INSERT INTO dl.quoted_lineage_dim VALUES (100,1),(200,2);
+INSERT INTO dl.quoted_lineage_bridge VALUES (1,10),(2,20);
+INSERT INTO dl.quoted_lineage_fact VALUES (10,5),(20,7),(20,8);
+CREATE VIEW quoted_lineage_expected AS
+    SELECT d.id, f.amount
+    FROM dl.quoted_lineage_dim d
+    JOIN dl.quoted_lineage_bridge b ON d."join|key" = b.k
+    JOIN dl.quoted_lineage_fact f ON b.other_key = f.k;
+CREATE MATERIALIZED VIEW dl.quoted_lineage_mv AS
+    SELECT d.id, f.amount
+    FROM dl.quoted_lineage_dim d
+    JOIN dl.quoted_lineage_bridge b ON d."join|key" = b.k
+    JOIN dl.quoted_lineage_fact f ON b.other_key = f.k;
+
+statement ok
+INSERT INTO dl.quoted_lineage_fact VALUES (20,9),(20,11);
+UPDATE dl.quoted_lineage_fact SET k = 10, amount = 12 WHERE amount = 9;
+DELETE FROM dl.quoted_lineage_fact WHERE amount IN (7,11);
+
+statement ok
+PRAGMA refresh('dl.quoted_lineage_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.quoted_lineage_mv EXCEPT ALL SELECT * FROM quoted_lineage_expected)
+    UNION ALL
+    (SELECT * FROM quoted_lineage_expected EXCEPT ALL SELECT * FROM dl.quoted_lineage_mv)
+);
+----
+0

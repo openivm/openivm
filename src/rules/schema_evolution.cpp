@@ -550,15 +550,10 @@ static bool RewriteWindowGroupColumnSources(Connection &con, RefreshMetadata &me
 	vector<string> rewritten;
 	bool changed = false;
 	for (auto &token : group_columns) {
-		auto pos = token.find('=');
-		if (pos != string::npos) {
-			string lhs = token.substr(0, pos);
-			string rhs = token.substr(pos + 1);
-			if (StringUtil::CIEquals(rhs, old_name)) {
-				rhs = new_name;
-				changed = true;
-			}
-			rewritten.push_back(lhs + "=" + rhs);
+		auto spec = RefreshMetadata::ParseWindowColumn(token);
+		if (StringUtil::CIEquals(spec.second, old_name)) {
+			changed = true;
+			rewritten.push_back(RefreshMetadata::SerializeWindowColumn(spec.first, new_name));
 		} else {
 			rewritten.push_back(token);
 		}
@@ -734,7 +729,9 @@ void RewriteDependentViewMetadataForRename(ClientContext &context, Connection &c
 			RewriteFilteredGroupCountMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteSemiAntiAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteLineageMeta(con, metadata, view.name, qualified_source, old_name, new_name);
-			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
+			if (metadata.GetViewType(view.name) == RefreshType::WINDOW_PARTITION) {
+				RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
+			}
 		}
 		auto after = con.Query("SELECT * FROM openivm_views ORDER BY view_name");
 		if (after->HasError()) {

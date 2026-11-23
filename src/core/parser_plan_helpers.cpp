@@ -2734,9 +2734,9 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 			}
 			for (auto &ref : refs) {
 				for (auto &stored : partition_columns) {
-					auto pos = stored.find('=');
-					string output_col = pos == string::npos ? stored : stored.substr(0, pos);
-					string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
+					auto spec = RefreshMetadata::ParseWindowColumn(stored);
+					auto &output_col = spec.first;
+					auto &source_col = spec.second;
 					if (!StringUtil::CIEquals(source_col, ref.column)) {
 						continue;
 					}
@@ -2932,9 +2932,7 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 	}
 
 	for (auto &partition_column : partition_columns) {
-		if (partition_column.find('=') != string::npos) {
-			continue;
-		}
+		string output_column = partition_column;
 		for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
 			auto &expr = top_projection->expressions[expr_i];
 			auto *bcr = GetColumnRefThroughCasts(expr.get());
@@ -2948,10 +2946,11 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 			}
 			string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 			if (!output_col.empty() && !IncrementalTableNames::IsInternalColumn(output_col)) {
-				partition_column = output_col + "=" + partition_column;
+				output_column = std::move(output_col);
 			}
 			break;
 		}
+		partition_column = RefreshMetadata::SerializeWindowColumn(output_column, partition_column);
 	}
 }
 
