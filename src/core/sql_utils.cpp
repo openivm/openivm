@@ -2,9 +2,11 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
@@ -24,6 +26,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "lpts_sql_scanner.hpp"
 
 #include <cctype>
@@ -34,6 +37,13 @@ namespace duckdb {
 
 string SqlUtils::NegativeZeroSQL(const string &value) {
 	return "CASE WHEN (" + value + ") = 0 THEN concat(" + value + ", '') LIKE '-%' ELSE FALSE END";
+}
+
+string SqlUtils::NegativeZeroSQL(const string &value, SqlDialect dialect) {
+	if (dialect != SqlDialect::DUCKDB) {
+		return NegativeZeroSQL(value);
+	}
+	return "CASE WHEN (" + value + ") = 0 THEN signbit(" + value + ") ELSE FALSE END";
 }
 
 string SqlUtils::FloatingRepresentativeSQL(const string &value, const string &negative_count,
@@ -295,6 +305,24 @@ string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
 	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
 	// fold only A-Z. Preserve every other code point, including quoted identifiers.
 	auto fold = [](const string &expression) {
+		// A string literal (Value::ToSQLString) folds here instead of in every evaluation; quotes
+		// inside it are doubled, so folding the SQL text folds exactly the literal's value.
+		bool literal = expression.size() >= 2 && expression.front() == '\'' && expression.back() == '\'';
+		for (idx_t i = 1; literal && i + 1 < expression.size(); i++) {
+			if (expression[i] == '\'') {
+				literal = i + 2 < expression.size() && expression[i + 1] == '\'';
+				i++;
+			}
+		}
+		if (literal) {
+			string folded = expression;
+			for (auto &c : folded) {
+				if (c >= 'A' && c <= 'Z') {
+					c = static_cast<char>(c - 'A' + 'a');
+				}
+			}
+			return folded;
+		}
 		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
 	};
 	// An application collation must not widen physical identifier equality either.
@@ -666,11 +694,17 @@ string SqlUtils::DuckLakeChangesSQL(const string &select_list, const string &cat
 }
 
 string SqlUtils::CurrentDatabase(Connection &con) {
-	auto result = con.Query("SELECT current_database()");
-	if (!result->HasError() && result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull()) {
-		return result->Collection().GetValue(0, 0).ToString();
+	// current_database() without planning a statement; empty when no database is attached.
+	return DatabaseManager::TryGetDefaultDatabase(*con.context).GetIdentifierName();
+}
+
+string SqlUtils::RequireCurrentDatabase(Connection &con, const string &format) {
+	try {
+		return DatabaseManager::GetDefaultDatabase(*con.context).GetIdentifierName();
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		throw CatalogException(format, error.RawMessage());
 	}
-	return "";
 }
 
 SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
@@ -678,6 +712,13 @@ SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
 	return {entry.GetCatalog().empty() ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
 	                                   : entry.GetCatalog().GetIdentifierName(),
 	        entry.GetSchema().empty() ? string(DEFAULT_SCHEMA) : entry.GetSchema().GetIdentifierName()};
+}
+
+optional_idx SqlUtils::StorageRowCount(TableCatalogEntry &table) {
+	if (!table.IsDuckTable()) {
+		return optional_idx();
+	}
+	return table.Cast<DuckTableEntry>().GetStorage().GetTotalRows();
 }
 
 string SqlUtils::DeleteViewRowsSQL(const string &table, const string &view_name, const string &column) {
@@ -764,8 +805,30 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 	});
 }
 
+string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
+                                     const vector<string> &columns) {
+	if (keys.empty() || columns.empty()) {
+		throw InternalException("Keyed upsert into %s needs its key and column names", data_table);
+	}
+	// DuckDB 2.0 plans INSERT OR REPLACE as a MERGE that probes with the source, so matched rows
+	// are updated in random order. An explicit MERGE keeps the target on the probe side. Only
+	// non-key columns are assigned: an indexed key assignment turns every update into delete+insert.
+	vector<string> updates;
+	for (auto &column : columns) {
+		if (std::find(keys.begin(), keys.end(), column) == keys.end()) {
+			auto quoted = QuoteIdentifier(column);
+			updates.push_back(quoted + " = d." + quoted);
+		}
+	}
+	auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
+	return "MERGE INTO " + data_table + " v USING " + source + " d ON " + BuildNullSafeKeyPredicate(keys, "v.", "d.") +
+	       matched + "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
+	       JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+}
+
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
-                                       const vector<string> &unique_keys, const string &temp_table) {
+                                       const vector<string> &unique_keys, const string &temp_table,
+                                       const vector<string> &columns, const vector<LogicalType> &column_types) {
 	if (unique_keys.empty() || temp_table.empty()) {
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
@@ -774,13 +837,36 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	// those keys as present -- raising a spurious "Duplicate key ... violates unique constraint".
 	// Materialize the new contents once, delete only the keys that are gone, then upsert the rest, so
 	// no non-NULL key is deleted and re-inserted in the same transaction. NULL-containing keys do not
-	// conflict in a UNIQUE index, so remove them explicitly before INSERT OR REPLACE to avoid duplicates.
+	// conflict in a UNIQUE index, so remove them explicitly before the upsert to avoid duplicates.
 	string keep_match = BuildNullSafeKeyPredicate(unique_keys, "openivm_new.", "openivm_old.");
 	string nullable_key = BuildAnyNullPredicate(unique_keys, "openivm_old.");
 	string sql = "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n";
 	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE (" + nullable_key +
 	       ")\n   OR NOT EXISTS (\n  SELECT 1 FROM " + temp_table + " AS openivm_new WHERE " + keep_match + "\n);\n";
-	sql += "INSERT OR REPLACE INTO " + data_table + " SELECT * FROM " + temp_table + ";\n";
+	sql += BuildKeyedUpsertSQL(data_table, temp_table, unique_keys, columns);
+	// The upsert never rewrites a matched key, so a floating zero key would keep a sign that
+	// the recomputed group no longer has. Adopt the recomputed representative, as the plain
+	// DELETE+INSERT form does. The indexed key makes this update a delete+insert.
+	vector<string> zero_keys;
+	vector<string> sign_changes;
+	vector<string> assignments;
+	for (idx_t index = 0; index < columns.size() && index < column_types.size(); index++) {
+		auto id = column_types[index].id();
+		if ((id != LogicalTypeId::FLOAT && id != LogicalTypeId::DOUBLE) ||
+		    std::find(unique_keys.begin(), unique_keys.end(), columns[index]) == unique_keys.end()) {
+			continue;
+		}
+		auto key = QuoteIdentifier(columns[index]);
+		zero_keys.push_back("v." + key + " = 0");
+		sign_changes.push_back(NegativeZeroSQL("v." + key, SqlDialect::DUCKDB) + " <> " +
+		                       NegativeZeroSQL("openivm_new." + key, SqlDialect::DUCKDB));
+		assignments.push_back(key + " = openivm_new." + key);
+	}
+	if (!assignments.empty()) {
+		sql += "UPDATE " + data_table + " AS v SET " + StringUtil::Join(assignments, ", ") + " FROM " + temp_table +
+		       " AS openivm_new WHERE " + BuildNullSafeKeyPredicate(unique_keys, "v.", "openivm_new.") + " AND (" +
+		       StringUtil::Join(zero_keys, " OR ") + ") AND (" + StringUtil::Join(sign_changes, " OR ") + ");\n";
+	}
 	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
 	return sql;
 }

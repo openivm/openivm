@@ -17,6 +17,7 @@ namespace duckdb {
 
 class BaseTableRef;
 class SelectStatement;
+class TableCatalogEntry;
 
 struct SessionLocation {
 	string catalog;
@@ -28,6 +29,8 @@ public:
 	// SQL equality can merge observably different values, including nested ones.
 	static bool EqualityCanHideValueIdentity(const LogicalType &type);
 	static string NegativeZeroSQL(const string &value);
+	// DuckDB tests the sign bit directly; other dialects keep the portable string form.
+	static string NegativeZeroSQL(const string &value, SqlDialect dialect);
 	static string FloatingRepresentativeSQL(const string &value, const string &negative_count,
 	                                        const string &total_count);
 	static string ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation = "");
@@ -99,8 +102,14 @@ public:
 	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
 	/// The connection's current_database(), or empty when it cannot be read.
 	static string CurrentDatabase(Connection &con);
+	/// The connection's current_database(), read without a statement; throws CatalogException(format, error)
+	/// when there is none (for example, the default database was detached).
+	static string RequireCurrentDatabase(Connection &con, const string &format);
 	/// The caller's default catalog and schema; an unset session catalog is the default database.
 	static SessionLocation SessionDefaultLocation(ClientContext &context);
+	/// Rows in a native table's storage, without a COUNT(*) statement. An estimate: it includes deleted
+	/// rows not yet vacuumed. Invalid for tables of other catalogs (DuckLake, attached SQL databases).
+	static optional_idx StorageRowCount(TableCatalogEntry &table);
 	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.
 	static string DeleteViewRowsSQL(const string &table, const string &view_name, const string &column = "view_name");
 	static bool IsDelta(const string &name);
@@ -124,10 +133,15 @@ public:
 	static string BuildCastSpec(const string &target_type, bool try_cast);
 	static string ComposeCastSpecs(const string &outer_cast_spec, const string &inner_cast_spec);
 	static string ApplyCastSpec(const string &column_expression, const string &cast_spec);
-	// Pass unique_keys + temp_table when the data table carries a UNIQUE index, to get a form that
-	// never deletes and re-inserts the same key in one transaction (see the definition for why).
+	// Pass unique_keys + temp_table + the data table's columns and types when it carries a UNIQUE
+	// index, to get a form that never deletes and re-inserts the same key in one transaction.
 	static string BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
-	                                    const vector<string> &unique_keys = {}, const string &temp_table = "");
+	                                    const vector<string> &unique_keys = {}, const string &temp_table = "",
+	                                    const vector<string> &columns = {},
+	                                    const vector<LogicalType> &column_types = {});
+	// Upserts `source` rows into a data table keyed by a UNIQUE index.
+	static string BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
+	                                  const vector<string> &columns);
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
