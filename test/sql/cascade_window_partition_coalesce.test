@@ -198,3 +198,67 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# A nullable input absent from COALESCE can still change rows in a fallback key's partition.
+statement ok
+CREATE TABLE cwpc_fact (id INT, ak INT, bk INT);
+CREATE TABLE cwpc_dim_a (id INT, k INT, attr INT);
+CREATE TABLE cwpc_dim_b (id INT, k INT);
+CREATE TABLE cwpc_extra (id INT, v INT);
+INSERT INTO cwpc_fact VALUES (1,1,1),(2,2,2),(3,1,1);
+INSERT INTO cwpc_dim_a VALUES (1,NULL,10),(2,30,20);
+INSERT INTO cwpc_dim_b VALUES (1,100),(2,200);
+INSERT INTO cwpc_extra VALUES (10,9),(20,5);
+CREATE VIEW cwpc_third_expected AS
+    WITH joined AS (
+        SELECT f.id, COALESCE(a.k,b.k) AS k, x.v
+        FROM cwpc_fact f LEFT JOIN cwpc_dim_a a ON f.ak=a.id
+        LEFT JOIN cwpc_dim_b b ON f.bk=b.id LEFT JOIN cwpc_extra x ON a.attr=x.id
+    )
+    SELECT id,k,v,row_number() OVER (PARTITION BY k ORDER BY v,id) AS rn FROM joined;
+CREATE MATERIALIZED VIEW cwpc_third_mv AS
+    WITH joined AS (
+        SELECT f.id, COALESCE(a.k,b.k) AS k, x.v
+        FROM cwpc_fact f LEFT JOIN cwpc_dim_a a ON f.ak=a.id
+        LEFT JOIN cwpc_dim_b b ON f.bk=b.id LEFT JOIN cwpc_extra x ON a.attr=x.id
+    )
+    SELECT id,k,v,row_number() OVER (PARTITION BY k ORDER BY v,id) AS rn FROM joined;
+
+statement ok
+INSERT INTO cwpc_extra VALUES (30,99),(40,72);
+UPDATE cwpc_extra SET v=12 WHERE id=10;
+DELETE FROM cwpc_extra WHERE id=40;
+
+statement ok
+PRAGMA refresh('cwpc_third_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM cwpc_third_mv EXCEPT ALL FROM cwpc_third_expected)
+    UNION ALL
+    (FROM cwpc_third_expected EXCEPT ALL FROM cwpc_third_mv)
+);
+----
+0
+
+# Main stored the lookup alternatives without proof of which inputs could change.
+statement ok
+UPDATE openivm_views SET lineage_json = regexp_replace(
+    regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', ''),
+    ',"coalesce_columns":\[[^]]*\],"coalesce_preserved_source":"[^"]*"', '')
+WHERE view_sql_name = 'cwpc_third_mv';
+INSERT INTO cwpc_extra VALUES (50,200),(60,300);
+UPDATE cwpc_extra SET v=144 WHERE id=10;
+DELETE FROM cwpc_extra WHERE id=60;
+
+statement ok
+PRAGMA refresh('cwpc_third_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM cwpc_third_mv EXCEPT ALL FROM cwpc_third_expected)
+    UNION ALL
+    (FROM cwpc_third_expected EXCEPT ALL FROM cwpc_third_mv)
+);
+----
+0

@@ -217,15 +217,15 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
     RefreshMetadata &metadata, Connection &con, const string &view_name, const vector<string> &delta_table_names,
     const vector<string> &partition_cols, const string &delta_ts_filter, const string &view_catalog_name,
     const string &view_schema_name, const string &attached_db_catalog_name, const string &attached_db_schema_name,
-    bool require_proof, optional_ptr<const DeltaActivityResult> activity, string &affected_keys_sql) {
+    bool require_proof, optional_ptr<const DeltaActivityResult> activity,
+    const RefreshMetadata::WindowPartitionLineage &lineage, string &affected_keys_sql) {
 	if (partition_cols.size() != 1) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
 	auto parsed = RefreshMetadata::ParseWindowColumn(partition_cols[0]);
 	string key_cols = SqlUtils::QuoteIdentifier(parsed.first);
 
-	RefreshMetadata::WindowPartitionLineage lineage;
-	if (!metadata.GetWindowPartitionLineage(view_name, lineage)) {
+	if (lineage.ops.empty()) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
 	bool proven = lineage.IsProven(parsed.first);
@@ -516,20 +516,11 @@ static bool HasDirectDuckLakeWindowPartitionOps(const RefreshMetadata::WindowPar
 	return found;
 }
 
-static bool CanScanDuckLakeWindowPartitionKeys(Connection &con, const string &view_query_sql,
-                                               const vector<string> &column_names, const string &partition_spec,
-                                               const RefreshMetadata::WindowPartitionLineage &lineage) {
-	if (!HasDirectDuckLakeWindowPartitionOps(lineage, partition_spec)) {
-		return false;
-	}
-	auto output = RefreshMetadata::ParseWindowColumn(partition_spec).first;
-	if (lineage.proven_columns) {
-		return lineage.IsProven(output);
-	}
-
-	// Legacy metadata does not identify occurrences. Rebind the saved query
-	// before using its candidate direct keys for a single physical source.
-	bool proven = false;
+static RefreshMetadata::WindowPartitionLineage RebindWindowPartitionLineage(Connection &con,
+                                                                            const string &view_query_sql,
+                                                                            const vector<string> &column_names,
+                                                                            const string &partition_spec) {
+	RefreshMetadata::WindowPartitionLineage rebound;
 	try {
 		con.context->RunFunctionInTransaction([&] {
 			auto parser = Parser::GetBuiltinParser();
@@ -544,15 +535,51 @@ static bool CanScanDuckLakeWindowPartitionKeys(Connection &con, const string &vi
 			}
 			auto facts =
 			    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(*con.context).catalog);
-			RefreshMetadata::WindowPartitionLineage rebound;
-			proven = !WindowPlanRequiresResultDiff(facts) &&
-			         BuildWindowPartitionLineageOps(facts, {partition_spec}, column_names, rebound) &&
-			         rebound.IsProven(output) && HasDirectDuckLakeWindowPartitionOps(rebound, partition_spec);
+			if (!WindowPlanRequiresResultDiff(facts)) {
+				BuildWindowPartitionLineageOps(facts, {partition_spec}, column_names, rebound);
+			}
 		});
 	} catch (const std::exception &error) {
-		OPENIVM_DEBUG_PRINT("[UPSERT] Could not prove legacy DuckLake window key: %s\n", error.what());
+		OPENIVM_DEBUG_PRINT("[UPSERT] Could not prove legacy window key: %s\n", error.what());
 	}
-	return proven;
+	return rebound;
+}
+
+static bool CanScanDuckLakeWindowPartitionKeys(Connection &con, const string &view_query_sql,
+                                               const vector<string> &column_names, const string &partition_spec,
+                                               const RefreshMetadata::WindowPartitionLineage &lineage) {
+	if (!HasDirectDuckLakeWindowPartitionOps(lineage, partition_spec)) {
+		return false;
+	}
+	auto output = RefreshMetadata::ParseWindowColumn(partition_spec).first;
+	if (lineage.proven_columns) {
+		return lineage.IsProven(output);
+	}
+	// Legacy metadata does not identify occurrences. Rebind the saved query
+	// before using its candidate direct keys for a single physical source.
+	auto rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, partition_spec);
+	return rebound.IsProven(output) && HasDirectDuckLakeWindowPartitionOps(rebound, partition_spec);
+}
+
+static void ProveLegacyDerivedPartition(Connection &con, const string &view_query_sql,
+                                        const vector<string> &column_names, const string &partition_spec,
+                                        RefreshMetadata::WindowPartitionLineage &lineage) {
+	auto output = RefreshMetadata::ParseWindowColumn(partition_spec).first;
+	idx_t direct_arms = 0;
+	for (const auto &op : lineage.ops) {
+		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, output)) {
+			direct_arms++;
+		}
+	}
+	if (direct_arms <= 1) {
+		return;
+	}
+	// Several legacy direct arms can be equivalent keys or COALESCE
+	// alternatives. Only a binding proof can distinguish the two.
+	auto rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, partition_spec);
+	lineage.proven_columns = std::move(rebound.proven_columns).value_or(vector<string>());
+	lineage.coalesce_columns = std::move(rebound.coalesce_columns);
+	lineage.coalesce_preserved_source = std::move(rebound.coalesce_preserved_source);
 }
 
 static string BuildSingleSourceDuckLakeWindowRefresh(
@@ -690,13 +717,20 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
 	string affected_keys_sql;
+	RefreshMetadata::WindowPartitionLineage lineage;
+	if (partition_cols.size() == 1 && !requires_result_diff) {
+		metadata.GetWindowPartitionLineage(view_name, lineage);
+		if (has_join && !lineage.proven_columns) {
+			ProveLegacyDerivedPartition(con, view_query_sql, column_names, partition_cols[0], lineage);
+		}
+	}
 	auto lineage_result =
 	    requires_result_diff
 	        ? LineageAffectedKeysResult::UNAVAILABLE
 	        : BuildLineageStandardAffectedKeysSQL(
 	              metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
 	              view_schema_name, attached_db_catalog_name, attached_db_schema_name,
-	              has_join && delta_table_names.size() == 1, activity, affected_keys_sql);
+	              has_join && delta_table_names.size() == 1, activity, lineage, affected_keys_sql);
 	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",
 		                    view_name.c_str());

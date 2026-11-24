@@ -1605,3 +1605,68 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'same_key_window_mv');
 ----
 true
+
+# Simulate a definition created before the persisted key proof was added.
+statement ok
+UPDATE openivm_views SET lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'same_key_window_mv';
+INSERT INTO dl.same_key_window_source VALUES (8,2,80),(9,2,90);
+UPDATE dl.same_key_window_source SET v=31 WHERE id=3;
+DELETE FROM dl.same_key_window_source WHERE id=9;
+
+statement ok
+PRAGMA refresh('dl.same_key_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.same_key_window_mv EXCEPT ALL FROM same_key_window_expected)
+    UNION ALL
+    (FROM same_key_window_expected EXCEPT ALL FROM dl.same_key_window_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) >= 2
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'same_key_window_mv');
+----
+true
+
+# Learning a second, quoted key must not lose the single-key change-feed path.
+statement ok
+CREATE TABLE dl.quoted_composite_source (id INT, k INT, "q=1" INT, v INT);
+INSERT INTO dl.quoted_composite_source VALUES (1,1,10,10),(2,1,10,20),(3,1,11,30),(4,2,20,40);
+CREATE VIEW quoted_composite_expected AS
+    SELECT id,k,"q=1" AS q2,v,row_number() OVER (PARTITION BY k,"q=1" ORDER BY id) AS rn
+    FROM dl.quoted_composite_source;
+CREATE MATERIALIZED VIEW dl.quoted_composite_mv AS
+    SELECT id,k,"q=1" AS q2,v,row_number() OVER (PARTITION BY k,"q=1" ORDER BY id) AS rn
+    FROM dl.quoted_composite_source;
+
+statement ok
+INSERT INTO dl.quoted_composite_source VALUES (5,1,10,50),(6,1,10,60);
+UPDATE dl.quoted_composite_source SET v=55 WHERE id=5;
+DELETE FROM dl.quoted_composite_source WHERE id=6;
+
+statement ok
+PRAGMA refresh('dl.quoted_composite_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_composite_mv EXCEPT ALL FROM quoted_composite_expected)
+    UNION ALL
+    (FROM quoted_composite_expected EXCEPT ALL FROM dl.quoted_composite_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_composite_mv');
+----
+true
