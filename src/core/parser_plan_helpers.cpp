@@ -2588,6 +2588,7 @@ struct WindowLineageOp {
 };
 
 struct WindowLookupEdge {
+	idx_t join_id;
 	OccurrenceColumnRef lookup_join;
 	string lookup_cast;
 	OccurrenceColumnRef changed_join;
@@ -2595,6 +2596,7 @@ struct WindowLookupEdge {
 };
 
 struct WindowEquivalenceEdge {
+	idx_t join_id;
 	OccurrenceColumnRef first;
 	string first_cast;
 	OccurrenceColumnRef second;
@@ -2668,16 +2670,17 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 }
 
 static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
-                                   optional_ptr<vector<WindowEquivalenceEdge>> equivalence_edges,
+                                   vector<WindowEquivalenceEdge> &equivalence_edges,
                                    vector<WindowLookupEdge> &lookup_edges) {
 	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
 	    join.type != LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		return;
 	}
+	auto join_id = facts.plan_node_ids.at(&join);
 	auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, string lookup_cast, OccurrenceColumnRef changed_ref,
 	                           string changed_cast) {
 		lookup_edges.push_back(
-		    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
+		    {join_id, std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
 	};
 	for (auto &condition : join.conditions) {
 		if (!condition.IsComparison()) {
@@ -2713,9 +2716,9 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		default:
 			break;
 		}
-		if (join.join_type == JoinType::INNER && equivalence_edges) {
-			equivalence_edges->push_back(
-			    {std::move(left_ref), std::move(left_cast), std::move(right_ref), std::move(right_cast)});
+		if (join.join_type == JoinType::INNER) {
+			equivalence_edges.push_back(
+			    {join_id, std::move(left_ref), std::move(left_cast), std::move(right_ref), std::move(right_cast)});
 		}
 	}
 }
@@ -2756,12 +2759,37 @@ static const OccurrenceColumnRef *OtherWindowKey(const WindowEquivalenceEdge &ed
 	return SameRef(edge.second, key) ? &edge.first : nullptr;
 }
 
+struct WindowInputRange {
+	idx_t first;
+	idx_t end;
+
+	bool Contains(idx_t node_id) const {
+		return node_id >= first && node_id < end;
+	}
+};
+
+static WindowInputRange GetWindowInputRange(const CreateMVPlanFacts &facts, const LogicalWindow &window) {
+	// Post-order node IDs form contiguous subtree ranges.
+	auto end = facts.plan_node_ids.at(&window);
+	auto first = end;
+	while (!facts.plan_nodes_post_order[first].child_ids.empty()) {
+		first = facts.plan_nodes_post_order[first].child_ids.front();
+	}
+	return {first, end};
+}
+
+static bool IsEarlyWindowEvidence(const unordered_map<string, idx_t> &first_windows, const OccurrenceColumnRef &ref,
+                                  idx_t node_id) {
+	auto first = first_windows.find(OccurrenceKey(ref));
+	return first == first_windows.end() || node_id <= first->second;
+}
+
 struct WindowKeyEquality {
 	const CreateMVPlanFacts &facts;
 	const vector<WindowEquivalenceEdge> &edges;
 	const unordered_set<string> &nullable_sources;
 
-	bool operator()(const Expression &left, const Expression &right) const {
+	bool operator()(const Expression &left, const Expression &right, const WindowInputRange &input) const {
 		if (Expression::Equals(left, right)) {
 			return true;
 		}
@@ -2782,7 +2810,7 @@ struct WindowKeyEquality {
 		vector<OccurrenceColumnRef> equivalents {std::move(first)};
 		for (idx_t i = 0; i < equivalents.size(); i++) {
 			for (const auto &edge : edges) {
-				if (edge.HasCast()) {
+				if (edge.HasCast() || !input.Contains(edge.join_id)) {
 					continue;
 				}
 				auto *other = OtherWindowKey(edge, equivalents[i]);
@@ -2802,13 +2830,14 @@ struct WindowKeyEquality {
 static bool IsCommonWindowKey(const CreateMVPlanFacts &facts, const Expression &key,
                               const WindowKeyEquality &equal_keys) {
 	for (const auto *window : facts.windows) {
+		auto input = GetWindowInputRange(facts, *window);
 		for (const auto &expression : window->expressions) {
 			if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
 				continue;
 			}
 			const auto &partitions = expression->Cast<BoundWindowExpression>().Partitions();
 			if (std::none_of(partitions.begin(), partitions.end(), [&](const unique_ptr<Expression> &partition) {
-				    return equal_keys(WindowKeyExpression(*partition, facts), key);
+				    return equal_keys(WindowKeyExpression(*partition, facts), key, input);
 			    })) {
 				return false;
 			}
@@ -2834,8 +2863,9 @@ static bool HasPlainCoalescePartition(const Expression &key, const CreateMVPlanF
 static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlanFacts &facts,
                                        const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops,
                                        unordered_map<string, const Expression *> &window_keys,
-                                       unordered_set<string> &coalesce_candidates,
-                                       const WindowKeyEquality &equal_keys) {
+                                       unordered_set<string> &coalesce_candidates, const WindowKeyEquality &equal_keys,
+                                       const unordered_map<string, idx_t> &first_windows) {
+	auto input = GetWindowInputRange(facts, window);
 	for (auto &expression : window.expressions) {
 		if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
 			continue;
@@ -2870,9 +2900,12 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 						continue;
 					}
 					auto output = StringUtil::Lower(output_col);
-					auto entry = window_keys.emplace(output, &key);
-					if (!entry.second && entry.first->second && !equal_keys(*entry.first->second, key)) {
-						entry.first->second = nullptr;
+					auto entry = window_keys.find(output);
+					if (entry != window_keys.end() && entry->second && !equal_keys(*entry->second, key, input)) {
+						entry->second = nullptr;
+					}
+					if (!IsEarlyWindowEvidence(first_windows, ref, input.end)) {
+						continue;
 					}
 					if (HasPlainCoalescePartition(key, facts, refs, source_col)) {
 						coalesce_candidates.insert(std::move(output));
@@ -3054,36 +3087,44 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		return false;
 	}
 
-	// Post-order node IDs form contiguous subtree ranges. An equality must
-	// hold at the input of every window before it can transfer partition keys.
-	idx_t first_input = 0;
-	idx_t end_input = facts.plan_nodes_post_order.size();
+	WindowInputRange common_input {0, facts.plan_nodes_post_order.size()};
+	unordered_map<string, idx_t> first_windows;
 	for (auto *window : facts.windows) {
-		auto window_id = facts.plan_node_ids.at(window);
-		end_input = MinValue(end_input, window_id);
-		auto first = window_id;
-		while (!facts.plan_nodes_post_order[first].child_ids.empty()) {
-			first = facts.plan_nodes_post_order[first].child_ids.front();
+		auto input = GetWindowInputRange(facts, *window);
+		common_input.first = MaxValue(common_input.first, input.first);
+		common_input.end = MinValue(common_input.end, input.end);
+		for (auto index : facts.plan_nodes_post_order[input.end].subtree_table_indices) {
+			auto source = facts.occurrence_by_index.find(index);
+			if (source != facts.occurrence_by_index.end()) {
+				auto &occurrence = source->second;
+				auto entry = first_windows.emplace(OccurrenceKey(occurrence.table, occurrence.occurrence), input.end);
+				entry.first->second = MinValue(entry.first->second, input.end);
+			}
 		}
-		first_input = MaxValue(first_input, first);
 	}
 
 	vector<WindowEquivalenceEdge> edges;
 	vector<WindowLookupEdge> lookup_edges;
 	for (auto *join : facts.comparison_joins) {
-		auto join_id = facts.plan_node_ids.at(join);
-		CollectWindowJoinEdges(*join, facts, join_id >= first_input && join_id < end_input ? &edges : nullptr,
-		                       lookup_edges);
+		CollectWindowJoinEdges(*join, facts, edges, lookup_edges);
 	}
 
 	auto nullable_sources = NullExtendedWindowSources(facts);
 	const WindowKeyEquality equal_keys {facts, edges, nullable_sources};
 	vector<WindowLineageOp> direct_ops;
 	unordered_map<string, const Expression *> window_keys;
+	auto spine = ViewOutputSpine(facts.root);
+	if (!spine.projections.empty()) {
+		const auto &projection = *spine.projections.front();
+		for (idx_t i = 0; i < projection.expressions.size() && i < output_names.size(); i++) {
+			window_keys.emplace(StringUtil::Lower(output_names[i]),
+			                    &WindowKeyExpression(*projection.expressions[i], facts));
+		}
+	}
 	unordered_set<string> coalesce_candidates;
 	for (auto *window : facts.windows) {
 		CollectWindowPartitionRefs(*window, facts, partition_columns, direct_ops, window_keys, coalesce_candidates,
-		                           equal_keys);
+		                           equal_keys, first_windows);
 	}
 	if (direct_ops.empty()) {
 		return false;
@@ -3104,7 +3145,8 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		changed = false;
 		vector<WindowLineageOp> next_ops = partition_ops;
 		for (auto &edge : edges) {
-			if (edge.HasCast()) {
+			// A transferred source key must hold for every window.
+			if (edge.HasCast() || !common_input.Contains(edge.join_id)) {
 				continue;
 			}
 			for (auto &direct : partition_ops) {
@@ -3136,6 +3178,11 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	}
 
 	for (auto &edge : lookup_edges) {
+		// A later join can narrow the output without narrowing the input of
+		// an earlier window that reads this source.
+		if (!IsEarlyWindowEvidence(first_windows, edge.changed_join, edge.join_id)) {
+			continue;
+		}
 		for (auto &direct : partition_ops) {
 			if (!StringUtil::CIEquals(edge.lookup_join.table, direct.source_table) ||
 			    edge.lookup_join.occurrence != direct.source_occurrence) {
@@ -3188,28 +3235,19 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			}
 		}
 	}
-	auto spine = ViewOutputSpine(facts.root);
-	const auto *projection = spine.projections.empty() ? nullptr : spine.projections.front();
 	out.proven_columns.emplace();
 	for (const auto &entry : covered) {
 		if (entry.second.size() != facts.source_occurrences.size()) {
 			continue;
 		}
-		auto *key = window_keys.at(entry.first);
-		if (!key || !projection) {
+		auto found = window_keys.find(entry.first);
+		if (found == window_keys.end() || !found->second) {
 			continue;
 		}
-		bool matches_projection = false;
-		for (idx_t i = 0; i < projection->expressions.size() && i < output_names.size(); i++) {
-			if (StringUtil::CIEquals(output_names[i], entry.first) &&
-			    equal_keys(WindowKeyExpression(*projection->expressions[i], facts), *key)) {
-				matches_projection = true;
-				break;
-			}
-		}
-		// Lineage only records resolvable source columns. Check every bound
-		// window so an unresolved or computed namesake cannot prove a common key.
-		if (!matches_projection || !IsCommonWindowKey(facts, *key, equal_keys)) {
+		const auto *key = found->second;
+		// A computed namesake may have produced no lineage. Check the projected
+		// key against every window, using the equalities at that window's input.
+		if (!IsCommonWindowKey(facts, *key, equal_keys)) {
 			continue;
 		}
 		const auto nullable_operand = [&](const WindowLineageOp &op) {
