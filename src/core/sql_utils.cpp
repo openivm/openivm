@@ -12,6 +12,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
@@ -825,24 +826,43 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 }
 
 string SqlUtils::BuildKeyedUpsertSQL(const string &data_table, const string &source, const vector<string> &keys,
-                                     const vector<string> &columns) {
+                                     const vector<string> &columns, SqlDialect dialect) {
 	if (keys.empty() || columns.empty()) {
 		throw InternalException("Keyed upsert into %s needs its key and column names", data_table);
 	}
-	// DuckDB 2.0 plans INSERT OR REPLACE as a MERGE that probes with the source, so matched rows
-	// are updated in random order. An explicit MERGE keeps the target on the probe side. Only
-	// non-key columns are assigned: an indexed key assignment turns every update into delete+insert.
+	// Only non-key columns are assigned: an indexed key assignment turns every update into
+	// delete+insert.
+	const string rowid_column = "openivm_target_rowid";
 	vector<string> updates;
+	// Only DuckDB tables expose `rowid`, and an output column named like it or the helper alias
+	// would shadow it in the row-id form.
+	bool key_match_only = dialect != SqlDialect::DUCKDB;
 	for (auto &column : columns) {
+		key_match_only |= StringUtil::CIEquals(column, "rowid") || StringUtil::CIEquals(column, rowid_column);
 		if (std::find(keys.begin(), keys.end(), column) == keys.end()) {
 			auto quoted = QuoteIdentifier(column);
 			updates.push_back(quoted + " = d." + quoted);
 		}
 	}
-	auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
-	return "MERGE INTO " + data_table + " v USING " + source + " d ON " + BuildNullSafeKeyPredicate(keys, "v.", "d.") +
-	       matched + "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
-	       JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+	auto not_matched = "\nWHEN NOT MATCHED THEN INSERT (" + JoinQuotedColumns(columns) + ") VALUES (" +
+	                   JoinQualifiedQuotedColumns(columns, "d") + ");\n";
+	if (updates.empty() || key_match_only) {
+		// Nothing is updated, or the row-id form is unavailable: match on the key directly.
+		auto matched = updates.empty() ? "" : "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ");
+		return "MERGE INTO " + data_table + " v USING " + source + " d ON " +
+		       BuildNullSafeKeyPredicate(keys, "v.", "d.") + matched + not_matched;
+	}
+	// DuckDB applies matched updates in the order the join emits them. INSERT OR REPLACE and a key
+	// MERGE each pick the probe side by cardinality estimate, and when the source probes, an order
+	// uncorrelated with the target's storage makes every update chunk touch many row groups (~100x
+	// slower). Resolve each source row's target row id and sort by it first: matching on the row id
+	// then follows storage order whichever side probes. Unmatched rows get a NULL row id and insert.
+	auto ordered_source = "(SELECT openivm_src.*, openivm_old.rowid AS " + rowid_column + " FROM " + source +
+	                      " openivm_src LEFT JOIN " + data_table + " openivm_old ON " +
+	                      BuildNullSafeKeyPredicate(keys, "openivm_old.", "openivm_src.") + " ORDER BY " +
+	                      rowid_column + ")";
+	return "MERGE INTO " + data_table + " v USING " + ordered_source + " d ON v.rowid = d." + rowid_column +
+	       "\nWHEN MATCHED THEN UPDATE SET " + StringUtil::Join(updates, ", ") + not_matched;
 }
 
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
@@ -966,6 +986,8 @@ bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, cons
 struct TableReferenceMatch {
 	idx_t start;
 	idx_t end;
+	//! Last name part: the implicit alias of an unaliased reference.
+	string name;
 };
 
 static bool IsIdentifierTokenStart(char c) {
@@ -1038,8 +1060,13 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 			idx_t end = i;
 			vector<IdentifierSegmentSpan> parts;
 			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
-				if (expect_table && matches_table(parts)) {
-					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
+				// `FROM (SELECT ...` / `FROM (WITH ...`: an unquoted reserved word is never a table name.
+				bool reserved_word =
+				    parts.size() == 1 && sql[start] != '"' &&
+				    KeywordHelper::KeywordCategoryType(parts[0].value) == KeywordCategory::KEYWORD_RESERVED;
+				if (expect_table && !reserved_word && matches_table(parts)) {
+					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end,
+					                   parts.back().value});
 					i = matches.back().end;
 					expect_table = false;
 					continue;
@@ -1049,7 +1076,8 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 				continue;
 			}
 		}
-		if (!std::isspace(static_cast<unsigned char>(c))) {
+		// A parenthesized join tree (`FROM (t AS a LEFT JOIN ...`) still starts with a table reference.
+		if (!std::isspace(static_cast<unsigned char>(c)) && c != '(') {
 			expect_table = false;
 		}
 		i++;
@@ -1089,12 +1117,48 @@ string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &t
 	return sql.substr(match.start, match.end - match.start);
 }
 
+// `t AS a`, `t a` and `t "a"` carry an alias; `t ON`, `t LEFT JOIN` and `t WHERE` do not.
+static bool HasTableAlias(const string &sql, idx_t pos) {
+	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
+		pos++;
+	}
+	if (pos >= sql.size()) {
+		return false;
+	}
+	if (sql[pos] == '"') {
+		return true;
+	}
+	if (!std::isalpha(static_cast<unsigned char>(sql[pos])) && sql[pos] != '_') {
+		return false;
+	}
+	idx_t end = pos;
+	while (end < sql.size() && (std::isalnum(static_cast<unsigned char>(sql[end])) || sql[end] == '_')) {
+		end++;
+	}
+	auto word = sql.substr(pos, end - pos);
+	if (StringUtil::CIEquals(word, "as")) {
+		return true;
+	}
+	auto category = KeywordHelper::KeywordCategoryType(word);
+	return category != KeywordCategory::KEYWORD_RESERVED && category != KeywordCategory::KEYWORD_TYPE_FUNC;
+}
+
+// A subquery in place of an unaliased table must keep the table's implicit alias,
+// or qualified references such as `t.col` no longer bind.
+static string ReplacementFor(const string &sql, const TableReferenceMatch &match, const string &replacement) {
+	if (replacement.empty() || replacement.front() != '(' || replacement.back() != ')' ||
+	    ExtendPastTimeTravelClause(sql, match.end) != match.end || HasTableAlias(sql, match.end)) {
+		return replacement;
+	}
+	return replacement + " AS " + SqlUtils::QuoteIdentifier(match.name);
+}
+
 static string ReplaceMatches(const string &sql, const vector<TableReferenceMatch> &matches, const string &replacement) {
 	string result;
 	idx_t last = 0;
 	for (auto &match : matches) {
 		result.append(sql, last, match.start - last);
-		result += replacement;
+		result += ReplacementFor(sql, match, replacement);
 		last = match.end;
 	}
 	return result.append(sql, last, string::npos);
@@ -1116,7 +1180,7 @@ vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const stri
 	vector<string> variants;
 	for (auto &match : CollectTableReferenceMatches(sql, table_name, false)) {
 		string variant = sql;
-		variant.replace(match.start, match.end - match.start, replacement);
+		variant.replace(match.start, match.end - match.start, ReplacementFor(sql, match, replacement));
 		variants.push_back(std::move(variant));
 	}
 	return variants;
