@@ -125,7 +125,6 @@ struct DeltaViewModel {
 	bool HasSemiAntiAux() const {
 		return !semi_anti_aux.aux_table.empty();
 	}
-	idx_t LineageEntryCount() const;
 };
 
 const char *DeltaStrategyReasonName(DeltaStrategyReason reason);

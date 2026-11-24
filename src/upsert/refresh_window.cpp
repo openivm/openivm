@@ -1,5 +1,6 @@
 #include "upsert/refresh_internal.hpp"
 
+#include "core/vector_utils.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_plan_helpers.hpp"
@@ -35,15 +36,11 @@ static bool DeltaHasColumn(Connection &con, const RefreshMetadata::SourceLocatio
 static vector<WindowPartitionDeltaSpec> BuildWindowPartitionDeltaSpecs(RefreshMetadata &metadata, Connection &con,
                                                                        const string &view_name,
                                                                        const vector<string> &delta_table_names,
-                                                                       const vector<string> &partition_cols,
-                                                                       bool cross_system) {
+                                                                       const vector<string> &partition_cols) {
 	vector<WindowPartitionDeltaSpec> partition_delta_specs;
 	for (auto &raw_partition_col : partition_cols) {
 		auto parsed = RefreshMetadata::ParseWindowColumn(raw_partition_col);
 		for (auto &dt : delta_table_names) {
-			if (metadata.IsDuckLakeTable(view_name, dt)) {
-				continue;
-			}
 			if (DeltaHasColumn(con, metadata.GetSourceLocation(view_name, dt), parsed.second)) {
 				string delta_table_sql = metadata.ResolveDeltaQualifiedName(view_name, dt);
 				partition_delta_specs.push_back({dt, delta_table_sql, parsed.first, parsed.second});
@@ -184,62 +181,85 @@ static bool CanUseCoalesceLineage(RefreshMetadata &metadata, const string &view_
 	return found_preserved;
 }
 
-static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
-    RefreshMetadata &metadata, Connection &con, const string &view_name, const vector<string> &delta_table_names,
-    const string &partition_spec, const string &delta_ts_filter, const string &view_catalog_name,
-    const string &view_schema_name, const string &attached_db_catalog_name, const string &attached_db_schema_name,
-    bool require_proof, optional_ptr<const DeltaActivityResult> activity,
-    const RefreshMetadata::WindowPartitionLineage &lineage, string &affected_keys_sql) {
-	auto parsed = RefreshMetadata::ParseWindowColumn(partition_spec);
-	string key_cols = SqlUtils::QuoteIdentifier(parsed.first);
-
-	if (lineage.ops.empty()) {
-		return LineageAffectedKeysResult::UNAVAILABLE;
-	}
-	bool proven = lineage.IsProven(parsed.first);
-	bool use_coalesce =
-	    !proven && CanUseCoalesceLineage(metadata, view_name, delta_table_names, lineage, parsed.first, activity);
-	if (lineage.proven_columns && !proven && !use_coalesce) {
-		return LineageAffectedKeysResult::UNAVAILABLE;
-	}
-
-	vector<string> arms;
+// Build one key-selection arm per applicable lineage op and require coverage of every source.
+static LineageAffectedKeysResult BuildLineageAffectedKeyArms(
+    const string &output_col, const vector<RefreshMetadata::WindowPartitionLineageOp> &lineage_ops,
+    const vector<string> &required_sources,
+    const std::function<LineageAffectedKeysResult(const RefreshMetadata::WindowPartitionLineageOp &, string &,
+                                                  string &)> &build_arm,
+    vector<string> &arms) {
 	unordered_set<string> covered_sources;
-	for (auto &op : lineage.ops) {
-		if (!StringUtil::CIEquals(op.output_col, parsed.first)) {
+	for (auto &op : lineage_ops) {
+		if (!StringUtil::CIEquals(op.output_col, output_col)) {
 			continue;
 		}
 		string arm_sql;
-		if (op.kind == WindowLineageKind::DIRECT) {
-			arm_sql =
-			    BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
-			                                  op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
-			                                  view_schema_name, attached_db_catalog_name, attached_db_schema_name);
-		} else if (op.kind == WindowLineageKind::LOOKUP) {
-			arm_sql = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op,
-			                                            delta_ts_filter, view_catalog_name, view_schema_name,
-			                                            attached_db_catalog_name, attached_db_schema_name);
+		string source;
+		auto result = build_arm(op, arm_sql, source);
+		if (result == LineageAffectedKeysResult::UNSAFE) {
+			return result;
 		}
-		if (arm_sql.empty()) {
-			return LineageAffectedKeysResult::UNSAFE;
+		if (result == LineageAffectedKeysResult::AVAILABLE) {
+			arms.push_back(std::move(arm_sql));
+			covered_sources.insert(std::move(source));
 		}
-		arms.push_back("(" + arm_sql + ")");
-		covered_sources.insert(ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names));
 	}
-
-	for (auto &dt : delta_table_names) {
-		if (!covered_sources.count(dt)) {
+	for (auto &source : required_sources) {
+		if (!covered_sources.count(source)) {
 			return LineageAffectedKeysResult::UNAVAILABLE;
 		}
 	}
 	if (arms.empty()) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
+	return LineageAffectedKeysResult::AVAILABLE;
+}
+
+static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
+    RefreshMetadata &metadata, Connection &con, const string &view_name, const vector<string> &delta_table_names,
+    const string &partition_spec, const string &delta_ts_filter, const string &view_catalog_name,
+    const string &view_schema_name, const string &attached_db_catalog_name, const string &attached_db_schema_name,
+    bool require_proof, optional_ptr<const DeltaActivityResult> activity,
+    const RefreshMetadata::WindowPartitionLineage &lineage, string &affected_keys_sql) {
+	auto output_col = RefreshMetadata::ParseWindowColumn(partition_spec).first;
+
+	if (lineage.ops.empty()) {
+		return LineageAffectedKeysResult::UNAVAILABLE;
+	}
+	bool proven = lineage.IsProven(output_col);
+	bool use_coalesce =
+	    !proven && CanUseCoalesceLineage(metadata, view_name, delta_table_names, lineage, output_col, activity);
+	if (lineage.proven_columns && !proven && !use_coalesce) {
+		return LineageAffectedKeysResult::UNAVAILABLE;
+	}
+	auto build_arm = [&](const RefreshMetadata::WindowPartitionLineageOp &op, string &arm, string &source) {
+		if (op.kind == WindowLineageKind::DIRECT) {
+			arm = BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
+			                                    op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
+			                                    view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		} else if (op.kind == WindowLineageKind::LOOKUP) {
+			arm = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op, delta_ts_filter,
+			                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                        attached_db_schema_name);
+		}
+		if (arm.empty()) {
+			return LineageAffectedKeysResult::UNSAFE;
+		}
+		arm = "(" + arm + ")";
+		source = ResolveDeltaMetadataKey(metadata, view_name, op.source, delta_table_names);
+		return LineageAffectedKeysResult::AVAILABLE;
+	};
+	vector<string> arms;
+	auto result = BuildLineageAffectedKeyArms(output_col, lineage.ops, delta_table_names, build_arm, arms);
 	// Check legacy casts before requiring the occurrence proof. An unsafe
 	// lookup still selects the established full-recompute path.
+	if (result != LineageAffectedKeysResult::AVAILABLE) {
+		return result;
+	}
 	if (require_proof && !proven && !use_coalesce) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
+	auto key_cols = SqlUtils::QuoteIdentifier(output_col);
 	if (use_coalesce) {
 		// The unchanged nullable inputs supply the alternative keys. A
 		// changed preserved row can also move into or out of the NULL partition.
@@ -306,11 +326,7 @@ static bool AddWindowRowKeyColumns(const vector<string> &specs, const vector<str
 		if (visible == visible_columns.end()) {
 			return false;
 		}
-		auto duplicate = std::find_if(row_keys.begin(), row_keys.end(),
-		                              [&](const string &column) { return StringUtil::CIEquals(column, *visible); });
-		if (duplicate == row_keys.end()) {
-			row_keys.push_back(*visible);
-		}
+		AddUniqueCI(row_keys, *visible);
 	}
 	return true;
 }
@@ -426,53 +442,42 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
 	if (partition_cols.size() != 1) {
 		return false;
 	}
-	auto parsed = RefreshMetadata::ParseWindowColumn(partition_cols[0]);
-	if ((lineage.proven_columns || delta_table_names.size() == 1) && !lineage.IsProven(parsed.first)) {
+	auto output_col = RefreshMetadata::ParseWindowColumn(partition_cols[0]).first;
+	if ((lineage.proven_columns || delta_table_names.size() == 1) && !lineage.IsProven(output_col)) {
 		return false;
 	}
-	auto key_cols = SqlUtils::QuoteIdentifier(parsed.first);
 
 	vector<DuckLakeSourceSpec> specs;
 	if (!BuildDuckLakeSourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name, view_schema_name,
 	                              attached_db_catalog_name, attached_db_schema_name, specs)) {
 		return false;
 	}
-
-	vector<string> arms;
-	unordered_set<string> covered_sources;
-	for (auto &op : lineage.ops) {
-		if (!StringUtil::CIEquals(op.output_col, parsed.first)) {
-			continue;
-		}
-		auto *source_spec = FindDuckLakeSourceSpec(specs, op.source);
-		if (!source_spec) {
-			continue;
-		}
-		if (op.kind == WindowLineageKind::DIRECT) {
-			arms.push_back(BuildDuckLakeChangedValuesSQL(*source_spec, op.source_col, op.source_cast, op.output_col));
-			covered_sources.insert(StripOpenIVMDataPrefix(source_spec->metadata_key));
-			continue;
-		}
-		if (op.kind == WindowLineageKind::LOOKUP) {
-			auto *lookup_spec = FindDuckLakeSourceSpec(specs, op.lookup);
-			if (!lookup_spec) {
-				continue;
-			}
-			arms.push_back(BuildDuckLakeLookupChangedKeysSQL(*source_spec, *lookup_spec, op));
-			covered_sources.insert(StripOpenIVMDataPrefix(source_spec->metadata_key));
-		}
-	}
-
+	vector<string> required_sources;
 	for (auto &spec : specs) {
-		if (!covered_sources.count(StripOpenIVMDataPrefix(spec.metadata_key))) {
-			return false;
-		}
+		required_sources.push_back(StripOpenIVMDataPrefix(spec.metadata_key));
 	}
-	if (arms.empty()) {
+	auto build_arm = [&](const RefreshMetadata::WindowPartitionLineageOp &op, string &arm, string &source) {
+		auto *source_spec = FindDuckLakeSourceSpec(specs, op.source);
+		if (source_spec && op.kind == WindowLineageKind::DIRECT) {
+			arm = BuildDuckLakeChangedValuesSQL(*source_spec, op.source_col, op.source_cast, op.output_col);
+		} else if (source_spec && op.kind == WindowLineageKind::LOOKUP) {
+			auto *lookup_spec = FindDuckLakeSourceSpec(specs, op.lookup);
+			if (lookup_spec) {
+				arm = BuildDuckLakeLookupChangedKeysSQL(*source_spec, *lookup_spec, op);
+			}
+		}
+		if (arm.empty()) {
+			return LineageAffectedKeysResult::UNAVAILABLE;
+		}
+		source = StripOpenIVMDataPrefix(source_spec->metadata_key);
+		return LineageAffectedKeysResult::AVAILABLE;
+	};
+	vector<string> arms;
+	if (BuildLineageAffectedKeyArms(output_col, lineage.ops, required_sources, build_arm, arms) !=
+	    LineageAffectedKeysResult::AVAILABLE) {
 		return false;
 	}
-
-	affected_keys_sql = ChangedPartitionKeysSQL(key_cols, arms);
+	affected_keys_sql = ChangedPartitionKeysSQL(SqlUtils::QuoteIdentifier(output_col), arms);
 	return true;
 }
 
@@ -583,13 +588,9 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 		return SqlUtils::QuoteIdentifier(parsed.second) + " AS " + SqlUtils::QuoteIdentifier(parsed.first);
 	});
 	string qtemp_affected = AffectedPartitionsTempTable(view_name);
-	string insertions = "SELECT " + affected_select + " FROM " +
-	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-	                                                    loc.table_name, old_snap, current_snap);
-	string deletions = "SELECT " + affected_select + " FROM " +
-	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-	                                                   loc.table_name, old_snap, current_snap);
-	string affected_keys = ChangedPartitionKeysSQL(affected_cols, {"(" + insertions + ")", "(" + deletions + ")"});
+	auto changes = SqlUtils::DuckLakeChangesSQL(affected_select, loc.catalog_name, loc.schema_name, loc.table_name,
+	                                            old_snap, current_snap);
+	string affected_keys = ChangedPartitionKeysSQL(affected_cols, {"(" + changes + ")"});
 	if (!order_cols.empty()) {
 		auto compact_diff =
 		    BuildDuckLakeWindowRowDiffRefreshSQL(view_name, data_table, view_query_sql, affected_keys, partition_cols,
@@ -737,10 +738,20 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 			if (composite && !lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
 				continue;
 			}
-			auto result = BuildLineageStandardAffectedKeysSQL(
-			    metadata, con, view_name, delta_table_names, partition, delta_ts_filter, view_catalog_name,
-			    view_schema_name, attached_db_catalog_name, attached_db_schema_name,
-			    has_join && delta_table_names.size() == 1, activity, lineage, affected_keys_sql);
+			auto build_keys = [&](const RefreshMetadata::WindowPartitionLineage &candidate) {
+				return BuildLineageStandardAffectedKeysSQL(
+				    metadata, con, view_name, delta_table_names, partition, delta_ts_filter, view_catalog_name,
+				    view_schema_name, attached_db_catalog_name, attached_db_schema_name,
+				    has_join && delta_table_names.size() == 1, activity, candidate, affected_keys_sql);
+			};
+			auto result = build_keys(lineage);
+			if (result == LineageAffectedKeysResult::UNAVAILABLE && !composite && has_join && !lineage.proven_columns) {
+				// Old single-key metadata can omit arms inferred from null-safe equality.
+				auto rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, partition_cols);
+				if (rebound.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
+					result = build_keys(rebound);
+				}
+			}
 			if (!composite || result == LineageAffectedKeysResult::AVAILABLE) {
 				lineage_result = result;
 				if (composite) {
@@ -768,7 +779,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		partition_cols = {std::move(composite_scope)};
 	} else if (!use_result_diff) {
 		partition_delta_specs =
-		    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);
+		    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols);
 	}
 	if (affected_keys_sql.empty() && delta_table_names.size() > 1 &&
 	    !AllWindowPartitionSourcesCovered(delta_table_names, partition_delta_specs)) {

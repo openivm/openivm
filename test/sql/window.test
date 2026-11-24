@@ -1325,6 +1325,22 @@ CREATE MATERIALIZED VIEW window_nullsafe_mv AS
     FROM window_nullsafe_a a JOIN window_nullsafe_b b
     ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
 
+# Pre-upgrade single-key metadata recorded only the left arm.
+statement ok
+CREATE VIEW window_nullsafe_legacy_expected AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_a a JOIN window_nullsafe_b b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+CREATE MATERIALIZED VIEW window_nullsafe_legacy_mv AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_a a JOIN window_nullsafe_b b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+UPDATE openivm_views
+SET lineage_json = '{"v":1,"items":[{"k":"window_partition","ops":[{"k":"direct","out":"k","source":"window_nullsafe_a","source_col":"k"}]}]}'
+WHERE view_sql_name = 'window_nullsafe_legacy_mv';
+
 statement ok
 INSERT INTO window_nullsafe_a VALUES (5,NULL,10,110),(6,2,20,1);
 INSERT INTO window_nullsafe_b VALUES (14,4294967295,10,50);
@@ -1351,6 +1367,29 @@ SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
 FROM openivm_compiled_statements
 WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_mv');
+----
+true
+
+statement ok
+PRAGMA refresh('window_nullsafe_legacy_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_nullsafe_legacy_mv EXCEPT ALL FROM window_nullsafe_legacy_expected)
+    UNION ALL
+    (FROM window_nullsafe_legacy_expected EXCEPT ALL FROM window_nullsafe_legacy_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_a')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_b')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_legacy_mv');
 ----
 true
 
@@ -1437,5 +1476,49 @@ SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
 FROM openivm_compiled_statements
 WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_wide_mv');
+----
+true
+
+# Unsigned-only widening preserves lineage even beyond the projected key's range.
+statement ok
+CREATE TABLE window_nullsafe_unsigned (id INT, k UBIGINT, q UBIGINT, v INT);
+INSERT INTO window_nullsafe_unsigned VALUES (21,NULL,10,1),(22,2,20,2),(23,3,30,3);
+CREATE VIEW window_nullsafe_unsigned_expected AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k,a.q ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_b a JOIN window_nullsafe_unsigned b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+CREATE MATERIALIZED VIEW window_nullsafe_unsigned_mv AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k,a.q ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_b a JOIN window_nullsafe_unsigned b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+
+statement ok
+INSERT INTO window_nullsafe_unsigned VALUES (24,18446744073709551615,10,4),(25,NULL,10,5);
+UPDATE window_nullsafe_unsigned SET v=6 WHERE id=21;
+DELETE FROM window_nullsafe_unsigned WHERE id=25;
+INSERT INTO window_nullsafe_b VALUES (15,NULL,10,7);
+
+statement ok
+PRAGMA refresh('window_nullsafe_unsigned_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_nullsafe_unsigned_mv EXCEPT ALL FROM window_nullsafe_unsigned_expected)
+    UNION ALL
+    (FROM window_nullsafe_unsigned_expected EXCEPT ALL FROM window_nullsafe_unsigned_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_b')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_unsigned')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_unsigned_mv');
 ----
 true
