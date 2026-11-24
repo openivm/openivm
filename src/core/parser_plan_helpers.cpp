@@ -3144,6 +3144,15 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	std::sort(out.proven_columns->begin(), out.proven_columns->end());
 	std::sort(out.coalesce_columns.begin(), out.coalesce_columns.end());
 	for (auto &op : ops) {
+		// A direct arm for the same occurrence already supplies this key.
+		if (partition_columns.size() > 1 && op.kind == WindowLineageKind::LOOKUP && out.IsProven(op.output_col) &&
+		    std::any_of(partition_ops.begin(), partition_ops.end(), [&](const WindowLineageOp &direct) {
+			    return direct.source_occurrence == op.source_occurrence &&
+			           StringUtil::CIEquals(direct.source_table, op.source_table) &&
+			           StringUtil::CIEquals(direct.output_col, op.output_col);
+		    })) {
+			continue;
+		}
 		out.ops.push_back(ToMetadataWindowLineageOp(op));
 	}
 	return !out.proven_columns->empty();

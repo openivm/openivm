@@ -989,3 +989,66 @@ WHERE operation = 'refresh' AND sql LIKE '%openivm_window_current%'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_winner_mv');
 ----
 true
+
+# A bound common key scopes a native join with multiple partition columns.
+statement ok
+CREATE TABLE composite_left_rows (id INT, k INT, q INT, v INT);
+CREATE TABLE composite_right_rows (id INT, k INT, q INT, v INT);
+INSERT INTO composite_left_rows VALUES (1,1,10,100),(2,1,10,90),(3,2,20,80),(4,3,30,70);
+INSERT INTO composite_right_rows VALUES (11,1,10,1),(12,2,20,2),(13,3,30,3);
+CREATE VIEW composite_join_expected AS
+    SELECT l.id AS lid,r.id AS rid,l.k,l.q,l.v+r.v AS v,
+           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS rn
+    FROM composite_left_rows l JOIN composite_right_rows r ON l.k=r.k AND l.q=r.q;
+CREATE MATERIALIZED VIEW composite_join_mv AS
+    SELECT l.id AS lid,r.id AS rid,l.k,l.q,l.v+r.v AS v,
+           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS rn
+    FROM composite_left_rows l JOIN composite_right_rows r ON l.k=r.k AND l.q=r.q;
+
+statement ok
+INSERT INTO composite_left_rows VALUES (5,1,10,110),(6,2,20,1);
+UPDATE composite_right_rows SET v=5 WHERE id=11;
+DELETE FROM composite_left_rows WHERE id IN (1,6);
+
+statement ok
+PRAGMA refresh('composite_join_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM composite_join_mv EXCEPT ALL FROM composite_join_expected)
+    UNION ALL
+    (FROM composite_join_expected EXCEPT ALL FROM composite_join_mv)
+);
+----
+0
+
+# Existing views rebind the saved definition to prove their common key.
+statement ok
+UPDATE openivm_views SET lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'composite_join_mv';
+INSERT INTO composite_right_rows VALUES (14,3,30,4),(15,1,10,5);
+UPDATE composite_left_rows SET k=3,q=30 WHERE id=3;
+DELETE FROM composite_right_rows WHERE id IN (12,15);
+
+statement ok
+PRAGMA refresh('composite_join_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM composite_join_mv EXCEPT ALL FROM composite_join_expected)
+    UNION ALL
+    (FROM composite_join_expected EXCEPT ALL FROM composite_join_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_delta_composite_left_rows')
+                          AND contains(sql, 'openivm_delta_composite_right_rows')
+                          AND contains(sql, 'openivm_changed_partitions')) >= 2
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'composite_join_mv');
+----
+true
