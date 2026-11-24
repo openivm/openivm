@@ -1260,3 +1260,49 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_local_equality_mv');
 ----
 true
+
+# Sources introduced after a window can inherit the later join's key transitively.
+statement ok
+CREATE VIEW window_chained_equality_expected AS
+    SELECT t.id AS aid,b.id AS bid,t.k,t.lower_rn,
+           row_number() OVER (PARTITION BY t.k ORDER BY t.id,b.id) AS upper_rn
+    FROM (
+        SELECT *,row_number() OVER (PARTITION BY k ORDER BY id) AS lower_rn
+        FROM window_before_join_a
+    ) t JOIN window_before_join_b b ON t.k=b.k
+        JOIN window_before_join_c c ON b.k=c.k;
+CREATE MATERIALIZED VIEW window_chained_equality_mv AS
+    SELECT t.id AS aid,b.id AS bid,t.k,t.lower_rn,
+           row_number() OVER (PARTITION BY t.k ORDER BY t.id,b.id) AS upper_rn
+    FROM (
+        SELECT *,row_number() OVER (PARTITION BY k ORDER BY id) AS lower_rn
+        FROM window_before_join_a
+    ) t JOIN window_before_join_b b ON t.k=b.k
+        JOIN window_before_join_c c ON b.k=c.k;
+
+statement ok
+INSERT INTO window_before_join_c VALUES (2),(4);
+UPDATE window_before_join_c SET k=2 WHERE k=1;
+DELETE FROM window_before_join_c WHERE k=4;
+
+statement ok
+PRAGMA refresh('window_chained_equality_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_chained_equality_mv EXCEPT ALL FROM window_chained_equality_expected)
+    UNION ALL
+    (FROM window_chained_equality_expected EXCEPT ALL FROM window_chained_equality_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_window_before_join_c')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_chained_equality_mv');
+----
+true

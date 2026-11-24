@@ -3087,18 +3087,15 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		return false;
 	}
 
-	WindowInputRange common_input {0, facts.plan_nodes_post_order.size()};
 	unordered_map<string, idx_t> first_windows;
 	for (auto *window : facts.windows) {
-		auto input = GetWindowInputRange(facts, *window);
-		common_input.first = MaxValue(common_input.first, input.first);
-		common_input.end = MinValue(common_input.end, input.end);
-		for (auto index : facts.plan_nodes_post_order[input.end].subtree_table_indices) {
+		auto window_id = facts.plan_node_ids.at(window);
+		for (auto index : facts.plan_nodes_post_order[window_id].subtree_table_indices) {
 			auto source = facts.occurrence_by_index.find(index);
 			if (source != facts.occurrence_by_index.end()) {
 				auto &occurrence = source->second;
-				auto entry = first_windows.emplace(OccurrenceKey(occurrence.table, occurrence.occurrence), input.end);
-				entry.first->second = MinValue(entry.first->second, input.end);
+				auto entry = first_windows.emplace(OccurrenceKey(occurrence.table, occurrence.occurrence), window_id);
+				entry.first->second = MinValue(entry.first->second, window_id);
 			}
 		}
 	}
@@ -3145,8 +3142,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		changed = false;
 		vector<WindowLineageOp> next_ops = partition_ops;
 		for (auto &edge : edges) {
-			// A transferred source key must hold for every window.
-			if (edge.HasCast() || !common_input.Contains(edge.join_id)) {
+			if (edge.HasCast()) {
 				continue;
 			}
 			for (auto &direct : partition_ops) {
@@ -3155,7 +3151,9 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				direct_ref.occurrence = direct.source_occurrence;
 				direct_ref.column = direct.source_col;
 				auto *other = OtherWindowKey(edge, direct_ref);
-				if (!other || HasEquivalentPartitionRef(next_ops, *other, direct.output_col)) {
+				// An equality must precede the first window that reads the new source.
+				if (!other || !IsEarlyWindowEvidence(first_windows, *other, edge.join_id) ||
+				    HasEquivalentPartitionRef(next_ops, *other, direct.output_col)) {
 					continue;
 				}
 				WindowLineageOp equivalent;
