@@ -1016,9 +1016,11 @@ SELECT count(*) FROM (
 0
 
 query I
-SELECT count(*) >= 2 FROM openivm_compiled_statements
-WHERE operation = 'refresh' AND contains(sql, 'openivm_window_current')
-AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_limited_mv');
+SELECT bool_or(contains(sql, 'openivm_window_current'))
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_limited_mv')
+GROUP BY version ORDER BY version DESC LIMIT 1;
 ----
 true
 
