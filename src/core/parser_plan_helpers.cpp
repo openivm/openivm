@@ -2866,15 +2866,55 @@ static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &
 	return sources;
 }
 
-bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts) {
-	// LIMIT, TOP_N and DISTINCT ON can evict a row from a different window
-	// partition even when the evicted row's source never changed.
+static bool DistinctOnPreservesWindowPartitions(const LogicalDistinct &distinct, const CreateMVPlanFacts &facts,
+                                                const vector<string> &partition_columns,
+                                                const vector<string> &output_names,
+                                                const RefreshMetadata::WindowPartitionLineage &lineage) {
+	auto spine = ViewOutputSpine(facts.root);
+	if (partition_columns.empty() || spine.projections.empty()) {
+		return false;
+	}
+	auto &projection = *spine.projections.front();
+	for (const auto &partition : partition_columns) {
+		auto output = RefreshMetadata::ParseWindowColumn(partition).first;
+		if (!lineage.IsProven(output)) {
+			return false;
+		}
+		auto position = std::find_if(output_names.begin(), output_names.end(),
+		                             [&](const string &name) { return StringUtil::CIEquals(output, name); });
+		auto index = static_cast<idx_t>(position - output_names.begin());
+		if (position == output_names.end() || index >= projection.expressions.size()) {
+			return false;
+		}
+		const auto &key = WindowKeyExpression(*projection.expressions[index], facts);
+		if (std::none_of(distinct.distinct_targets.begin(), distinct.distinct_targets.end(),
+		                 [&](const unique_ptr<Expression> &target) {
+			                 return Expression::Equals(WindowKeyExpression(*target, facts), key);
+		                 })) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                  const vector<string> &output_names,
+                                  const RefreshMetadata::WindowPartitionLineage &lineage) {
+	// LIMIT and TOP_N can evict rows across partitions. DISTINCT ON can
+	// displace a winner only within its own key, which must include the
+	// bound window keys for the change feed to cover the evicted row.
 	return std::any_of(
-	    facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [](const CreateMVPlanNodeFacts &node) {
+	    facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [&](const CreateMVPlanNodeFacts &node) {
 		    auto type = node.plan_node->type;
-		    return type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N ||
-		           (type == LogicalOperatorType::LOGICAL_DISTINCT &&
-		            node.plan_node->Cast<LogicalDistinct>().distinct_type == DistinctType::DISTINCT_ON);
+		    if (type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N) {
+			    return true;
+		    }
+		    if (type != LogicalOperatorType::LOGICAL_DISTINCT) {
+			    return false;
+		    }
+		    auto &distinct = node.plan_node->Cast<LogicalDistinct>();
+		    return distinct.distinct_type == DistinctType::DISTINCT_ON &&
+		           !DistinctOnPreservesWindowPartitions(distinct, facts, partition_columns, output_names, lineage);
 	    });
 }
 

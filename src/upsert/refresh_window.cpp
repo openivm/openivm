@@ -535,8 +535,10 @@ static RefreshMetadata::WindowPartitionLineage RebindWindowPartitionLineage(Conn
 			}
 			auto facts =
 			    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(*con.context).catalog);
-			if (!WindowPlanRequiresResultDiff(facts)) {
-				BuildWindowPartitionLineageOps(facts, {partition_spec}, column_names, rebound);
+			vector<string> partitions {partition_spec};
+			BuildWindowPartitionLineageOps(facts, partitions, column_names, rebound);
+			if (WindowPlanRequiresResultDiff(facts, partitions, column_names, rebound)) {
+				rebound = RefreshMetadata::WindowPartitionLineage();
 			}
 		});
 	} catch (const std::exception &error) {
