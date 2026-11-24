@@ -1121,3 +1121,54 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_namesake_mv');
 ----
 true
+
+# An equality introduced after a window cannot scope that window's inputs.
+statement ok
+CREATE TABLE window_before_join_a (id INT, k INT, v INT);
+CREATE TABLE window_before_join_b (id INT, k INT);
+CREATE TABLE window_before_join_c (k INT);
+INSERT INTO window_before_join_a VALUES (4,1,40),(5,2,50),(6,3,60);
+INSERT INTO window_before_join_b VALUES (11,1),(12,2),(13,3);
+INSERT INTO window_before_join_c VALUES (1),(2),(3);
+CREATE VIEW window_before_join_expected AS
+    SELECT t.aid,t.bid,t.k,t.lower_rn,
+           row_number() OVER (PARTITION BY t.k ORDER BY t.aid,t.bid) AS upper_rn
+    FROM (
+        SELECT a.id AS aid,b.id AS bid,a.k AS k,b.k AS bk,
+               row_number() OVER (PARTITION BY b.k ORDER BY a.id,b.id) AS lower_rn
+        FROM window_before_join_a a CROSS JOIN window_before_join_b b
+    ) t JOIN window_before_join_c c ON t.k=c.k AND t.bk=c.k;
+CREATE MATERIALIZED VIEW window_before_join_mv AS
+    SELECT t.aid,t.bid,t.k,t.lower_rn,
+           row_number() OVER (PARTITION BY t.k ORDER BY t.aid,t.bid) AS upper_rn
+    FROM (
+        SELECT a.id AS aid,b.id AS bid,a.k AS k,b.k AS bk,
+               row_number() OVER (PARTITION BY b.k ORDER BY a.id,b.id) AS lower_rn
+        FROM window_before_join_a a CROSS JOIN window_before_join_b b
+    ) t JOIN window_before_join_c c ON t.k=c.k AND t.bk=c.k;
+
+statement ok
+INSERT INTO window_before_join_a VALUES (1,2,10),(2,2,20);
+UPDATE window_before_join_a SET v=51 WHERE id=5;
+DELETE FROM window_before_join_a WHERE id=2;
+
+statement ok
+PRAGMA refresh('window_before_join_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_before_join_mv EXCEPT ALL FROM window_before_join_expected)
+    UNION ALL
+    (FROM window_before_join_expected EXCEPT ALL FROM window_before_join_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_before_join_mv');
+----
+true

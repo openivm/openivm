@@ -2668,7 +2668,7 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 }
 
 static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
-                                   vector<WindowEquivalenceEdge> &equivalence_edges,
+                                   optional_ptr<vector<WindowEquivalenceEdge>> equivalence_edges,
                                    vector<WindowLookupEdge> &lookup_edges) {
 	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
 	    join.type != LogicalOperatorType::LOGICAL_ASOF_JOIN) {
@@ -2713,8 +2713,8 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		default:
 			break;
 		}
-		if (join.join_type == JoinType::INNER) {
-			equivalence_edges.push_back(
+		if (join.join_type == JoinType::INNER && equivalence_edges) {
+			equivalence_edges->push_back(
 			    {std::move(left_ref), std::move(left_cast), std::move(right_ref), std::move(right_cast)});
 		}
 	}
@@ -3054,10 +3054,26 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		return false;
 	}
 
+	// Post-order node IDs form contiguous subtree ranges. An equality must
+	// hold at the input of every window before it can transfer partition keys.
+	idx_t first_input = 0;
+	idx_t end_input = facts.plan_nodes_post_order.size();
+	for (auto *window : facts.windows) {
+		auto window_id = facts.plan_node_ids.at(window);
+		end_input = MinValue(end_input, window_id);
+		auto first = window_id;
+		while (!facts.plan_nodes_post_order[first].child_ids.empty()) {
+			first = facts.plan_nodes_post_order[first].child_ids.front();
+		}
+		first_input = MaxValue(first_input, first);
+	}
+
 	vector<WindowEquivalenceEdge> edges;
 	vector<WindowLookupEdge> lookup_edges;
 	for (auto *join : facts.comparison_joins) {
-		CollectWindowJoinEdges(*join, facts, edges, lookup_edges);
+		auto join_id = facts.plan_node_ids.at(join);
+		CollectWindowJoinEdges(*join, facts, join_id >= first_input && join_id < end_input ? &edges : nullptr,
+		                       lookup_edges);
 	}
 
 	auto nullable_sources = NullExtendedWindowSources(facts);
