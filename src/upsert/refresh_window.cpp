@@ -62,36 +62,6 @@ static bool AnyDuckLakeSource(RefreshMetadata &metadata, const string &view_name
 	return false;
 }
 
-static vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const vector<string> &column_names) {
-	if (partition_cols.empty()) {
-		return {};
-	}
-	if (partition_cols.size() == 1) {
-		auto key = RefreshMetadata::ParseWindowColumn(partition_cols[0]).first;
-		if (std::find(column_names.begin(), column_names.end(), key) != column_names.end()) {
-			return partition_cols;
-		}
-		return {};
-	}
-	// Preserve the existing single-key change-feed path when a quoted
-	// identifier adds a second common key. Filtering by the previously
-	// usable key covers every affected partition without filtering by a tuple.
-	string plain_key;
-	idx_t plain_count = 0;
-	for (auto &pc : partition_cols) {
-		auto parsed = RefreshMetadata::ParseWindowColumn(pc);
-		if (parsed.first.find('=') != string::npos || parsed.second.find('=') != string::npos ||
-		    RefreshMetadata::IsTaggedWindowColumn(pc)) {
-			continue;
-		}
-		if (std::find(column_names.begin(), column_names.end(), parsed.first) != column_names.end()) {
-			plain_key = pc;
-			plain_count++;
-		}
-	}
-	return plain_count == 1 ? vector<string> {std::move(plain_key)} : vector<string>();
-}
-
 static string ResolveStandardTrackedTableSQL(RefreshMetadata &metadata, const string &view_name,
                                              const vector<string> &delta_table_names, const string &table_name,
                                              bool delta_table, const string &view_catalog_name,
@@ -354,6 +324,10 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
                                                    RefreshPublicationScope *publication_scope) {
 	vector<string> visible_columns;
 	for (auto &column : column_names) {
+		// A stored column named rowid shadows the physical row identifier.
+		if (StringUtil::CIEquals(column, "rowid")) {
+			return "";
+		}
 		if (!IncrementalTableNames::IsInternalColumn(column)) {
 			visible_columns.push_back(column);
 		}

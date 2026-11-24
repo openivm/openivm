@@ -156,6 +156,7 @@ string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
+vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const vector<string> &column_names);
 bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                   const vector<string> &output_names,
                                   const RefreshMetadata::WindowPartitionLineage &lineage);

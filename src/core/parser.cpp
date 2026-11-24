@@ -1003,7 +1003,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 	}
 	auto lineage_start = create_profile_now();
-	PopulateDeltaViewModelLineage(view_model, facts, output_names);
+	PopulateDeltaViewModelLineage(view_model, facts, output_names, model_input.has_ducklake_source);
 	string lineage_json = BuildDeltaViewModelLineageJson(view_model);
 	int64_t lineage_duration_ms =
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lineage_start).count();

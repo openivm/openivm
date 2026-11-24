@@ -207,7 +207,7 @@ void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts,
 }
 
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
-                                   const vector<string> &output_names) {
+                                   const vector<string> &output_names, bool has_ducklake_source) {
 	model.window_lineage = RefreshMetadata::WindowPartitionLineage();
 	model.has_projection_lineage = false;
 	model.has_left_join_key_source = false;
@@ -222,8 +222,12 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
 		                                                  model.window_lineage, &direct_lineage_ops);
 		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
+		auto ducklake_scope = has_ducklake_source && model.window_partition_columns.size() > 1
+		                          ? DuckLakeWindowScope(model.window_partition_columns, output_names)
+		                          : vector<string>();
+		const auto &refresh_scope = ducklake_scope.empty() ? model.window_partition_columns : ducklake_scope;
 		model.window_requires_result_diff =
-		    WindowPlanRequiresResultDiff(facts, model.window_partition_columns, output_names, model.window_lineage);
+		    WindowPlanRequiresResultDiff(facts, refresh_scope, output_names, model.window_lineage);
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, facts) ||
 		     !WindowLineageCoversAllSources(model.window_lineage.ops, facts))) {

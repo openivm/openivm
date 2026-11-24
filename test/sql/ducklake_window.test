@@ -1744,8 +1744,8 @@ true
 
 # DISTINCT ON by the window key can only replace a winner in the same partition.
 statement ok
-CREATE TABLE dl.partition_winner_scores (id INT, k INT, score INT);
-INSERT INTO dl.partition_winner_scores VALUES (1,1,100),(2,2,90),(3,1,80),(4,3,70);
+CREATE TABLE dl.partition_winner_scores (id INT, k INT, "q=key" INT, score INT);
+INSERT INTO dl.partition_winner_scores VALUES (1,1,10,100),(2,2,20,90),(3,1,11,80),(4,3,30,70);
 CREATE VIEW partition_winner_expected AS
     SELECT id,k,score,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
     FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
@@ -1753,8 +1753,24 @@ CREATE MATERIALIZED VIEW dl.partition_winner_mv AS
     SELECT id,k,score,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
     FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
 
+-- The selected DuckLake key k covers all of its narrower (k, "q=key") partitions.
+CREATE VIEW composite_winner_expected AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
+CREATE MATERIALIZED VIEW dl.composite_winner_mv AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
+
+-- A distinct key that preserves only the secondary partition column is insufficient.
+CREATE VIEW secondary_winner_expected AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON ("q=key") * FROM dl.partition_winner_scores ORDER BY "q=key",score DESC,id) winners;
+CREATE MATERIALIZED VIEW dl.secondary_winner_mv AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON ("q=key") * FROM dl.partition_winner_scores ORDER BY "q=key",score DESC,id) winners;
+
 statement ok
-INSERT INTO dl.partition_winner_scores VALUES (5,1,110),(6,2,1);
+INSERT INTO dl.partition_winner_scores VALUES (5,1,20,110),(6,2,21,1);
 UPDATE dl.partition_winner_scores SET score=120 WHERE id=5;
 DELETE FROM dl.partition_winner_scores WHERE id=6;
 
@@ -1776,5 +1792,83 @@ SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
 FROM openivm_compiled_statements
 WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'partition_winner_mv');
+----
+true
+
+statement ok
+PRAGMA refresh('dl.composite_winner_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.composite_winner_mv EXCEPT ALL FROM composite_winner_expected)
+    UNION ALL
+    (FROM composite_winner_expected EXCEPT ALL FROM dl.composite_winner_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'composite_winner_mv');
+----
+true
+
+statement ok
+PRAGMA refresh('dl.secondary_winner_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.secondary_winner_mv EXCEPT ALL FROM secondary_winner_expected)
+    UNION ALL
+    (FROM secondary_winner_expected EXCEPT ALL FROM dl.secondary_winner_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'secondary_winner_mv');
+----
+true
+
+# User rowids can repeat across partitions and must not be used for physical deletes.
+statement ok
+CREATE TABLE dl.quoted_window_rowids (id INT, "p=key" INT, "RoWiD" INT, score INT);
+INSERT INTO dl.quoted_window_rowids VALUES (1,1,7,100),(2,2,7,90),(3,1,8,80),(4,3,8,70);
+CREATE VIEW quoted_rowid_expected AS
+    SELECT id,"p=key" AS pk,"RoWiD",score,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.quoted_window_rowids;
+CREATE MATERIALIZED VIEW dl.quoted_rowid_mv AS
+    SELECT id,"p=key" AS pk,"RoWiD",score,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.quoted_window_rowids;
+
+statement ok
+INSERT INTO dl.quoted_window_rowids VALUES (5,1,9,110),(6,1,10,1);
+UPDATE dl.quoted_window_rowids SET score=120 WHERE id=1;
+DELETE FROM dl.quoted_window_rowids WHERE id=6;
+
+statement ok
+PRAGMA refresh('dl.quoted_rowid_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_rowid_mv EXCEPT ALL FROM quoted_rowid_expected)
+    UNION ALL
+    (FROM quoted_rowid_expected EXCEPT ALL FROM dl.quoted_rowid_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_changed')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_rowid_mv');
 ----
 true
