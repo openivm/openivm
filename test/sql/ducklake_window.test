@@ -2082,6 +2082,10 @@ CREATE MATERIALIZED VIEW dl.window_identity_result_{snapshot} AS
     SELECT id,"p=key" AS pk,duration,list_value(reading) AS readings,
            row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
     FROM (SELECT * FROM dl.window_identity_{snapshot} ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW dl.window_identity_compact_child_{snapshot} AS
+    SELECT * FROM dl.window_identity_compact_{snapshot} WHERE id > 0;
+CREATE MATERIALIZED VIEW dl.window_identity_result_child_{snapshot} AS
+    SELECT * FROM dl.window_identity_result_{snapshot} WHERE id > 0;
 
 statement ok
 DELETE FROM dl.window_identity_{snapshot} WHERE id IN (1,2);
@@ -2104,6 +2108,19 @@ SELECT count(*) FROM (
     (SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot}
      EXCEPT ALL
      SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_{snapshot})
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_child_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot})
+    UNION ALL
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_child_{snapshot})
 );
 ----
 0

@@ -1574,9 +1574,10 @@ static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &
 	return true;
 }
 
-string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                                const vector<LogicalType> &column_types, const vector<string> &delta_table_names,
-                                const string &data_table, const string &view_query_sql, const string &delta_ts_filter,
+string CompileProjectionRefresh(RefreshMetadata &metadata, SqlDialect dialect, const string &view_name,
+                                const vector<string> &column_names, const vector<LogicalType> &column_types,
+                                const vector<string> &delta_table_names, const string &data_table,
+                                const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete, bool insert_only, const vector<string> &active_delta_table_names,
                                 bool can_use_runtime_delta_shape, ProjectionDeleteRetryPlan *delete_retry_plan,
@@ -1590,14 +1591,15 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 		if (insert_only && nullable_side_quiet) {
 			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN insert-only append for %s (nullable side quiet)\n",
 			                    view_name.c_str());
-			return CompileProjectionsFilters(view_name, column_names, column_types, delta_ts_filter, catalog_prefix,
+			return CompileProjectionsFilters(dialect, view_name, column_names, column_types, delta_ts_filter,
+			                                 catalog_prefix,
 			                                 /*insert_only=*/true, appended_rows);
 		}
 		return BuildLeftJoinProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
 		                                      view_query_sql, delta_ts_filter, catalog_prefix,
 		                                      can_use_runtime_delta_shape, nullable_side_quiet, delete_retry_plan);
 	}
-	return CompileProjectionsFilters(view_name, column_names, column_types, delta_ts_filter, catalog_prefix,
+	return CompileProjectionsFilters(dialect, view_name, column_names, column_types, delta_ts_filter, catalog_prefix,
 	                                 skip_proj_delete, appended_rows);
 }
 

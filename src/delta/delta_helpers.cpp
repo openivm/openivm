@@ -1,6 +1,7 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "delta/delta_helpers.hpp"
 
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/plan_rewrite_internal.hpp"
@@ -126,13 +127,17 @@ static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder
 	for (idx_t i = 0; i < base_col_count; i++) { // mull-ignore: cxx_lt_to_le
 		groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
 	}
-	// SQL equality merges signed zeros, but scalar projections and zero-sign
-	// support counts can observe them. Retain their signs through compaction.
+	// Keep representations that downstream expressions can distinguish.
 	Optimizer optimizer(binder, context);
+	const bool native = openivm::CompileFactsContextSlot::Get(context).target_dialect == SqlDialect::DUCKDB;
 	for (idx_t i = 0; i < base_col_count; i++) {
-		if (input_types[i].id() == LogicalTypeId::DOUBLE || input_types[i].id() == LogicalTypeId::FLOAT) {
-			groups.push_back(MakeNegativeZeroExpression(
-			    context, optimizer, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i])));
+		const auto &type = input_types[i];
+		if (type.id() == LogicalTypeId::DOUBLE || type.id() == LogicalTypeId::FLOAT) {
+			groups.push_back(MakeNegativeZeroExpression(context, optimizer,
+			                                            make_uniq<BoundColumnRefExpression>(type, input_bindings[i])));
+		} else if (native && SqlUtils::EqualityCanHideValueIdentity(type)) {
+			groups.push_back(optimizer.BindScalarFunction(
+			    "openivm_internal_value_key", make_uniq<BoundColumnRefExpression>(type, input_bindings[i])));
 		}
 	}
 	auto aggregate = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(delta_node));

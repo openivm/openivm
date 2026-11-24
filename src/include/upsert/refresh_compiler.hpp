@@ -78,14 +78,14 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
                                const vector<LogicalType> &column_types = {},
                                const DerivedAggregateOutputInfo &derived_outputs = {},
                                const DerivedAggregateOutputRenderer &render_derived_output = {});
-string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
+string CompileProjectionsFilters(SqlDialect dialect, const string &view_name, const vector<string> &column_names,
                                  const vector<LogicalType> &column_types, const string &delta_ts_filter = "",
                                  const string &catalog_prefix = "", bool insert_only = false,
                                  string *appended_rows = nullptr);
-string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
-                              const vector<LogicalType> &column_types, const string &delta_ts_filter = "",
-                              bool insert_only = false, string *appended_rows = nullptr,
-                              bool preserve_value_identity = false);
+string CompileProjectionDelta(SqlDialect dialect, const string &data_table, const string &delta_view,
+                              const vector<string> &column_names, const vector<LogicalType> &column_types,
+                              const string &delta_ts_filter = "", bool insert_only = false,
+                              string *appended_rows = nullptr);
 vector<string> PartitionOutputColumns(const vector<string> &partition_columns);
 
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",

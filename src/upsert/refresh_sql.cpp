@@ -1318,15 +1318,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			refresh_plan.skip_projection_key_delta = true;
 		} else {
 			upsert_query = CompileProjectionRefresh(
-			    metadata, view_name, column_names, column_types, delta_table_names, data_table, view_query_sql,
-			    delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
-			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only, delete_retry_plan,
-			    &appended_projection_rows);
+			    metadata, active_facts.target_dialect, view_name, column_names, column_types, delta_table_names,
+			    data_table, view_query_sql, delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join,
+			    skip_proj_delete, insert_only, fast_paths.active_delta_table_names,
+			    cross_system && !active_facts.compile_only, delete_retry_plan, &appended_projection_rows);
 			if (delete_retry_plan && delete_retry_plan->IsActive()) {
 				fallback_upsert_query = CompileProjectionRefresh(
-				    metadata, view_name, column_names, column_types, delta_table_names, data_table, view_query_sql,
-				    delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete,
-				    insert_only, fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only);
+				    metadata, active_facts.target_dialect, view_name, column_names, column_types, delta_table_names,
+				    data_table, view_query_sql, delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join,
+				    skip_proj_delete, insert_only, fast_paths.active_delta_table_names,
+				    cross_system && !active_facts.compile_only);
 			}
 		}
 		break;
@@ -1948,10 +1949,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto visible = publication_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name));
 			auto visible_delta = "(SELECT *, CAST(0 AS BIGINT) AS " + string(openivm::PUBLISHED_ORDINAL_COL) +
 			                     " FROM " + signed_publication_rows + ")";
-			publication_sql = CompileProjectionDelta(visible, visible_delta, publication_columns, publication_types,
-			                                         signed_publication_filter, /*insert_only=*/false,
-			                                         /*appended_rows=*/nullptr,
-			                                         dispatch_refresh_type == RefreshType::WINDOW_PARTITION);
+			publication_sql = CompileProjectionDelta(active_facts.target_dialect, visible, visible_delta,
+			                                         publication_columns, publication_types, signed_publication_filter);
 			OPENIVM_DEBUG_PRINT("[PUBLISH] Applying exact signed row changes for %s\n", view_name.c_str());
 		} else {
 			publication_sql = BuildPublishViewSQL(
