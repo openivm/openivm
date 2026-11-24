@@ -1949,7 +1949,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto visible_delta = "(SELECT *, CAST(0 AS BIGINT) AS " + string(openivm::PUBLISHED_ORDINAL_COL) +
 			                     " FROM " + signed_publication_rows + ")";
 			publication_sql = CompileProjectionDelta(visible, visible_delta, publication_columns, publication_types,
-			                                         signed_publication_filter);
+			                                         signed_publication_filter, /*insert_only=*/false,
+			                                         /*appended_rows=*/nullptr,
+			                                         dispatch_refresh_type == RefreshType::WINDOW_PARTITION);
 			OPENIVM_DEBUG_PRINT("[PUBLISH] Applying exact signed row changes for %s\n", view_name.c_str());
 		} else {
 			publication_sql = BuildPublishViewSQL(

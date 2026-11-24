@@ -1309,7 +1309,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 
 string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
                               const vector<LogicalType> &column_types, const string &delta_ts_filter, bool insert_only,
-                              string *appended_rows) {
+                              string *appended_rows, bool preserve_value_identity) {
 	string mul = string(openivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
@@ -1336,20 +1336,27 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 		return "INSERT INTO " + data_table + " " + rows + ";\n";
 	}
 
-	// Separate SQL-equal zero representations in both consolidation and copy
-	// deletion. Otherwise a sign-only replacement disappears, or deletes a copy
-	// with the opposite sign from a mixed bag.
+	// Consolidate and delete copies by the same representation-aware identity.
 	D_ASSERT(column_names.size() == column_types.size());
 	string group_columns = select_columns;
 	for (idx_t index = 0; index < column_names.size(); index++) {
-		if (column_types[index].id() == LogicalTypeId::FLOAT || column_types[index].id() == LogicalTypeId::DOUBLE) {
-			auto column = SqlUtils::QuoteIdentifier(column_names[index]);
-			group_columns += ", " + SqlUtils::NegativeZeroSQL(column);
-			match_conditions += " AND (" + SqlUtils::NegativeZeroSQL("v." + column) + ") = (" +
-			                    SqlUtils::NegativeZeroSQL("d." + column) + ")";
+		const auto &type = column_types[index];
+		if (!preserve_value_identity && type.id() != LogicalTypeId::FLOAT && type.id() != LogicalTypeId::DOUBLE) {
+			continue;
+		}
+		auto identity = [&](const string &value) {
+			return preserve_value_identity ? SqlUtils::ValueIdentitySQL(value, type, SqlDialect::DUCKDB)
+			                               : SqlUtils::NegativeZeroSQL(value);
+		};
+		auto column = SqlUtils::QuoteIdentifier(column_names[index]);
+		auto unqualified = identity(column);
+		if (!unqualified.empty()) {
+			group_columns += ", " + unqualified;
+			match_conditions +=
+			    " AND (" + identity("v." + column) + ") IS NOT DISTINCT FROM (" + identity("d." + column) + ")";
 		}
 	}
-	OPENIVM_DEBUG_PRINT("[CompileProjectionDelta] Preserving zero signs in tuple consolidation for %s\n",
+	OPENIVM_DEBUG_PRINT("[CompileProjectionDelta] Compiled representation-aware tuple consolidation for %s\n",
 	                    data_table.c_str());
 
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).

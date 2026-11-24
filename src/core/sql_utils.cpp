@@ -64,6 +64,13 @@ string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, 
 	return EqualityCanHideValueIdentity(type) ? "openivm_internal_value_key(" + value + ")" : "";
 }
 
+string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, SqlDialect dialect) {
+	if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+		return NegativeZeroSQL(value, dialect);
+	}
+	return dialect == SqlDialect::DUCKDB ? ValueIdentitySQL(value, type) : "";
+}
+
 bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
 	return TypeVisitor::Contains(type, [](const LogicalType &child) {
 		return child.id() == LogicalTypeId::VARIANT || child.id() == LogicalTypeId::INTERVAL ||

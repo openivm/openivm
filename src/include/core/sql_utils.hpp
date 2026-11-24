@@ -34,6 +34,7 @@ public:
 	static string FloatingRepresentativeSQL(const string &value, const string &negative_count,
 	                                        const string &total_count);
 	static string ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation = "");
+	static string ValueIdentitySQL(const string &value, const LogicalType &type, SqlDialect dialect);
 	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
 	                                     const Identifier &schema) {
 		return EntryLookupInfo(lookup, QualifiedName(catalog, schema, lookup.GetEntryIdentifier()));

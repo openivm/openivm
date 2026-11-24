@@ -182,18 +182,15 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	string create = dialect == SqlDialect::SPARK ? "CREATE TABLE " : "CREATE TEMP TABLE ";
 	string sql = create + next + " AS " + scoped_query + ";\n";
 	auto weight = quote("openivm_publish_weight");
-	// SQL equality merges signed zeros. Keep their sign-only retractions and
-	// insertions so downstream expressions observe the newly published value.
+	// Keep retractions and insertions for representations that SQL equality merges.
 	D_ASSERT(columns.size() == column_types.size());
 	string group_list = column_list;
-	idx_t zero_sign_keys = 0;
 	for (idx_t index = 0; index < columns.size(); index++) {
-		if (column_types[index].id() == LogicalTypeId::FLOAT || column_types[index].id() == LogicalTypeId::DOUBLE) {
-			group_list += ", " + SqlUtils::NegativeZeroSQL(quoted_columns[index], dialect);
-			zero_sign_keys++;
+		auto identity = SqlUtils::ValueIdentitySQL(quoted_columns[index], column_types[index], dialect);
+		if (!identity.empty()) {
+			group_list += ", " + identity;
 		}
 	}
-	OPENIVM_DEBUG_PRINT("[PUBLISH] Retained %zu zero-sign grouping keys for %s\n", zero_sign_keys, view_name.c_str());
 	sql += create + changes + " AS SELECT " + column_list + ", SUM(" + weight + ") AS " + weight +
 	       " FROM (SELECT *, CAST(-1 AS BIGINT) AS " + weight + " FROM (" + old_query +
 	       ") old_rows UNION ALL SELECT *, CAST(1 AS BIGINT) FROM " + next + ") signed_rows GROUP BY " + group_list +

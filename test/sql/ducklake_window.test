@@ -2061,3 +2061,62 @@ GROUP BY view_sql_name ORDER BY view_sql_name;
 ----
 window_zero_diff_mv	true
 window_zero_row_mv	true
+
+# Both window diff paths retain representations that SQL equality merges.
+foreach snapshot true false
+
+statement ok
+SET openivm_snapshot_publication = {snapshot};
+CREATE TABLE dl.window_identity_{snapshot} (id INT, "p=key" INT, duration INTERVAL, reading DOUBLE);
+INSERT INTO dl.window_identity_{snapshot} VALUES
+    (1,1,INTERVAL '1 month',1),(2,2,INTERVAL '1 day','-0.0'::DOUBLE),(3,3,INTERVAL '2 days',3);
+CREATE VIEW window_identity_expected_{snapshot} AS
+    SELECT id,"p=key" AS pk,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_identity_{snapshot};
+CREATE MATERIALIZED VIEW dl.window_identity_compact_{snapshot} AS
+    SELECT id,"p=key" AS pk,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_identity_{snapshot};
+CREATE MATERIALIZED VIEW dl.window_identity_result_{snapshot} AS
+    SELECT id,"p=key" AS pk,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_identity_{snapshot} ORDER BY id LIMIT 10) input;
+
+statement ok
+DELETE FROM dl.window_identity_{snapshot} WHERE id IN (1,2);
+INSERT INTO dl.window_identity_{snapshot} VALUES
+    (1,1,INTERVAL '30 days',1),(2,2,INTERVAL '1 day','0.0'::DOUBLE),(4,3,INTERVAL '2 days',4);
+UPDATE dl.window_identity_{snapshot} SET reading=5 WHERE id=4;
+DELETE FROM dl.window_identity_{snapshot} WHERE id=4;
+
+foreach path compact result
+
+statement ok
+PRAGMA refresh('dl.window_identity_{path}_{snapshot}');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot})
+    UNION ALL
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_{snapshot})
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql,'openivm_internal_value_key') AND contains(sql,
+    CASE '{path}' WHEN 'compact' THEN 'openivm_window_changed' ELSE 'openivm_window_current' END)) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_identity_{path}_{snapshot}');
+----
+true
+
+endloop
+
+endloop
