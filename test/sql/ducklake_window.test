@@ -1670,3 +1670,37 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_composite_mv');
 ----
 true
+
+# The second key can also acquire its spelling through a projected alias.
+statement ok
+CREATE VIEW quoted_alias_expected AS
+    SELECT id,k,"v=alias" AS vkey,row_number() OVER (PARTITION BY k,"v=alias" ORDER BY id) AS rn
+    FROM (SELECT id,k,v AS "v=alias" FROM dl.same_key_window_source) input;
+CREATE MATERIALIZED VIEW dl.quoted_alias_mv AS
+    SELECT id,k,"v=alias" AS vkey,row_number() OVER (PARTITION BY k,"v=alias" ORDER BY id) AS rn
+    FROM (SELECT id,k,v AS "v=alias" FROM dl.same_key_window_source) input;
+
+statement ok
+INSERT INTO dl.same_key_window_source VALUES (60,2,31),(61,2,33);
+UPDATE dl.same_key_window_source SET v=80 WHERE id=60;
+DELETE FROM dl.same_key_window_source WHERE id=61;
+
+statement ok
+PRAGMA refresh('dl.quoted_alias_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_alias_mv EXCEPT ALL FROM quoted_alias_expected)
+    UNION ALL
+    (FROM quoted_alias_expected EXCEPT ALL FROM dl.quoted_alias_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_alias_mv');
+----
+true

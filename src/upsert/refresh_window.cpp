@@ -81,7 +81,7 @@ static vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, 
 	for (auto &pc : partition_cols) {
 		auto parsed = RefreshMetadata::ParseWindowColumn(pc);
 		if (parsed.first.find('=') != string::npos || parsed.second.find('=') != string::npos ||
-		    StringUtil::StartsWith(pc, "json:")) {
+		    RefreshMetadata::IsTaggedWindowColumn(pc)) {
 			continue;
 		}
 		if (std::find(column_names.begin(), column_names.end(), parsed.first) != column_names.end()) {

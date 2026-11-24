@@ -1746,11 +1746,15 @@ vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
 	return ReadViewList(view_name, "group_columns");
 }
 
-string RefreshMetadata::SerializeWindowColumn(const string &output, const string &source) {
-	if (output.find('=') != string::npos || StringUtil::StartsWith(output, VIEW_LIST_JSON_PREFIX)) {
+string RefreshMetadata::SerializeWindowColumn(const string &output, const string &source, bool tagged) {
+	if (tagged || output.find('=') != string::npos || IsTaggedWindowColumn(output)) {
 		return VIEW_LIST_JSON_PREFIX + SqlUtils::JsonArray({output, source});
 	}
 	return output + "=" + source;
+}
+
+bool RefreshMetadata::IsTaggedWindowColumn(const string &spec) {
+	return StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX);
 }
 
 static pair<string, string> ParseLegacyWindowColumn(const string &spec) {

@@ -554,7 +554,8 @@ static bool RewriteWindowGroupColumnSources(Connection &con, RefreshMetadata &me
 		auto spec = RefreshMetadata::ParseWindowColumn(token);
 		if (StringUtil::CIEquals(spec.second, old_name)) {
 			changed = true;
-			rewritten.push_back(RefreshMetadata::SerializeWindowColumn(spec.first, new_name));
+			bool tagged = RefreshMetadata::IsTaggedWindowColumn(token) || spec.second.find('=') != string::npos;
+			rewritten.push_back(RefreshMetadata::SerializeWindowColumn(spec.first, new_name, tagged));
 		} else {
 			rewritten.push_back(token);
 		}

@@ -254,7 +254,8 @@ public:
 	vector<string> GetGroupColumns(const string &view_name);
 
 	// Window partition and order specs map a stored output column to its source column.
-	static string SerializeWindowColumn(const string &output, const string &source);
+	static string SerializeWindowColumn(const string &output, const string &source, bool tagged = false);
+	static bool IsTaggedWindowColumn(const string &spec);
 	static pair<string, string> ParseWindowColumn(const string &spec);
 	static string SerializeWindowColumns(const vector<string> &columns, bool requires_result_diff = false);
 	vector<string> GetWindowPartitionColumns(const string &view_name, bool *requires_result_diff = nullptr);

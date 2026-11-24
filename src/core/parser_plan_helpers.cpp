@@ -3165,7 +3165,10 @@ void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &pa
 			                  : FindQuotedWindowOutput(facts, *spine.projections.front(), output_names,
 			                                           partition_column, order, source);
 			if (!output.empty()) {
-				resolved.push_back(RefreshMetadata::SerializeWindowColumn(output, source));
+				// Preserve that this key needed quoted-name resolution even
+				// if the underlying physical column has an ordinary name.
+				resolved.push_back(
+				    RefreshMetadata::SerializeWindowColumn(output, source, source.find('=') == string::npos));
 			} else if (order) {
 				partition_columns.clear();
 				return;
