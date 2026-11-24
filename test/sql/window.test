@@ -990,7 +990,7 @@ WHERE operation = 'refresh' AND sql LIKE '%openivm_window_current%'
 ----
 true
 
-# A bound common key scopes a native join with multiple partition columns.
+# Both sides of an inner equijoin can supply the common window partition keys.
 statement ok
 CREATE TABLE composite_left_rows (id INT, k INT, q INT, v INT);
 CREATE TABLE composite_right_rows (id INT, k INT, q INT, v INT);
@@ -998,11 +998,13 @@ INSERT INTO composite_left_rows VALUES (1,1,10,100),(2,1,10,90),(3,2,20,80),(4,3
 INSERT INTO composite_right_rows VALUES (11,1,10,1),(12,2,20,2),(13,3,30,3);
 CREATE VIEW composite_join_expected AS
     SELECT l.id AS lid,r.id AS rid,l.k,l.q,l.v+r.v AS v,
-           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS rn
+           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS rn,
+           row_number() OVER (PARTITION BY r.k,r.q ORDER BY r.id,l.id) AS rn_right
     FROM composite_left_rows l JOIN composite_right_rows r ON l.k=r.k AND l.q=r.q;
 CREATE MATERIALIZED VIEW composite_join_mv AS
     SELECT l.id AS lid,r.id AS rid,l.k,l.q,l.v+r.v AS v,
-           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS rn
+           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS rn,
+           row_number() OVER (PARTITION BY r.k,r.q ORDER BY r.id,l.id) AS rn_right
     FROM composite_left_rows l JOIN composite_right_rows r ON l.k=r.k AND l.q=r.q;
 
 statement ok
