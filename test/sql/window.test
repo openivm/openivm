@@ -1685,3 +1685,44 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_widening_mv');
 ----
 true
+
+statement ok
+SET SESSION default_collation = 'nocase';
+CREATE TABLE window_collated_source (id INT, k INT, label VARCHAR);
+INSERT INTO window_collated_source VALUES (1,1,'A'),(2,1,'B'),(3,2,'C');
+CREATE VIEW window_collated_expected AS
+    SELECT id,k,label,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM window_collated_source ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW window_collated_mv AS SELECT * FROM window_collated_expected;
+CREATE MATERIALIZED VIEW window_collated_child AS SELECT * FROM window_collated_mv WHERE id > 0;
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM window_collated_source WHERE id=1;
+INSERT INTO window_collated_source VALUES (1,1,'a'),(4,2,'D'),(5,3,'E');
+UPDATE window_collated_source SET label='d' WHERE id=4;
+DELETE FROM window_collated_source WHERE id=5;
+
+statement ok
+PRAGMA refresh('window_collated_mv');
+
+statement ok
+COMMIT;
+
+foreach suffix mv child
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(label) FROM window_collated_{suffix} EXCEPT ALL SELECT *,hex(label) FROM window_collated_expected)
+    UNION ALL
+    (SELECT *,hex(label) FROM window_collated_expected EXCEPT ALL SELECT *,hex(label) FROM window_collated_{suffix})
+);
+----
+0
+
+endloop
+
+statement ok
+SET SESSION default_collation = '';

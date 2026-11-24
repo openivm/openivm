@@ -1313,6 +1313,7 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		throw InvalidInputException("OpenIVM refresh received an unsupported argument list");
 	}
 	Connection metadata_con(*context.db);
+	SqlUtils::CopyDefaultCollation(context, *metadata_con.context);
 	RefreshMetadata::UseCatalog(
 	    context, metadata_con,
 	    !pipeline && parameters.values.size() >= 3
