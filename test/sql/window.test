@@ -1394,3 +1394,46 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_padding_mv');
 ----
 true
+
+# A wider delta key can exceed the range of the projected partition key.
+statement ok
+CREATE TABLE window_nullsafe_wide (id INT, k HUGEINT, q BIGINT, v INT);
+INSERT INTO window_nullsafe_wide VALUES (11,NULL,10,1),(12,2,20,2),(13,3,30,3);
+CREATE VIEW window_nullsafe_wide_expected AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k,a.q ORDER BY a.id,b.id) AS rn
+    FROM (SELECT id,k::BIGINT AS k,q,v FROM window_nullsafe_a) a JOIN window_nullsafe_wide b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+CREATE MATERIALIZED VIEW window_nullsafe_wide_mv AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k,a.q ORDER BY a.id,b.id) AS rn
+    FROM (SELECT id,k::BIGINT AS k,q,v FROM window_nullsafe_a) a JOIN window_nullsafe_wide b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+
+statement ok
+INSERT INTO window_nullsafe_wide VALUES (14,9223372036854775808,10,4),(15,NULL,10,5);
+UPDATE window_nullsafe_wide SET v=6 WHERE id=11;
+DELETE FROM window_nullsafe_wide WHERE id=15;
+
+statement ok
+PRAGMA refresh('window_nullsafe_wide_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_nullsafe_wide_mv EXCEPT ALL FROM window_nullsafe_wide_expected)
+    UNION ALL
+    (FROM window_nullsafe_wide_expected EXCEPT ALL FROM window_nullsafe_wide_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_wide')
+                          AND contains(sql, 'SELECT DISTINCT k FROM')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_wide_mv');
+----
+true

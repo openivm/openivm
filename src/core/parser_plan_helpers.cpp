@@ -2598,13 +2598,8 @@ struct WindowLookupEdge {
 struct WindowEquivalenceEdge {
 	idx_t join_id;
 	OccurrenceColumnRef first;
-	string first_cast;
 	OccurrenceColumnRef second;
-	string second_cast;
-
-	bool HasCast() const {
-		return !first_cast.empty() || !second_cast.empty();
-	}
+	bool widened;
 };
 
 static void CollectLeafColumnBindings(Expression *expr, vector<ColumnBinding> &bindings) {
@@ -2669,6 +2664,8 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 	return ResolveBindingToOccurrenceRefsInternal(binding, facts, out, 0);
 }
 
+static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool signed_only = false);
+
 static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
                                    const unordered_set<string> &null_extended_sources,
                                    vector<WindowEquivalenceEdge> &equivalence_edges,
@@ -2731,8 +2728,11 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 			}
 		}
 		if (join.join_type == JoinType::INNER) {
-			equivalence_edges.push_back(
-			    {join_id, std::move(left_ref), std::move(left_cast), std::move(right_ref), std::move(right_cast)});
+			bool widened = !left_cast.empty() || !right_cast.empty();
+			if (!widened || (null_safe_inner && IsDirectWindowKey(*condition.LeftReference(), facts, true) &&
+			                 IsDirectWindowKey(*condition.RightReference(), facts, true))) {
+				equivalence_edges.push_back({join_id, std::move(left_ref), std::move(right_ref), widened});
+			}
 		}
 	}
 }
@@ -2751,10 +2751,21 @@ static const Expression &WindowKeyExpression(const Expression &expr, const Creat
 	return *current;
 }
 
-static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts) {
+static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool signed_only) {
 	const auto &expression = WindowKeyExpression(key, facts);
+	const auto &type = expression.GetReturnType();
+	if (signed_only && (!type.IsIntegral() || !type.IsSigned() || type.HasAlias())) {
+		return false;
+	}
 	if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
-		return true;
+		if (!signed_only) {
+			return true;
+		}
+		auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
+		auto source = facts.gets_by_index.find(binding.table_index);
+		LogicalType source_type;
+		return source != facts.gets_by_index.end() &&
+		       GetLogicalGetColumnType(*source->second, binding.column_index, source_type) && source_type == type;
 	}
 	if (!BoundCastExpression::IsCast(expression)) {
 		return false;
@@ -2763,7 +2774,7 @@ static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &fa
 	const auto &from = child.GetReturnType();
 	const auto &to = expression.GetReturnType();
 	return from.IsIntegral() && to.IsIntegral() && !from.HasAlias() && !to.HasAlias() &&
-	       BoundCastExpression::CastIsInvertible(from, to) && IsDirectWindowKey(child, facts);
+	       BoundCastExpression::CastIsInvertible(from, to) && IsDirectWindowKey(child, facts, signed_only);
 }
 
 static const OccurrenceColumnRef *OtherWindowKey(const WindowEquivalenceEdge &edge, const OccurrenceColumnRef &key) {
@@ -2820,11 +2831,11 @@ struct WindowKeyEquality {
 		    !left_cast.empty() || !right_cast.empty() || nullable_sources.count(OccurrenceKey(first))) {
 			return false;
 		}
-		// Follow only uncast inner-join equalities that survive null extension.
+		// Use only key equalities established in this window's input.
 		vector<OccurrenceColumnRef> equivalents {std::move(first)};
 		for (idx_t i = 0; i < equivalents.size(); i++) {
 			for (const auto &edge : edges) {
-				if (edge.HasCast() || !input.Contains(edge.join_id)) {
+				if (!input.Contains(edge.join_id)) {
 					continue;
 				}
 				auto *other = OtherWindowKey(edge, equivalents[i]);
@@ -3156,9 +3167,6 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		changed = false;
 		vector<WindowLineageOp> next_ops = partition_ops;
 		for (auto &edge : edges) {
-			if (edge.HasCast()) {
-				continue;
-			}
 			for (auto &direct : partition_ops) {
 				OccurrenceColumnRef direct_ref;
 				direct_ref.table = direct.source_table;
@@ -3176,7 +3184,11 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				equivalent.source_table = other->table;
 				equivalent.source_occurrence = other->occurrence;
 				equivalent.source_col = other->column;
-				equivalent.source_cast = direct.source_cast;
+				// A wider source can contain unmatched values outside the
+				// projection's type. Let the key comparison widen as needed.
+				if (!edge.widened) {
+					equivalent.source_cast = direct.source_cast;
+				}
 				AddUniqueLineageOp(next_ops, std::move(equivalent));
 				changed = true;
 			}
