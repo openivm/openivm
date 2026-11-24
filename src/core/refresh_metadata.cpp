@@ -2462,11 +2462,18 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, WindowP
 	if (!MetadataJson::ExtractJsonStringArray(json, "coalesce_columns", out.coalesce_columns)) {
 		out.coalesce_columns.clear();
 	}
-	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "ops")) {
+	bool complete;
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "ops", complete);
+	if (!complete) {
+		return false;
+	}
+	for (auto &object : objects) {
 		WindowPartitionLineageOp op;
-		if (MetadataJson::Read(object, op)) {
-			out.ops.push_back(std::move(op));
+		if (!MetadataJson::Read(object, op)) {
+			out.ops.clear();
+			return false;
 		}
+		out.ops.push_back(std::move(op));
 	}
 	return !out.ops.empty();
 }

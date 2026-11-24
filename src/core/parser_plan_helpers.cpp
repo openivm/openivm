@@ -2994,7 +2994,18 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			continue;
 		}
 		auto *key = window_keys.at(entry.first);
-		if (!key) {
+		if (!key || !projection) {
+			continue;
+		}
+		bool matches_projection = false;
+		for (idx_t i = 0; i < projection->expressions.size() && i < output_names.size(); i++) {
+			if (StringUtil::CIEquals(output_names[i], entry.first) &&
+			    Expression::Equals(WindowKeyExpression(*projection->expressions[i], facts), *key)) {
+				matches_projection = true;
+				break;
+			}
+		}
+		if (!matches_projection) {
 			continue;
 		}
 		const auto nullable_operand = [&](const WindowLineageOp &op) {
@@ -3006,8 +3017,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			out.proven_columns->push_back(entry.first);
 			continue;
 		}
-		if (!projection || !coalesce_candidates.count(entry.first) ||
-		    facts.source_occurrences.size() != nullable_sources.size() + 1) {
+		if (!coalesce_candidates.count(entry.first) || facts.source_occurrences.size() != nullable_sources.size() + 1) {
 			continue;
 		}
 		// For one preserved input, every alternative must be discoverable
@@ -3026,12 +3036,8 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				              !nullable_sources.count(OccurrenceKey(lookup.source_table, lookup.source_occurrence));
 			       });
 		});
-		for (idx_t i = 0; covers_alternatives && i < projection->expressions.size() && i < output_names.size(); i++) {
-			if (StringUtil::CIEquals(output_names[i], entry.first) &&
-			    Expression::Equals(WindowKeyExpression(*projection->expressions[i], facts), *key)) {
-				out.coalesce_columns.push_back(entry.first);
-				break;
-			}
+		if (covers_alternatives) {
+			out.coalesce_columns.push_back(entry.first);
 		}
 	}
 	std::sort(out.proven_columns->begin(), out.proven_columns->end());
