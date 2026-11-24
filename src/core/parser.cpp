@@ -1241,8 +1241,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
-	string group_cols_val =
-	    ViewListSqlLiteralOrNull(cols_to_store, analysis.found_window, view_model.window_requires_result_diff);
+	optional<bool> window_requires_result_diff;
+	if (refresh_type == RefreshType::WINDOW_PARTITION) {
+		window_requires_result_diff = view_model.window_requires_result_diff;
+	}
+	string group_cols_val = ViewListSqlLiteralOrNull(cols_to_store, analysis.found_window, window_requires_result_diff);
 	string window_order_cols_val = ViewListSqlLiteralOrNull(window_order_columns, true);
 	string agg_types_val = ViewListSqlLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)

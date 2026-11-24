@@ -1655,9 +1655,10 @@ pair<string, string> RefreshMetadata::ParseWindowColumn(const string &spec) {
 	return ParseLegacyWindowColumn(spec);
 }
 
-string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns, bool requires_result_diff) {
+string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns, optional<bool> requires_result_diff) {
 	if (requires_result_diff) {
-		return WINDOW_COLUMN_LIST_PREFIX + SqlUtils::JsonArray(columns) + ",\"requires_result_diff\":\"true\"}";
+		return WINDOW_COLUMN_LIST_PREFIX + SqlUtils::JsonArray(columns) + ",\"requires_result_diff\":\"" +
+		       (*requires_result_diff ? "true" : "false") + "\"}";
 	}
 	for (const auto &spec : columns) {
 		if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
@@ -1670,10 +1671,10 @@ string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns, bo
 }
 
 vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const string &column,
-                                                  bool *requires_result_diff) {
+                                                  optional<bool> *requires_result_diff) {
 	auto text = ReadViewString(view_name, column);
 	if (requires_result_diff) {
-		*requires_result_diff = false;
+		requires_result_diff->reset();
 	}
 	if (StringUtil::StartsWith(text, WINDOW_COLUMN_LIST_PREFIX)) {
 		vector<string> columns;
@@ -1682,8 +1683,9 @@ vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const
 		}
 		if (requires_result_diff) {
 			string flag;
-			*requires_result_diff =
-			    MetadataJson::ExtractJsonString(text, "requires_result_diff", flag) && flag == "true";
+			if (MetadataJson::ExtractJsonString(text, "requires_result_diff", flag)) {
+				*requires_result_diff = (flag != "false");
+			}
 		}
 		return columns;
 	}
@@ -1697,7 +1699,8 @@ vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const
 	return columns;
 }
 
-vector<string> RefreshMetadata::GetWindowPartitionColumns(const string &view_name, bool *requires_result_diff) {
+vector<string> RefreshMetadata::GetWindowPartitionColumns(const string &view_name,
+                                                          optional<bool> *requires_result_diff) {
 	return ReadWindowColumns(view_name, "group_columns", requires_result_diff);
 }
 

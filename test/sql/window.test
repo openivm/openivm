@@ -827,7 +827,7 @@ CREATE MATERIALIZED VIEW quoted_window_join_mv AS
 query T
 SELECT group_columns FROM openivm_views WHERE view_sql_name = 'quoted_window_join_mv';
 ----
-pk=p=key
+json:{"window_columns":["pk=p=key"],"requires_result_diff":"false"}
 
 statement ok
 INSERT INTO quoted_window_left VALUES (4,1),(5,2);
@@ -920,6 +920,45 @@ SELECT count(*) FROM (
 ----
 0
 
+# A null-rejecting filter below the window makes the nullable-side key usable.
+statement ok
+CREATE VIEW filtered_window_expected AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
+    WHERE b.id IS NOT NULL AND a.v > 0;
+CREATE MATERIALIZED VIEW filtered_window_mv AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
+    WHERE b.id IS NOT NULL AND a.v > 0;
+INSERT INTO nullable_window_right VALUES (1,200),(3,300),(4,400);
+UPDATE nullable_window_left SET v=35 WHERE id=3;
+DELETE FROM nullable_window_right WHERE id IN (2,4);
+
+statement ok
+PRAGMA refresh('filtered_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM filtered_window_mv EXCEPT ALL FROM filtered_window_expected)
+    UNION ALL
+    (FROM filtered_window_expected EXCEPT ALL FROM filtered_window_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_nullable_window_left')
+                          AND contains(sql, 'openivm_delta_nullable_window_right')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'filtered_window_mv');
+----
+true
+
 # A row admitted by a nested LIMIT can evict a row from another partition.
 statement ok
 CREATE TABLE window_limited_scores (id INT, "p=key" INT, score INT);
@@ -951,6 +990,34 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) > 0 FROM openivm_compiled_statements
 WHERE operation = 'refresh' AND sql LIKE '%openivm_window_current%'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_limited_mv');
+----
+true
+
+# Legacy metadata lacks the result-diff flag. The evicted partition has no source delta.
+statement ok
+UPDATE openivm_views SET group_columns = 'pk=p=key',
+    lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'window_limited_mv';
+INSERT INTO window_limited_scores VALUES (6,6,140),(7,7,1);
+UPDATE window_limited_scores SET score=150 WHERE id=6;
+DELETE FROM window_limited_scores WHERE id=7;
+
+statement ok
+PRAGMA refresh('window_limited_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_limited_mv EXCEPT ALL FROM window_limited_expected)
+    UNION ALL
+    (FROM window_limited_expected EXCEPT ALL FROM window_limited_mv)
+);
+----
+0
+
+query I
+SELECT count(*) >= 2 FROM openivm_compiled_statements
+WHERE operation = 'refresh' AND contains(sql, 'openivm_window_current')
 AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_limited_mv');
 ----
 true
@@ -1520,5 +1587,43 @@ SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
 FROM openivm_compiled_statements
 WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_unsigned_mv');
+----
+true
+
+# A single-key ordinary widening equijoin needs only the two direct delta arms.
+statement ok
+CREATE VIEW window_widening_expected AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_a a JOIN window_nullsafe_b b ON a.k=b.k;
+CREATE MATERIALIZED VIEW window_widening_mv AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_a a JOIN window_nullsafe_b b ON a.k=b.k;
+INSERT INTO window_nullsafe_a VALUES (7,2,20,7),(8,3,30,8);
+UPDATE window_nullsafe_b SET v=12 WHERE id=12;
+DELETE FROM window_nullsafe_a WHERE id IN (3,8);
+
+statement ok
+PRAGMA refresh('window_widening_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_widening_mv EXCEPT ALL FROM window_widening_expected)
+    UNION ALL
+    (FROM window_widening_expected EXCEPT ALL FROM window_widening_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_a')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_b')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')
+                              OR contains(sql, 'IN (SELECT DISTINCT CAST(')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_widening_mv');
 ----
 true

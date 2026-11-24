@@ -37,7 +37,8 @@ bool CanCreateGroupIndex(const vector<string> &groups, const vector<string> &nam
 	return true;
 }
 
-string ViewListSqlLiteralOrNull(const vector<string> &values, bool window_columns, bool requires_result_diff) {
+string ViewListSqlLiteralOrNull(const vector<string> &values, bool window_columns,
+                                optional<bool> requires_result_diff) {
 	if (values.empty()) {
 		return "null";
 	}

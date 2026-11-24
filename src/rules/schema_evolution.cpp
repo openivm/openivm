@@ -530,7 +530,7 @@ static bool RewriteLineageMeta(Connection &con, RefreshMetadata &metadata, const
 
 static bool RewriteWindowGroupColumnSources(Connection &con, RefreshMetadata &metadata, const string &view_name,
                                             const string &old_name, const string &new_name) {
-	bool requires_result_diff;
+	optional<bool> requires_result_diff;
 	auto group_columns = metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
 	if (group_columns.empty()) {
 		return false;

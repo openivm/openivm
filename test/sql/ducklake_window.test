@@ -44,7 +44,7 @@ WHERE H_AMOUNT > 0;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f686973746f72795f77696e646f77_';
 ----
-H_W_ID=H_W_ID
+json:{"window_columns":["H_W_ID=H_W_ID"],"requires_result_diff":"false"}
 
 query I
 SELECT (lineage_json LIKE '{"v":1,"items":[{"k":"window_partition"%')::INT FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f686973746f72795f77696e646f77_';
@@ -118,7 +118,7 @@ query I
 SELECT group_columns FROM openivm_views
 WHERE view_sql_name = 'mv_window_multi_scope' AND view_catalog = 'dl';
 ----
-w=w
+json:{"window_columns":["w=w"],"requires_result_diff":"false"}
 
 # Batch conflicting operations before a single refresh. The inserted GC row is
 # updated before refresh, while another GC row is updated and then deleted.
@@ -216,7 +216,7 @@ LEFT JOIN dl.window_join_codes c
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f77696e646f775f6a6f696e_';
 ----
-acct_id=acct_id
+json:{"window_columns":["acct_id=acct_id"],"requires_result_diff":"false"}
 
 statement ok
 SET openivm_files_path='__TEST_DIR__';
@@ -513,7 +513,7 @@ FROM dl.window_composite_src;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_';
 ----
-w_id=w_id,d_id=d_id
+json:{"window_columns":["w_id=w_id","d_id=d_id"],"requires_result_diff":"false"}
 
 statement ok
 INSERT INTO dl.window_composite_src VALUES
@@ -1039,7 +1039,7 @@ WHERE c.ca_id IS NOT NULL;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6163636f756e74735f6c696b65_';
 ----
-account_id=ca_id
+json:{"window_columns":["account_id=ca_id"],"requires_result_diff":"false"}
 
 statement ok
 INSERT INTO dl.accounts_tax_src VALUES
@@ -1402,7 +1402,7 @@ FROM dl.window_upstream_base;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f77696e646f775f757073747265616d_';
 ----
-acct_id=acct_id
+json:{"window_columns":["acct_id=acct_id"],"requires_result_diff":"false"}
 
 statement ok
 INSERT INTO dl.window_upstream_src VALUES
@@ -1739,6 +1739,43 @@ SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
 FROM openivm_compiled_statements
 WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_winner_mv');
+----
+true
+
+# A saved pre-upgrade LIMIT can evict a partition absent from the change feed.
+statement ok
+CREATE TABLE dl.window_legacy_limit (id INT, k INT, v INT);
+INSERT INTO dl.window_legacy_limit VALUES (10,1,100),(20,2,200),(30,3,300),(40,4,400);
+CREATE VIEW lake_legacy_limit_expected AS
+    SELECT k,id,v,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_legacy_limit ORDER BY id LIMIT 3) limited;
+CREATE MATERIALIZED VIEW dl.lake_legacy_limit_mv AS
+    SELECT k,id,v,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_legacy_limit ORDER BY id LIMIT 3) limited;
+UPDATE openivm_views SET group_columns = 'k=k',
+    lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'lake_legacy_limit_mv';
+INSERT INTO dl.window_legacy_limit VALUES (5,9,500),(31,8,310);
+UPDATE dl.window_legacy_limit SET v=550 WHERE id=5;
+DELETE FROM dl.window_legacy_limit WHERE id=31;
+
+statement ok
+PRAGMA refresh('dl.lake_legacy_limit_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.lake_legacy_limit_mv EXCEPT ALL FROM lake_legacy_limit_expected)
+    UNION ALL
+    (FROM lake_legacy_limit_expected EXCEPT ALL FROM dl.lake_legacy_limit_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'lake_legacy_limit_mv');
 ----
 true
 

@@ -499,11 +499,15 @@ static bool HasDirectDuckLakeWindowPartitionOps(const RefreshMetadata::WindowPar
 	return found;
 }
 
-static RefreshMetadata::WindowPartitionLineage RebindWindowPartitionLineage(Connection &con,
-                                                                            const string &view_query_sql,
-                                                                            const vector<string> &column_names,
-                                                                            const vector<string> &partitions) {
-	RefreshMetadata::WindowPartitionLineage rebound;
+struct ReboundWindowPartition {
+	RefreshMetadata::WindowPartitionLineage lineage;
+	bool requires_result_diff = true;
+};
+
+static ReboundWindowPartition RebindWindowPartitionLineage(Connection &con, const string &view_query_sql,
+                                                           const vector<string> &column_names,
+                                                           const vector<string> &partitions) {
+	ReboundWindowPartition rebound;
 	try {
 		con.context->RunFunctionInTransaction([&] {
 			auto parser = Parser::GetBuiltinParser();
@@ -519,10 +523,9 @@ static RefreshMetadata::WindowPartitionLineage RebindWindowPartitionLineage(Conn
 			InlineCtesIfPresent(*con.context, *planner.binder, planner.plan);
 			auto facts =
 			    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(*con.context).catalog);
-			BuildWindowPartitionLineageOps(facts, partitions, column_names, rebound);
-			if (WindowPlanRequiresResultDiff(facts, partitions, column_names, rebound)) {
-				rebound = RefreshMetadata::WindowPartitionLineage();
-			}
+			BuildWindowPartitionLineageOps(facts, partitions, column_names, rebound.lineage);
+			rebound.requires_result_diff =
+			    WindowPlanRequiresResultDiff(facts, partitions, column_names, rebound.lineage);
 		});
 	} catch (const std::exception &error) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] Could not prove legacy window key: %s\n", error.what());
@@ -530,41 +533,16 @@ static RefreshMetadata::WindowPartitionLineage RebindWindowPartitionLineage(Conn
 	return rebound;
 }
 
-static bool CanScanDuckLakeWindowPartitionKeys(Connection &con, const string &view_query_sql,
-                                               const vector<string> &column_names, const string &partition_spec,
-                                               const RefreshMetadata::WindowPartitionLineage &lineage) {
-	if (!HasDirectDuckLakeWindowPartitionOps(lineage, partition_spec)) {
-		return false;
-	}
-	auto output = RefreshMetadata::ParseWindowColumn(partition_spec).first;
-	if (lineage.proven_columns) {
-		return lineage.IsProven(output);
-	}
-	// Legacy metadata does not identify occurrences. Rebind the saved query
-	// before using its candidate direct keys for a single physical source.
-	auto rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, {partition_spec});
-	return rebound.IsProven(output) && HasDirectDuckLakeWindowPartitionOps(rebound, partition_spec);
-}
-
-static void ProveLegacyDerivedPartition(Connection &con, const string &view_query_sql,
-                                        const vector<string> &column_names, const string &partition_spec,
-                                        RefreshMetadata::WindowPartitionLineage &lineage) {
+static bool HasMultipleLegacyDirectArms(const string &partition_spec,
+                                        const RefreshMetadata::WindowPartitionLineage &lineage) {
 	auto output = RefreshMetadata::ParseWindowColumn(partition_spec).first;
 	idx_t direct_arms = 0;
 	for (const auto &op : lineage.ops) {
-		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, output)) {
-			direct_arms++;
+		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, output) && ++direct_arms > 1) {
+			return true;
 		}
 	}
-	if (direct_arms <= 1) {
-		return;
-	}
-	// Several legacy direct arms can be equivalent keys or COALESCE
-	// alternatives. Only a binding proof can distinguish the two.
-	auto rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, {partition_spec});
-	lineage.proven_columns = std::move(rebound.proven_columns).value_or(vector<string>());
-	lineage.coalesce_columns = std::move(rebound.coalesce_columns);
-	lineage.coalesce_preserved_source = std::move(rebound.coalesce_preserved_source);
+	return false;
 }
 
 static string BuildSingleSourceDuckLakeWindowRefresh(
@@ -683,34 +661,52 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 			floating_columns.push_back(column_names[i]);
 		}
 	}
-	bool requires_result_diff;
-	auto partition_cols = metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
+	optional<bool> saved_result_diff;
+	auto partition_cols = metadata.GetWindowPartitionColumns(view_name, &saved_result_diff);
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
 	bool any_ducklake = AnyDuckLakeSource(metadata, view_name, delta_table_names);
+	auto ducklake_scope = any_ducklake ? DuckLakeWindowScope(partition_cols, column_names) : vector<string>();
+	optional<ReboundWindowPartition> rebound;
+	auto get_rebound = [&]() -> const ReboundWindowPartition & {
+		if (!rebound) {
+			auto &scope = ducklake_scope.empty() ? partition_cols : ducklake_scope;
+			rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, scope);
+		}
+		return *rebound;
+	};
+	// Legacy metadata never recorded whether a LIMIT or DISTINCT ON could
+	// evict a row in an unchanged source partition.
+	bool requires_result_diff = saved_result_diff.value_or(false);
+	if (!saved_result_diff && !partition_cols.empty()) {
+		requires_result_diff = get_rebound().requires_result_diff;
+	}
 	if (any_ducklake && requires_result_diff && !partition_cols.empty()) {
 		auto keys = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols, floating_columns);
 		return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, keys,
 		                                        AffectedPartitionsTempTable(view_name), partition_cols,
 		                                        publication_scope);
 	}
-	if (any_ducklake) {
-		partition_cols = DuckLakeWindowScope(partition_cols, column_names);
-	}
-	if (any_ducklake && !partition_cols.empty()) {
+	if (!ducklake_scope.empty()) {
 		RefreshMetadata::WindowPartitionLineage lineage;
 		if (delta_table_names.size() > 1 || has_join) {
 			metadata.GetWindowPartitionLineage(view_name, lineage);
 		}
+		if (has_join && !lineage.proven_columns) {
+			const auto &bound = get_rebound();
+			if (!bound.requires_result_diff) {
+				lineage = bound.lineage;
+			}
+		}
 		if (delta_table_names.size() == 1 &&
-		    (!has_join ||
-		     CanScanDuckLakeWindowPartitionKeys(con, view_query_sql, column_names, partition_cols[0], lineage))) {
+		    (!has_join || (lineage.IsProven(RefreshMetadata::ParseWindowColumn(ducklake_scope[0]).first) &&
+		                   HasDirectDuckLakeWindowPartitionOps(lineage, ducklake_scope[0])))) {
 			return BuildSingleSourceDuckLakeWindowRefresh(
-			    metadata, con, view_name, view_query_sql, partition_cols, order_cols, column_names, data_table,
+			    metadata, con, view_name, view_query_sql, ducklake_scope, order_cols, column_names, data_table,
 			    view_catalog_name, view_schema_name, attached_db_catalog_name, attached_db_schema_name,
 			    delta_table_names[0], floating_columns, publication_scope);
 		}
 		return BuildDuckLakeWindowRefreshWithLineage(metadata, con, view_name, view_query_sql, delta_table_names,
-		                                             partition_cols, data_table, view_catalog_name, view_schema_name,
+		                                             ducklake_scope, data_table, view_catalog_name, view_schema_name,
 		                                             attached_db_catalog_name, attached_db_schema_name, lineage,
 		                                             floating_columns, publication_scope);
 	}
@@ -728,9 +724,19 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		metadata.GetWindowPartitionLineage(view_name, lineage);
 		if (has_join && !lineage.proven_columns) {
 			if (composite) {
-				lineage = RebindWindowPartitionLineage(con, view_query_sql, column_names, partition_cols);
-			} else {
-				ProveLegacyDerivedPartition(con, view_query_sql, column_names, partition_cols[0], lineage);
+				const auto &bound = get_rebound();
+				if (!bound.requires_result_diff) {
+					lineage = bound.lineage;
+				}
+			} else if (HasMultipleLegacyDirectArms(partition_cols[0], lineage)) {
+				// A binding proof distinguishes equal keys from alternatives.
+				const auto &bound = get_rebound();
+				lineage.proven_columns.emplace();
+				if (!bound.requires_result_diff) {
+					lineage.proven_columns = bound.lineage.proven_columns.value_or(vector<string>());
+					lineage.coalesce_columns = bound.lineage.coalesce_columns;
+					lineage.coalesce_preserved_source = bound.lineage.coalesce_preserved_source;
+				}
 			}
 		}
 		for (const auto &partition : partition_cols) {
@@ -747,9 +753,10 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 			auto result = build_keys(lineage);
 			if (result == LineageAffectedKeysResult::UNAVAILABLE && !composite && has_join && !lineage.proven_columns) {
 				// Old single-key metadata can omit arms inferred from null-safe equality.
-				auto rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, partition_cols);
-				if (rebound.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
-					result = build_keys(rebound);
+				const auto &bound = get_rebound();
+				if (!bound.requires_result_diff &&
+				    bound.lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
+					result = build_keys(bound.lineage);
 				}
 			}
 			if (!composite || result == LineageAffectedKeysResult::AVAILABLE) {

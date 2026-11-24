@@ -50,6 +50,7 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -2942,13 +2943,52 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 	return metadata_op;
 }
 
+static bool RejectsNullPadding(const Expression &predicate, const vector<ColumnBinding> &bindings) {
+	if (predicate.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		const auto &children = predicate.Cast<BoundConjunctionExpression>().GetChildren();
+		return std::any_of(children.begin(), children.end(),
+		                   [&](const unique_ptr<Expression> &child) { return RejectsNullPadding(*child, bindings); });
+	}
+	if (predicate.GetExpressionType() != ExpressionType::OPERATOR_IS_NOT_NULL) {
+		return false;
+	}
+	const auto &child = *predicate.Cast<BoundOperatorExpression>().GetChildren().front();
+	if (child.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto binding = child.Cast<BoundColumnRefExpression>().Binding();
+	return std::find(bindings.begin(), bindings.end(), binding) != bindings.end();
+}
+
 static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &facts) {
 	unordered_set<string> sources;
+	if (facts.outer_joins.empty()) {
+		return sources;
+	}
+	unordered_map<const LogicalOperator *, const LogicalOperator *> filters;
+	for (auto &node : facts.plan_nodes_post_order) {
+		auto &op = *node.plan_node;
+		if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+			filters.emplace(op.children[0].get(), &op);
+		}
+	}
 	for (auto *join : facts.outer_joins) {
+		auto filter = filters.find(join);
 		for (idx_t child = 0; child < 2; child++) {
 			if ((join->join_type == JoinType::LEFT && child == 0) ||
 			    (join->join_type == JoinType::RIGHT && child == 1)) {
 				continue;
+			}
+			// Only a filter directly above this join excludes padding before
+			// any window or other operator can observe it.
+			if (filter != filters.end()) {
+				auto bindings = join->children[child]->GetColumnBindings();
+				const auto &predicates = filter->second->expressions;
+				if (std::any_of(predicates.begin(), predicates.end(), [&](const unique_ptr<Expression> &predicate) {
+					    return RejectsNullPadding(*predicate, bindings);
+				    })) {
+					continue;
+				}
 			}
 			auto *subtree = GetPlanNodeFacts(facts, join->children[child].get());
 			D_ASSERT(subtree);
@@ -3267,7 +3307,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	std::sort(out.coalesce_columns.begin(), out.coalesce_columns.end());
 	for (auto &op : ops) {
 		// A direct arm for the same occurrence already supplies this key.
-		if (partition_columns.size() > 1 && op.kind == WindowLineageKind::LOOKUP && out.IsProven(op.output_col) &&
+		if (op.kind == WindowLineageKind::LOOKUP && out.IsProven(op.output_col) &&
 		    std::any_of(partition_ops.begin(), partition_ops.end(), [&](const WindowLineageOp &direct) {
 			    return direct.source_occurrence == op.source_occurrence &&
 			           StringUtil::CIEquals(direct.source_table, op.source_table) &&

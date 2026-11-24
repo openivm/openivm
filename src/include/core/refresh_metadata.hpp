@@ -26,7 +26,7 @@ class RefreshMetadata {
 	Value ReadDeltaValue(const string &view_name, const string &table_name, const string &column);
 	vector<string> ReadViewList(const string &view_name, const string &column);
 	vector<string> ReadWindowColumns(const string &view_name, const string &column,
-	                                 bool *requires_result_diff = nullptr);
+	                                 optional<bool> *requires_result_diff = nullptr);
 
 public:
 	explicit RefreshMetadata(Connection &con, optional_ptr<ClientContext> snapshot_context = nullptr)
@@ -261,8 +261,8 @@ public:
 	static string SerializeWindowColumn(const string &output, const string &source, bool tagged = false);
 	static bool IsTaggedWindowColumn(const string &spec);
 	static pair<string, string> ParseWindowColumn(const string &spec);
-	static string SerializeWindowColumns(const vector<string> &columns, bool requires_result_diff = false);
-	vector<string> GetWindowPartitionColumns(const string &view_name, bool *requires_result_diff = nullptr);
+	static string SerializeWindowColumns(const vector<string> &columns, optional<bool> requires_result_diff = {});
+	vector<string> GetWindowPartitionColumns(const string &view_name, optional<bool> *requires_result_diff = nullptr);
 
 	// Get common window ORDER BY output/source mappings. Empty means the view
 	// predates this metadata or its window specifications do not share a simple key.
