@@ -1753,7 +1753,8 @@ CREATE MATERIALIZED VIEW dl.partition_winner_mv AS
     SELECT id,k,score,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
     FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
 
--- The selected DuckLake key k covers all of its narrower (k, "q=key") partitions.
+# The selected DuckLake key k covers all of its narrower (k, "q=key") partitions.
+statement ok
 CREATE VIEW composite_winner_expected AS
     SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
     FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
@@ -1761,7 +1762,8 @@ CREATE MATERIALIZED VIEW dl.composite_winner_mv AS
     SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
     FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
 
--- A distinct key that preserves only the secondary partition column is insufficient.
+# A distinct key that preserves only the secondary partition column is insufficient.
+statement ok
 CREATE VIEW secondary_winner_expected AS
     SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
     FROM (SELECT DISTINCT ON ("q=key") * FROM dl.partition_winner_scores ORDER BY "q=key",score DESC,id) winners;
@@ -1770,7 +1772,7 @@ CREATE MATERIALIZED VIEW dl.secondary_winner_mv AS
     FROM (SELECT DISTINCT ON ("q=key") * FROM dl.partition_winner_scores ORDER BY "q=key",score DESC,id) winners;
 
 statement ok
-INSERT INTO dl.partition_winner_scores VALUES (5,1,20,110),(6,2,21,1);
+INSERT INTO dl.partition_winner_scores VALUES (5,1,20,110),(6,3,31,1);
 UPDATE dl.partition_winner_scores SET score=120 WHERE id=5;
 DELETE FROM dl.partition_winner_scores WHERE id=6;
 
