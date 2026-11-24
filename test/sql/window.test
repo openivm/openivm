@@ -954,3 +954,38 @@ WHERE operation = 'refresh' AND sql LIKE '%openivm_window_current%'
 AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_limited_mv');
 ----
 true
+
+# A DISTINCT ON winner can move between window partitions.
+statement ok
+CREATE TABLE window_winner_scores (id INT, bucket INT, "p=key" INT, score INT);
+INSERT INTO window_winner_scores VALUES (1,1,1,100),(2,2,2,90),(3,1,3,80);
+CREATE VIEW window_winner_expected AS
+    SELECT id, "p=key" AS pk, score, row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (bucket) * FROM window_winner_scores ORDER BY bucket, score DESC, id) winners;
+CREATE MATERIALIZED VIEW window_winner_mv AS
+    SELECT id, "p=key" AS pk, score, row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (bucket) * FROM window_winner_scores ORDER BY bucket, score DESC, id) winners;
+
+statement ok
+INSERT INTO window_winner_scores VALUES (4,1,3,110),(5,3,4,1);
+UPDATE window_winner_scores SET score=120 WHERE id=4;
+DELETE FROM window_winner_scores WHERE id=5;
+
+statement ok
+PRAGMA refresh('window_winner_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_winner_mv EXCEPT ALL FROM window_winner_expected)
+    UNION ALL
+    (FROM window_winner_expected EXCEPT ALL FROM window_winner_mv)
+);
+----
+0
+
+query I
+SELECT count(*) > 0 FROM openivm_compiled_statements
+WHERE operation = 'refresh' AND sql LIKE '%openivm_window_current%'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_winner_mv');
+----
+true

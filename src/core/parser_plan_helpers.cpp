@@ -2867,12 +2867,14 @@ static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &
 }
 
 bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts) {
-	// A limited input can evict a row from a different partition even if
-	// the evicted row's source never changed.
+	// LIMIT, TOP_N and DISTINCT ON can evict a row from a different window
+	// partition even when the evicted row's source never changed.
 	return std::any_of(
 	    facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [](const CreateMVPlanNodeFacts &node) {
 		    auto type = node.plan_node->type;
-		    return type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N;
+		    return type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N ||
+		           (type == LogicalOperatorType::LOGICAL_DISTINCT &&
+		            node.plan_node->Cast<LogicalDistinct>().distinct_type == DistinctType::DISTINCT_ON);
 	    });
 }
 
