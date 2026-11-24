@@ -208,7 +208,7 @@ void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts,
 
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
                                    const vector<string> &output_names) {
-	model.window_lineage_ops.clear();
+	model.window_lineage = RefreshMetadata::WindowPartitionLineage();
 	model.has_projection_lineage = false;
 	model.has_left_join_key_source = false;
 	model.has_left_join_nullable = false;
@@ -219,14 +219,14 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	if (model.type == RefreshType::WINDOW_PARTITION) {
 		const auto lineage_partition_columns = model.window_partition_columns;
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
-		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, model.window_lineage_ops,
-		                                                  &direct_lineage_ops);
+		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
+		                                                  model.window_lineage, &direct_lineage_ops);
 		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, facts) ||
-		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {
+		     !WindowLineageCoversAllSources(model.window_lineage.ops, facts))) {
 			model.type = RefreshType::FULL_REFRESH;
-			model.window_lineage_ops.clear();
+			model.window_lineage = RefreshMetadata::WindowPartitionLineage();
 		}
 		return;
 	}
@@ -243,8 +243,8 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 
 string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	vector<string> entries;
-	if (!model.window_lineage_ops.empty()) {
-		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(model.window_lineage_ops));
+	if (!model.window_lineage.ops.empty()) {
+		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(model.window_lineage));
 	}
 	if (model.has_projection_lineage) {
 		entries.push_back(RefreshMetadata::ProjectionKeyLineageToJson(model.projection_lineage));

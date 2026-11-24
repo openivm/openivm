@@ -1303,7 +1303,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		upsert_query = BuildWindowPartitionRefresh(
 		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system, has_join, emit_cascade_delta_for_recompute,
+		    attached_db_schema_name, cross_system, has_join,
+		    active_facts.compile_only ? nullptr : refresh_delta_activity, emit_cascade_delta_for_recompute,
 		    running_window_incremental, &window_uses_suffix, publication_scope);
 		break;
 	}

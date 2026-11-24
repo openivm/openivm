@@ -49,6 +49,7 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
@@ -2715,8 +2716,38 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 	}
 }
 
+static const Expression &WindowKeyExpression(const Expression &expr, const CreateMVPlanFacts &facts) {
+	auto *current = &expr;
+	for (idx_t depth = 0; depth < 16 && current->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF; depth++) {
+		auto binding = current->Cast<BoundColumnRefExpression>().Binding();
+		auto projection = facts.projections_by_index.find(binding.table_index);
+		if (projection == facts.projections_by_index.end() ||
+		    binding.column_index >= projection->second->expressions.size()) {
+			break;
+		}
+		current = projection->second->expressions[binding.column_index].get();
+	}
+	return *current;
+}
+
+static bool HasPlainCoalescePartition(const Expression &key, const CreateMVPlanFacts &facts,
+                                      const vector<OccurrenceColumnRef> &refs, const string &source_name) {
+	if (key.GetExpressionType() != ExpressionType::OPERATOR_COALESCE) {
+		return false;
+	}
+	auto &children = key.Cast<BoundOperatorExpression>().GetChildren();
+	return refs.size() == children.size() &&
+	       std::all_of(refs.begin(), refs.end(),
+	                   [&](const OccurrenceColumnRef &ref) { return StringUtil::CIEquals(ref.column, source_name); }) &&
+	       std::all_of(children.begin(), children.end(), [&](const unique_ptr<Expression> &child) {
+		       return WindowKeyExpression(*child, facts).GetExpressionType() == ExpressionType::BOUND_COLUMN_REF;
+	       });
+}
+
 static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlanFacts &facts,
-                                       const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
+                                       const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops,
+                                       unordered_map<string, const Expression *> &window_keys,
+                                       unordered_set<string> &coalesce_candidates) {
 	for (auto &expression : window.expressions) {
 		if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
 			continue;
@@ -2732,6 +2763,7 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 			if (!ResolveBindingToOccurrenceRefs(column_ref->Binding(), facts, refs)) {
 				continue;
 			}
+			auto &key = WindowKeyExpression(*partition, facts);
 			for (auto &ref : refs) {
 				for (auto &stored : partition_columns) {
 					auto spec = RefreshMetadata::ParseWindowColumn(stored);
@@ -2739,6 +2771,14 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 					auto &source_col = spec.second;
 					if (!StringUtil::CIEquals(source_col, ref.column)) {
 						continue;
+					}
+					auto output = StringUtil::Lower(output_col);
+					auto entry = window_keys.emplace(output, &key);
+					if (!entry.second && entry.first->second && !Expression::Equals(*entry.first->second, key)) {
+						entry.first->second = nullptr;
+					}
+					if (HasPlainCoalescePartition(key, facts, refs, source_col)) {
+						coalesce_candidates.insert(std::move(output));
 					}
 					WindowLineageOp op;
 					op.kind = WindowLineageKind::DIRECT;
@@ -2827,9 +2867,9 @@ static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &
 }
 
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
-                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out,
+                                    const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
-	out.clear();
+	out = RefreshMetadata::WindowPartitionLineage();
 	if (direct_out) {
 		direct_out->clear();
 	}
@@ -2841,8 +2881,10 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	}
 
 	vector<WindowLineageOp> direct_ops;
+	unordered_map<string, const Expression *> window_keys;
+	unordered_set<string> coalesce_candidates;
 	for (auto *window : facts.windows) {
-		CollectWindowPartitionRefs(*window, facts, partition_columns, direct_ops);
+		CollectWindowPartitionRefs(*window, facts, partition_columns, direct_ops, window_keys, coalesce_candidates);
 	}
 	if (direct_ops.empty()) {
 		return false;
@@ -2944,18 +2986,60 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		covered[StringUtil::Lower(op.output_col)].insert(OccurrenceKey(op.source_table, op.source_occurrence));
 	}
 	auto nullable_sources = NullExtendedWindowSources(facts);
-	for (auto &op : direct_ops) {
-		if (nullable_sources.count(OccurrenceKey(op.source_table, op.source_occurrence))) {
-			covered.erase(StringUtil::Lower(op.output_col));
+	auto spine = ViewOutputSpine(facts.root);
+	const auto *projection = spine.projections.empty() ? nullptr : spine.projections.front();
+	out.proven_columns.emplace();
+	for (const auto &entry : covered) {
+		if (entry.second.size() != facts.source_occurrences.size()) {
+			continue;
+		}
+		auto *key = window_keys.at(entry.first);
+		if (!key) {
+			continue;
+		}
+		const auto nullable_operand = [&](const WindowLineageOp &op) {
+			return StringUtil::CIEquals(op.output_col, entry.first) &&
+			       nullable_sources.count(OccurrenceKey(op.source_table, op.source_occurrence));
+		};
+		if (key->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+		    std::none_of(direct_ops.begin(), direct_ops.end(), nullable_operand)) {
+			out.proven_columns->push_back(entry.first);
+			continue;
+		}
+		if (!projection || !coalesce_candidates.count(entry.first) ||
+		    facts.source_occurrences.size() != nullable_sources.size() + 1) {
+			continue;
+		}
+		// For one preserved input, every alternative must be discoverable
+		// through a lookup from that input. The stored output must be the
+		// same COALESCE expression over those nullable columns.
+		bool covers_alternatives = std::all_of(direct_ops.begin(), direct_ops.end(), [&](const WindowLineageOp &op) {
+			if (!StringUtil::CIEquals(op.output_col, entry.first)) {
+				return true;
+			}
+			return nullable_operand(op) && std::any_of(ops.begin(), ops.end(), [&](const WindowLineageOp &lookup) {
+				       return lookup.kind == WindowLineageKind::LOOKUP &&
+				              StringUtil::CIEquals(lookup.output_col, op.output_col) &&
+				              StringUtil::CIEquals(lookup.lookup_table, op.source_table) &&
+				              lookup.lookup_occurrence == op.source_occurrence &&
+				              StringUtil::CIEquals(lookup.lookup_output_col, op.source_col) &&
+				              !nullable_sources.count(OccurrenceKey(lookup.source_table, lookup.source_occurrence));
+			       });
+		});
+		for (idx_t i = 0; covers_alternatives && i < projection->expressions.size() && i < output_names.size(); i++) {
+			if (StringUtil::CIEquals(output_names[i], entry.first) &&
+			    Expression::Equals(WindowKeyExpression(*projection->expressions[i], facts), *key)) {
+				out.coalesce_columns.push_back(entry.first);
+				break;
+			}
 		}
 	}
+	std::sort(out.proven_columns->begin(), out.proven_columns->end());
+	std::sort(out.coalesce_columns.begin(), out.coalesce_columns.end());
 	for (auto &op : ops) {
-		auto coverage = covered.find(StringUtil::Lower(op.output_col));
-		if (coverage != covered.end() && coverage->second.size() == facts.source_occurrences.size()) {
-			out.push_back(ToMetadataWindowLineageOp(op));
-		}
+		out.ops.push_back(ToMetadataWindowLineageOp(op));
 	}
-	return !out.empty();
+	return !out.proven_columns->empty();
 }
 
 // Scope refresh only when the stored output passes through the same source

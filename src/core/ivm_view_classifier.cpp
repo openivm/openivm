@@ -599,7 +599,7 @@ const char *DeltaModelNodeKindName(DeltaModelNodeKind kind) {
 
 idx_t DeltaViewModel::LineageEntryCount() const {
 	idx_t count = 0;
-	if (!window_lineage_ops.empty()) {
+	if (!window_lineage.ops.empty()) {
 		count++;
 	}
 	if (has_projection_lineage) {

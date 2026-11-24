@@ -524,10 +524,10 @@ static bool RewriteLineageMeta(Connection &con, RefreshMetadata &metadata, const
                                const string &table_name, const string &old_name, const string &new_name) {
 	vector<string> entries;
 	bool changed = false;
-	vector<RefreshMetadata::WindowPartitionLineageOp> window_ops;
-	if (metadata.GetWindowPartitionLineage(view_name, window_ops)) {
-		changed |= RewriteWindowLineageFields(window_ops, table_name, old_name, new_name);
-		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(window_ops));
+	RefreshMetadata::WindowPartitionLineage window_lineage;
+	if (metadata.GetWindowPartitionLineage(view_name, window_lineage)) {
+		changed |= RewriteWindowLineageFields(window_lineage.ops, table_name, old_name, new_name);
+		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(window_lineage));
 	}
 	RefreshMetadata::ProjectionKeyLineage projection;
 	if (metadata.GetProjectionKeyLineage(view_name, projection)) {
@@ -583,9 +583,9 @@ static bool AuxMetadataReferencesColumn(RefreshMetadata &metadata, const string 
 	    RewriteSemiAntiAuxMetaFields(semi, table_name, col_name, col_name, /*include_stable_left_predicate=*/true)) {
 		return true;
 	}
-	vector<RefreshMetadata::WindowPartitionLineageOp> window_ops;
-	if (metadata.GetWindowPartitionLineage(view_name, window_ops) &&
-	    RewriteWindowLineageFields(window_ops, table_name, col_name, col_name)) {
+	RefreshMetadata::WindowPartitionLineage window_lineage;
+	if (metadata.GetWindowPartitionLineage(view_name, window_lineage) &&
+	    RewriteWindowLineageFields(window_lineage.ops, table_name, col_name, col_name)) {
 		return true;
 	}
 	RefreshMetadata::ProjectionKeyLineage projection;

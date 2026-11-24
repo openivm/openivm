@@ -2445,22 +2445,42 @@ string RefreshMetadata::SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta) {
 	return MetadataJson::Write(meta);
 }
 
-bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
-	out.clear();
+bool RefreshMetadata::WindowPartitionLineage::IsProven(const string &column) const {
+	return proven_columns && std::any_of(proven_columns->begin(), proven_columns->end(),
+	                                     [&](const string &proven) { return StringUtil::CIEquals(column, proven); });
+}
+
+bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, WindowPartitionLineage &out) {
+	out = WindowPartitionLineage();
 	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "window_partition");
+	if (MetadataJson::FindValue(json, "proven_columns") != string::npos) {
+		out.proven_columns.emplace();
+		if (!MetadataJson::ExtractJsonStringArray(json, "proven_columns", *out.proven_columns)) {
+			out.proven_columns->clear();
+		}
+	}
+	if (!MetadataJson::ExtractJsonStringArray(json, "coalesce_columns", out.coalesce_columns)) {
+		out.coalesce_columns.clear();
+	}
 	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "ops")) {
 		WindowPartitionLineageOp op;
 		if (MetadataJson::Read(object, op)) {
-			out.push_back(std::move(op));
+			out.ops.push_back(std::move(op));
 		}
 	}
-	return !out.empty();
+	return !out.ops.empty();
 }
 
-string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitionLineageOp> &ops) {
+string RefreshMetadata::WindowPartitionLineageToJson(const WindowPartitionLineage &lineage) {
 	MetadataJson::Writer writer;
 	writer.Tag("k", "window_partition");
-	writer.Objects("ops", WriteEach(ops));
+	writer.Objects("ops", WriteEach(lineage.ops));
+	if (lineage.proven_columns) {
+		writer.Arr("proven_columns", *lineage.proven_columns);
+	}
+	if (!lineage.coalesce_columns.empty()) {
+		writer.Arr("coalesce_columns", lineage.coalesce_columns);
+	}
 	return writer.Finish();
 }
 

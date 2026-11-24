@@ -154,7 +154,7 @@ void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &pa
                               const vector<string> &output_names, bool order);
 string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
-                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out,
+                                    const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);

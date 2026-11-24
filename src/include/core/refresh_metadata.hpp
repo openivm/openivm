@@ -428,8 +428,17 @@ public:
 		string lookup_out_cast;
 	};
 
-	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
-	static string WindowPartitionLineageToJson(const vector<WindowPartitionLineageOp> &ops);
+	struct WindowPartitionLineage {
+		vector<WindowPartitionLineageOp> ops;
+		// Absent in older databases. An empty proof covers no output columns.
+		optional<vector<string>> proven_columns;
+		vector<string> coalesce_columns;
+
+		bool IsProven(const string &column) const;
+	};
+
+	bool GetWindowPartitionLineage(const string &view_name, WindowPartitionLineage &out);
+	static string WindowPartitionLineageToJson(const WindowPartitionLineage &lineage);
 
 	struct ProjectionKeyLineageStep {
 		string table;

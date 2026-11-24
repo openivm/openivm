@@ -290,8 +290,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system, bool has_join, bool emit_cascade_delta = false,
-                                   bool running_window_incremental = false, bool *uses_running_suffix = nullptr,
+                                   bool cross_system, bool has_join, optional_ptr<const DeltaActivityResult> activity,
+                                   bool emit_cascade_delta = false, bool running_window_incremental = false,
+                                   bool *uses_running_suffix = nullptr,
                                    RefreshPublicationScope *publication_scope = nullptr);
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
