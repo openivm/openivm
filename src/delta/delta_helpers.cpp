@@ -132,7 +132,7 @@ static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder
 	const bool native = openivm::CompileFactsContextSlot::Get(context).target_dialect == SqlDialect::DUCKDB;
 	for (idx_t i = 0; i < base_col_count; i++) {
 		const auto &type = input_types[i];
-		if (type.id() == LogicalTypeId::DOUBLE || type.id() == LogicalTypeId::FLOAT) {
+		if (type.IsFloating()) {
 			groups.push_back(MakeNegativeZeroExpression(context, optimizer,
 			                                            make_uniq<BoundColumnRefExpression>(type, input_bindings[i])));
 		} else if (native && SqlUtils::EqualityCanHideValueIdentity(type)) {
