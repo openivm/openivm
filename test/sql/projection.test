@@ -1352,3 +1352,27 @@ query I
 SELECT count(*) FROM limit_refill_mv;
 ----
 4
+
+statement ok
+CREATE TABLE projection_collated_source (id INT, k INT, label VARCHAR COLLATE NOCASE);
+INSERT INTO projection_collated_source VALUES (1,1,'A'),(2,1,'a'),(3,2,'C');
+CREATE MATERIALIZED VIEW projection_collated_mv AS SELECT k,label FROM projection_collated_source;
+CREATE VIEW projection_collated_expected AS SELECT k,label FROM projection_collated_source;
+
+statement ok
+DELETE FROM projection_collated_source WHERE id=2;
+INSERT INTO projection_collated_source VALUES (2,1,'c'),(4,2,'D');
+UPDATE projection_collated_source SET label='E' WHERE id=4;
+DELETE FROM projection_collated_source WHERE id=4;
+
+statement ok
+PRAGMA refresh('projection_collated_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(label) FROM projection_collated_mv EXCEPT ALL SELECT *,hex(label) FROM projection_collated_expected)
+    UNION ALL
+    (SELECT *,hex(label) FROM projection_collated_expected EXCEPT ALL SELECT *,hex(label) FROM projection_collated_mv)
+);
+----
+0

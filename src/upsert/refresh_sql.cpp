@@ -17,6 +17,7 @@
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/config.hpp"
@@ -556,10 +557,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	const string cleanup_data_catalog = cross_system ? internal_catalog_name : string();
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
 	string data_table = internal_catalog_prefix + SqlUtils::QuoteIdentifier(data_table_bare);
+	RefreshType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Looking up delta view '%s' in catalog '%s.%s'\n",
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
 	optional_ptr<CatalogEntry> index_delta_view_catalog_entry;
+	case_insensitive_map_t<LogicalType> collated_data_types;
 	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || target_is_native) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
@@ -574,13 +577,26 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                                            error_context),
 		                            Identifier(internal_catalog_name), Identifier(internal_schema_name)),
 		    OnEntryNotFound::RETURN_NULL);
+		// Delta DDL round-trips types through DESCRIBE, which omits explicit collations.
+		// Window diffs and projection deletes compare the stored data columns.
+		if (target_is_native && active_facts.target_dialect == SqlDialect::DUCKDB &&
+		    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::SIMPLE_PROJECTION) &&
+		    Settings::Get<DefaultCollationSetting>(context).empty()) {
+			const auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+			    planning_context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                                    Identifier(data_table_bare)));
+			for (const auto &column : entry.GetColumns().Logical()) {
+				if (SqlUtils::IsCollatedString(column.Type(), "")) {
+					collated_data_types.emplace(column.Name().GetIdentifierName(), column.Type());
+				}
+			}
+		}
 		con.Rollback();
 	}
 	auto view_query_sql = metadata.GetViewQuery(view_name);
 	if (view_query_sql.empty()) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
-	RefreshType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 	auto delta_sources = metadata.GetDeltaSources(view_name);
@@ -992,6 +1008,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		column_names.erase(it);
 		if (offset < static_cast<decltype(offset)>(column_types.size())) {
 			column_types.erase(column_types.begin() + offset);
+		}
+	}
+	if (!collated_data_types.empty()) {
+		for (idx_t i = 0; i < column_names.size(); i++) {
+			auto match = collated_data_types.find(column_names[i]);
+			if (match != collated_data_types.end()) {
+				column_types[i] = match->second;
+			}
 		}
 	}
 	add_profile_step("generate_refresh_sql.column_metadata", column_metadata_start,

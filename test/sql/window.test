@@ -1726,3 +1726,43 @@ endloop
 
 statement ok
 SET SESSION default_collation = '';
+
+# The destination retains its explicit collation even when the delta table does not.
+statement ok
+CREATE TABLE window_explicit_collation_source (id INT, k INT, label VARCHAR COLLATE NOCASE);
+INSERT INTO window_explicit_collation_source VALUES (1,1,'A'),(2,1,'B'),(3,2,'C');
+CREATE VIEW window_explicit_collation_expected AS
+    SELECT id,k,label,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM window_explicit_collation_source ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW window_explicit_collation_mv AS SELECT * FROM window_explicit_collation_expected;
+CREATE MATERIALIZED VIEW window_explicit_collation_child AS SELECT * FROM window_explicit_collation_mv WHERE id > 0;
+
+statement ok
+DELETE FROM window_explicit_collation_source WHERE id=1;
+INSERT INTO window_explicit_collation_source VALUES (1,1,'a'),(4,2,'D');
+UPDATE window_explicit_collation_source SET label='E' WHERE id=4;
+DELETE FROM window_explicit_collation_source WHERE id=4;
+
+statement ok
+PRAGMA refresh('window_explicit_collation_mv');
+
+foreach suffix mv child
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(label) FROM window_explicit_collation_{suffix} EXCEPT ALL SELECT *,hex(label) FROM window_explicit_collation_expected)
+    UNION ALL
+    (SELECT *,hex(label) FROM window_explicit_collation_expected EXCEPT ALL SELECT *,hex(label) FROM window_explicit_collation_{suffix})
+);
+----
+0
+
+endloop
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current') AND contains(sql, 'unhex(hex(')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_explicit_collation_mv');
+----
+true
