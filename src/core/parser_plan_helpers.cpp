@@ -1984,22 +1984,12 @@ static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_inde
 }
 
 static bool GetLogicalGetColumnType(LogicalGet &get, ProjectionIndex column_index, LogicalType &type) {
-	if (column_index < get.returned_types.size()) {
-		type = get.returned_types[column_index];
-		return true;
+	const auto &columns = get.GetColumnIds();
+	if (column_index >= columns.size()) {
+		return false;
 	}
-	if (get.GetTable().get()) {
-		auto &ids = get.GetColumnIds();
-		if (column_index < ids.size()) {
-			auto base_idx = ids[column_index].GetPrimaryIndex();
-			auto &cols = get.GetTable().get()->GetColumns();
-			if (base_idx < cols.LogicalColumnCount()) {
-				type = cols.GetColumn(LogicalIndex(base_idx)).Type();
-				return true;
-			}
-		}
-	}
-	return false;
+	type = get.GetColumnType(columns[column_index]);
+	return true;
 }
 
 static bool HasKeyBinding(const vector<ColumnBinding> &keys, const ColumnBinding &binding) {
