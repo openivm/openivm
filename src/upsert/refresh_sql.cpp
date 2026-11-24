@@ -517,7 +517,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string internal_schema_name = view_schema_name;
 	string internal_catalog_prefix = catalog_prefix;
 	auto metadata_start = profile_now();
-	RefreshMetadata metadata(con);
+	RefreshMetadata metadata(con, owned_connection ? nullptr : &context);
 	auto delta_metadata_tables = active_facts.target_dialect == SqlDialect::DUCKDB
 	                                 ? RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)
 	                                 : vector<string>();
@@ -732,6 +732,26 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		return "UPDATE " + views_metadata_table + " SET refresh_in_progress = " + (value ? "true" : "false") +
 		       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
 	};
+	auto build_ducklake_checkpoint = [&](const RefreshMetadata::DeltaSource &source, bool update_identity) {
+		DuckLakeSourceLocation loc;
+		loc.catalog_name = source.catalog_name;
+		if (update_identity || loc.catalog_name.empty()) {
+			loc = ResolveDuckLakeSourceLocation(con, view_name, source.table_name, view_catalog_name, view_schema_name,
+			                                    attached_db_catalog_name, attached_db_schema_name);
+		}
+		string snapshot_expr =
+		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
+		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
+		string source_table_id;
+		if (update_identity) {
+			source_table_id = "(" +
+			                  RefreshMetadata::BuildDuckLakeTableIdAtSQL(loc.catalog_name, loc.schema_name,
+			                                                             loc.table_name, snapshot_expr) +
+			                  ")";
+		}
+		return RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, source.table_name, snapshot_expr,
+		                                                        delta_metadata_table, source_table_id);
+	};
 	// Recompute the whole view. A recovery also clears the interruption marker; under the split protocol
 	// the marker stays durable until the recomputed state and its watermarks have both committed.
 	auto build_full_recompute = [&](bool recovering) {
@@ -741,7 +761,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                                             active_facts.target_dialect, view_time_travel_pins);
 		}
 		auto aux_rebuild = rebuild_distinct_aux(source_sql);
-		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql,
+		string ducklake_checkpoints;
+		for (auto &source : delta_sources) {
+			if (StringUtil::CIEquals(source.catalog_type, "ducklake")) {
+				ducklake_checkpoints += build_ducklake_checkpoint(source, true);
+			}
+		}
+		auto query = aux_rebuild + BuildRecomputeQuery(metadata, view_name, source_sql, ducklake_checkpoints,
 		                                               index_delta_view_catalog_entry &&
 		                                                   active_facts.target_dialect == SqlDialect::DUCKDB,
 		                                               cross_system, attached_db_catalog_name, attached_db_schema_name,
@@ -1229,6 +1255,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto options = aggregate_options(has_minmax, aggregate_insert_only);
 			if (!aggregate_recompute_delta_specs.empty()) {
 				options.cascade_delta_specs = &aggregate_recompute_delta_specs;
+				options.cascade_context = con.context.get();
 			}
 			options.inline_cascade_delta = inline_merge_cascade;
 			options.preserved_side_cols = std::move(ljsec.preserved_cols);
@@ -1466,9 +1493,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_cols,
 			                                                 view_query_sql, delta_specs);
 		}
-		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_cols, delta_specs,
+		const bool has_source_deletes = active_facts.compile_only
+		                                    ? !active_facts.assume_insert_only
+		                                    : !refresh_delta_activity || refresh_delta_activity->any_has_deletes;
+		upsert_query = CompileGroupRecompute(*con.context, view_name, view_query_sql, group_cols, delta_specs,
 		                                     internal_catalog_prefix, emit_cascade_delta_for_recompute, affected_mode,
-		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name));
+		                                     unmatched_groups, metadata.GetGroupRecomputeAffectedQuery(view_name),
+		                                     has_source_deletes);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE "
 		                    "(%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
@@ -1782,22 +1813,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	for (auto &source : delta_sources) {
 		string dt = source.table_name;
 		if (StringUtil::CIEquals(source.catalog_type, "ducklake")) {
-			string catalog_name = source.catalog_name;
-			if (catalog_name.empty()) {
-				auto loc =
-				    ResolveDuckLakeSourceLocation(con, view_name, source.table_name, view_catalog_name,
-				                                  view_schema_name, attached_db_catalog_name, attached_db_schema_name);
-				catalog_name = loc.catalog_name;
-			}
-			if (catalog_name.empty()) {
-				throw Exception(ExceptionType::CATALOG,
-				                "Could not resolve DuckLake catalog for source table '" + dt + "'");
-			}
-			string dl_snapshot_expr =
-			    cross_system ? DuckLakeSnapshotPlaceholder(catalog_name)
-			                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot())";
-			snapshot_update_query +=
-			    RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, dl_snapshot_expr, delta_metadata_table);
+			bool backfill_source_table_id =
+			    refresh_delta_activity && std::any_of(refresh_delta_activity->sources.begin(),
+			                                          refresh_delta_activity->sources.end(), [&](const auto &activity) {
+				                                          return activity.delta_table_name == dt &&
+				                                                 activity.backfill_source_table_id;
+			                                          });
+			snapshot_update_query += build_ducklake_checkpoint(
+			    source, dispatch_refresh_type == RefreshType::FULL_REFRESH || backfill_source_table_id);
 			continue;
 		}
 		string catalog_name = source.catalog_name.empty() ? view_catalog_name : source.catalog_name;
