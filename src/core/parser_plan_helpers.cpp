@@ -2670,6 +2670,7 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 }
 
 static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
+                                   const unordered_set<string> &null_extended_sources,
                                    vector<WindowEquivalenceEdge> &equivalence_edges,
                                    vector<WindowLookupEdge> &lookup_edges) {
 	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
@@ -2686,7 +2687,11 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		if (!condition.IsComparison()) {
 			continue;
 		}
-		if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+		auto comparison = condition.GetComparisonType();
+		bool null_safe_inner = join.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+		                       join.join_type == JoinType::INNER &&
+		                       comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+		if (comparison != ExpressionType::COMPARE_EQUAL && !null_safe_inner) {
 			continue;
 		}
 		string left_cast;
@@ -2703,18 +2708,27 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		                                           right->GetReturnType())) {
 			continue;
 		}
-		switch (join.join_type) {
-		case JoinType::INNER:
-		case JoinType::LEFT:
-			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
-			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
-			break;
-		case JoinType::RIGHT:
-			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
-			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
-			break;
-		default:
-			break;
+		if (null_safe_inner) {
+			// An outer join can add or remove a padded NULL without a source
+			// delta for that key. Null-safe equalities only transfer direct keys.
+			if (null_extended_sources.count(OccurrenceKey(left_ref)) ||
+			    null_extended_sources.count(OccurrenceKey(right_ref))) {
+				continue;
+			}
+		} else {
+			switch (join.join_type) {
+			case JoinType::INNER:
+			case JoinType::LEFT:
+				add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+				add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+				break;
+			case JoinType::RIGHT:
+				add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+				add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+				break;
+			default:
+				break;
+			}
 		}
 		if (join.join_type == JoinType::INNER) {
 			equivalence_edges.push_back(
@@ -3100,13 +3114,13 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 	}
 
+	auto nullable_sources = NullExtendedWindowSources(facts);
 	vector<WindowEquivalenceEdge> edges;
 	vector<WindowLookupEdge> lookup_edges;
 	for (auto *join : facts.comparison_joins) {
-		CollectWindowJoinEdges(*join, facts, edges, lookup_edges);
+		CollectWindowJoinEdges(*join, facts, nullable_sources, edges, lookup_edges);
 	}
 
-	auto nullable_sources = NullExtendedWindowSources(facts);
 	const WindowKeyEquality equal_keys {facts, edges, nullable_sources};
 	vector<WindowLineageOp> direct_ops;
 	unordered_map<string, const Expression *> window_keys;

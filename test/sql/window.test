@@ -1306,3 +1306,91 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_chained_equality_mv');
 ----
 true
+
+# Null-safe inner equijoins can discover affected partitions from either delta.
+statement ok
+CREATE TABLE window_nullsafe_a (id INT, k INT, q INT, v INT);
+CREATE TABLE window_nullsafe_b (id INT, k INT, q INT, v INT);
+INSERT INTO window_nullsafe_a VALUES (1,NULL,10,100),(2,NULL,10,90),(3,2,20,80),(4,3,30,70);
+INSERT INTO window_nullsafe_b VALUES (11,NULL,10,1),(12,2,20,2),(13,3,30,3);
+CREATE VIEW window_nullsafe_expected AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k,a.q ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_a a JOIN window_nullsafe_b b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+CREATE MATERIALIZED VIEW window_nullsafe_mv AS
+    SELECT a.id AS aid,b.id AS bid,a.k,a.q,a.v+b.v AS v,
+           row_number() OVER (PARTITION BY a.k,a.q ORDER BY a.id,b.id) AS rn
+    FROM window_nullsafe_a a JOIN window_nullsafe_b b
+    ON a.k IS NOT DISTINCT FROM b.k AND a.q IS NOT DISTINCT FROM b.q;
+
+statement ok
+INSERT INTO window_nullsafe_a VALUES (5,NULL,10,110),(6,2,20,1);
+UPDATE window_nullsafe_b SET v=5 WHERE id=11;
+DELETE FROM window_nullsafe_a WHERE id IN (1,6);
+
+statement ok
+PRAGMA refresh('window_nullsafe_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_nullsafe_mv EXCEPT ALL FROM window_nullsafe_expected)
+    UNION ALL
+    (FROM window_nullsafe_expected EXCEPT ALL FROM window_nullsafe_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_a')
+                          AND contains(sql, 'openivm_delta_window_nullsafe_b')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_mv');
+----
+true
+
+# A new match can displace a padded NULL key following an outer join.
+statement ok
+CREATE TABLE window_nullsafe_left (id INT);
+CREATE TABLE window_nullsafe_optional (id INT, k INT, v INT);
+CREATE TABLE window_nullsafe_keys (k INT);
+INSERT INTO window_nullsafe_left VALUES (1),(2),(3);
+INSERT INTO window_nullsafe_optional VALUES (2,5,20);
+INSERT INTO window_nullsafe_keys VALUES (NULL),(5);
+CREATE VIEW window_nullsafe_padding_expected AS
+    SELECT l.id,keys.k,b.v,row_number() OVER (PARTITION BY keys.k ORDER BY l.id) AS rn
+    FROM (window_nullsafe_left l LEFT JOIN window_nullsafe_optional b ON l.id=b.id)
+    JOIN window_nullsafe_keys keys ON b.k IS NOT DISTINCT FROM keys.k;
+CREATE MATERIALIZED VIEW window_nullsafe_padding_mv AS
+    SELECT l.id,keys.k,b.v,row_number() OVER (PARTITION BY keys.k ORDER BY l.id) AS rn
+    FROM (window_nullsafe_left l LEFT JOIN window_nullsafe_optional b ON l.id=b.id)
+    JOIN window_nullsafe_keys keys ON b.k IS NOT DISTINCT FROM keys.k;
+
+statement ok
+INSERT INTO window_nullsafe_optional VALUES (1,5,10),(3,5,30);
+UPDATE window_nullsafe_optional SET v=15 WHERE id=1;
+DELETE FROM window_nullsafe_optional WHERE id=3;
+
+statement ok
+PRAGMA refresh('window_nullsafe_padding_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_nullsafe_padding_mv EXCEPT ALL FROM window_nullsafe_padding_expected)
+    UNION ALL
+    (FROM window_nullsafe_padding_expected EXCEPT ALL FROM window_nullsafe_padding_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_nullsafe_padding_mv');
+----
+true
