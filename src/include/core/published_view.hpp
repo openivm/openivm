@@ -15,7 +15,7 @@ bool IsSnapshotPublication(ClientContext &context, const string &catalog, const 
                            const string &view_name);
 string BuildSnapshotPublicationSQL(Connection &con, const string &catalog, const string &published,
                                    const string &data_table, const string &query);
-string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
+string BuildPublishViewSQL(ClientContext &context, const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, const vector<LogicalType> &column_types, bool ducklake,
                            const string &metadata_table, const vector<string> &scope_columns = {},
                            const string &timestamp_sql = "", SqlDialect dialect = SqlDialect::DUCKDB,

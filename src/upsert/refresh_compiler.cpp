@@ -7,6 +7,7 @@
 #include "upsert/refresh_internal.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -1298,18 +1299,20 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	return result;
 }
 
-string CompileProjectionsFilters(SqlDialect dialect, const string &view_name, const vector<string> &column_names,
-                                 const vector<LogicalType> &column_types, const string &delta_ts_filter,
-                                 const string &catalog_prefix, bool insert_only, string *appended_rows) {
+string CompileProjectionsFilters(ClientContext &context, SqlDialect dialect, const string &view_name,
+                                 const vector<string> &column_names, const vector<LogicalType> &column_types,
+                                 const string &delta_ts_filter, const string &catalog_prefix, bool insert_only,
+                                 string *appended_rows) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
-	return CompileProjectionDelta(dialect, data_table, delta_view, column_names, column_types, delta_ts_filter,
+	return CompileProjectionDelta(context, dialect, data_table, delta_view, column_names, column_types, delta_ts_filter,
 	                              insert_only, appended_rows);
 }
 
-string CompileProjectionDelta(SqlDialect dialect, const string &data_table, const string &delta_view,
-                              const vector<string> &column_names, const vector<LogicalType> &column_types,
-                              const string &delta_ts_filter, bool insert_only, string *appended_rows) {
+string CompileProjectionDelta(ClientContext &context, SqlDialect dialect, const string &data_table,
+                              const string &delta_view, const vector<string> &column_names,
+                              const vector<LogicalType> &column_types, const string &delta_ts_filter, bool insert_only,
+                              string *appended_rows) {
 	string mul = string(openivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
@@ -1339,9 +1342,10 @@ string CompileProjectionDelta(SqlDialect dialect, const string &data_table, cons
 	// Consolidate and delete copies by the same representation-aware identity.
 	D_ASSERT(column_names.size() == column_types.size());
 	string group_columns = select_columns;
+	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
 	for (idx_t index = 0; index < column_names.size(); index++) {
 		auto identity = [&](const string &value) {
-			return SqlUtils::ValueIdentitySQL(value, column_types[index], dialect);
+			return SqlUtils::ValueIdentitySQL(value, column_types[index], dialect, default_collation);
 		};
 		auto column = SqlUtils::QuoteIdentifier(column_names[index]);
 		auto unqualified = identity(column);

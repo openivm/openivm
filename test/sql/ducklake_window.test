@@ -2137,3 +2137,67 @@ true
 endloop
 
 endloop
+
+# Session collation applies on the helper connections as well as the caller.
+statement ok
+SET SESSION default_collation = 'nocase';
+SET openivm_snapshot_publication = true;
+CREATE TABLE dl.window_collated_source (id INT, "p=key" INT, label VARCHAR);
+INSERT INTO dl.window_collated_source VALUES (1,1,'A'),(2,2,'B'),(3,3,'C');
+CREATE VIEW window_collated_expected AS
+    SELECT id,"p=key" AS pk,label,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_collated_source;
+CREATE MATERIALIZED VIEW dl.window_collated_compact AS
+    SELECT id,"p=key" AS pk,label,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_collated_source;
+CREATE MATERIALIZED VIEW dl.window_collated_result AS
+    SELECT id,"p=key" AS pk,label,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_collated_source ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW dl.window_collated_compact_child AS
+    SELECT * FROM dl.window_collated_compact WHERE id > 0;
+CREATE MATERIALIZED VIEW dl.window_collated_result_child AS
+    SELECT * FROM dl.window_collated_result WHERE id > 0;
+
+statement ok
+DELETE FROM dl.window_collated_source WHERE id=1;
+INSERT INTO dl.window_collated_source VALUES (1,1,'a'),(4,3,'D');
+UPDATE dl.window_collated_source SET label='E' WHERE id=4;
+DELETE FROM dl.window_collated_source WHERE id=4;
+
+foreach path compact result
+
+statement ok
+PRAGMA refresh('dl.window_collated_{path}');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(label) FROM dl.window_collated_{path} EXCEPT ALL SELECT *,hex(label) FROM window_collated_expected)
+    UNION ALL
+    (SELECT *,hex(label) FROM window_collated_expected EXCEPT ALL SELECT *,hex(label) FROM dl.window_collated_{path})
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(label) FROM dl.window_collated_{path}_child EXCEPT ALL SELECT *,hex(label) FROM window_collated_expected)
+    UNION ALL
+    (SELECT *,hex(label) FROM window_collated_expected EXCEPT ALL SELECT *,hex(label) FROM dl.window_collated_{path}_child)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'unhex(hex(') AND contains(sql,
+    CASE '{path}' WHEN 'compact' THEN 'openivm_window_changed' ELSE 'openivm_window_current' END)) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_collated_{path}');
+----
+true
+
+endloop
+
+statement ok
+SET SESSION default_collation = '';
+SET openivm_snapshot_publication = false;

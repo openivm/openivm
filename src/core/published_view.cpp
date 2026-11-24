@@ -6,6 +6,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
@@ -114,7 +115,7 @@ string PublishedSourceViewName(string source_name) {
 	return source_name;
 }
 
-string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
+string BuildPublishViewSQL(ClientContext &context, const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, const vector<LogicalType> &column_types, bool ducklake,
                            const string &metadata_table, const vector<string> &scope_columns,
                            const string &timestamp_sql, SqlDialect dialect, const string &appended_rows,
@@ -185,8 +186,10 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	// Keep retractions and insertions for representations that SQL equality merges.
 	D_ASSERT(columns.size() == column_types.size());
 	string group_list = column_list;
+	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
 	for (idx_t index = 0; index < columns.size(); index++) {
-		auto identity = SqlUtils::ValueIdentitySQL(quoted_columns[index], column_types[index], dialect);
+		auto identity =
+		    SqlUtils::ValueIdentitySQL(quoted_columns[index], column_types[index], dialect, default_collation);
 		if (!identity.empty()) {
 			group_list += ", " + identity;
 		}

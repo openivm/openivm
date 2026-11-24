@@ -1694,9 +1694,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		if (parse_data_ref.is_replace) {
 			ddl.push_back(BuildPublishViewSQL(
-			    view_name, internal_catalog_prefix, published_query, visible_columns, visible_types, target_is_ducklake,
-			    SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {}, creation_timestamp,
-			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)));
+			    context, view_name, internal_catalog_prefix, published_query, visible_columns, visible_types,
+			    target_is_ducklake, SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {},
+			    creation_timestamp, SqlDialect::DUCKDB, "", "",
+			    RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)));
 		}
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("published_query", published_query, view_name));
 		ddl.push_back(string(staged_cross_catalog_replace ? "CREATE OR REPLACE VIEW " : "CREATE VIEW ") + qvn +

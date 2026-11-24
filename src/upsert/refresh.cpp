@@ -258,6 +258,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
 	Connection exec_con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *exec_con.context, "TimeZone");
+	SqlUtils::CopyDefaultCollation(context, *exec_con.context);
 	TransactionalMVLockState::ShareMutationOwner(context, *exec_con.context);
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;
@@ -1101,6 +1102,7 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
 	Connection con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *con.context, "TimeZone");
+	SqlUtils::CopyDefaultCollation(context, *con.context);
 	// Hooks run through this helper connection while the caller owns the
 	// database-wide mutation gate. Give tracked DML in the hook the same logical
 	// owner so delta capture re-enters the gate instead of waiting on its caller.

@@ -424,6 +424,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
 	SqlUtils::CopySessionSetting(context, *conn->context, "TimeZone");
+	SqlUtils::CopyDefaultCollation(context, *conn->context);
 	TransactionalMVLockState::ShareMutationOwner(context, *conn->context);
 	MutationLockGuard mutation_guard(context);
 	StagedSourceDeltaCleanup source_delta_cleanup(context);

@@ -10,6 +10,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -130,11 +131,16 @@ static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder
 	// Keep representations that downstream expressions can distinguish.
 	Optimizer optimizer(binder, context);
 	const bool native = openivm::CompileFactsContextSlot::Get(context).target_dialect == SqlDialect::DUCKDB;
+	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
 	for (idx_t i = 0; i < base_col_count; i++) {
 		const auto &type = input_types[i];
 		if (type.IsFloating()) {
 			groups.push_back(MakeNegativeZeroExpression(context, optimizer,
 			                                            make_uniq<BoundColumnRefExpression>(type, input_bindings[i])));
+		} else if (native && SqlUtils::IsCollatedString(type, default_collation)) {
+			auto bytes =
+			    optimizer.BindScalarFunction("hex", make_uniq<BoundColumnRefExpression>(type, input_bindings[i]));
+			groups.push_back(optimizer.BindScalarFunction("unhex", std::move(bytes)));
 		} else if (native && SqlUtils::EqualityCanHideValueIdentity(type)) {
 			groups.push_back(optimizer.BindScalarFunction(
 			    "openivm_internal_value_key", make_uniq<BoundColumnRefExpression>(type, input_bindings[i])));

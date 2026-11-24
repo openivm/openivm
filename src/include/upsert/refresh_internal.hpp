@@ -224,7 +224,7 @@ string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const strin
                                           const string &delta_ts_filter, const string &catalog_prefix,
                                           const string &recompute_alias);
 string
-CompileProjectionRefresh(RefreshMetadata &metadata, SqlDialect dialect, const string &view_name,
+CompileProjectionRefresh(ClientContext &context, RefreshMetadata &metadata, SqlDialect dialect, const string &view_name,
                          const vector<string> &column_names, const vector<LogicalType> &column_types,
                          const vector<string> &delta_table_names, const string &data_table,
                          const string &view_query_sql, const string &delta_ts_filter, const string &catalog_prefix,

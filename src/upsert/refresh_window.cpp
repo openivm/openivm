@@ -7,6 +7,7 @@
 #include "core/plan_rewrite.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -330,6 +331,7 @@ struct WindowOutput {
 	const vector<string> &column_names;
 	const vector<LogicalType> &column_types;
 	SqlDialect dialect;
+	string default_collation;
 
 	vector<string> Identities(const string &prefix = "") const {
 		D_ASSERT(column_names.size() == column_types.size());
@@ -339,7 +341,7 @@ struct WindowOutput {
 				continue;
 			}
 			auto identity = SqlUtils::ValueIdentitySQL(prefix + SqlUtils::QuoteIdentifier(column_names[i]),
-			                                           column_types[i], dialect);
+			                                           column_types[i], dialect, default_collation);
 			if (!identity.empty()) {
 				identities.push_back(std::move(identity));
 			}
@@ -681,7 +683,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		*uses_running_suffix = false;
 	}
 	auto dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
-	const WindowOutput output {column_names, column_types, dialect};
+	const WindowOutput output {column_names, column_types, dialect,
+	                           Settings::Get<DefaultCollationSetting>(*con.context)};
 	optional<bool> saved_result_diff;
 	auto partition_cols = metadata.GetWindowPartitionColumns(view_name, &saved_result_diff);
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
