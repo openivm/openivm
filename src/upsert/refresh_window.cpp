@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_plan_helpers.hpp"
+#include "core/plan_rewrite.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -510,6 +511,7 @@ static RefreshMetadata::WindowPartitionLineage RebindWindowPartitionLineage(Conn
 			if (!planner.plan) {
 				return;
 			}
+			InlineCtesIfPresent(*con.context, *planner.binder, planner.plan);
 			auto facts =
 			    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(*con.context).catalog);
 			BuildWindowPartitionLineageOps(facts, partitions, column_names, rebound);
