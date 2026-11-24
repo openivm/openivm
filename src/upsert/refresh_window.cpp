@@ -568,6 +568,35 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 	return upsert_query;
 }
 
+static vector<string> ResultDiffScope(const vector<string> &partition_cols, const vector<string> &column_names) {
+	vector<string> scope;
+	optional<vector<string>> sanitized_names;
+	for (const auto &partition : partition_cols) {
+		auto output = RefreshMetadata::ParseWindowColumn(partition).first;
+		if (ContainsCI(column_names, output)) {
+			AddUniqueCI(scope, partition);
+			continue;
+		}
+		// DuckLake may materialize the original SQL while metadata names were
+		// prepared for LPTS. Recover the physical column at the same position.
+		if (!sanitized_names) {
+			sanitized_names = PrepareOutputNames(nullptr, column_names);
+		}
+		auto match = std::find_if(sanitized_names->begin(), sanitized_names->end(),
+		                          [&](const string &name) { return StringUtil::CIEquals(name, output); });
+		if (match != sanitized_names->end()) {
+			const auto &physical_name = column_names[match - sanitized_names->begin()];
+			AddUniqueCI(scope, RefreshMetadata::SerializeWindowColumn(physical_name, physical_name));
+		}
+	}
+	if (scope.empty()) {
+		// Full result comparison can group the changed rows by any output key.
+		D_ASSERT(!column_names.empty());
+		scope.push_back(RefreshMetadata::SerializeWindowColumn(column_names.front(), column_names.front()));
+	}
+	return scope;
+}
+
 static string BuildChangedWindowPartitionsSQL(const string &data_table, const string &view_query_sql,
                                               const vector<string> &partition_cols,
                                               const vector<string> &floating_columns) {
@@ -673,10 +702,10 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		requires_result_diff = get_rebound().requires_result_diff;
 	}
 	if (any_ducklake && requires_result_diff && !partition_cols.empty()) {
-		auto keys = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols, floating_columns);
+		auto scope = ResultDiffScope(partition_cols, column_names);
+		auto keys = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, scope, floating_columns);
 		return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, keys,
-		                                        AffectedPartitionsTempTable(view_name), partition_cols,
-		                                        publication_scope);
+		                                        AffectedPartitionsTempTable(view_name), scope, publication_scope);
 	}
 	if (!ducklake_scope.empty()) {
 		// Narrowing a composite scope needs the same proof as a join:
@@ -737,6 +766,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	                       lineage_result != LineageAffectedKeysResult::AVAILABLE && !partition_cols.empty();
 	if (use_result_diff) {
 		// Matching column names in delta tables do not prove a partition relationship.
+		partition_cols = ResultDiffScope(partition_cols, column_names);
 		affected_keys_sql =
 		    BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols, floating_columns);
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION uses result-diff keys for '%s'\n", view_name.c_str());

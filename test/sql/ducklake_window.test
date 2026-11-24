@@ -1742,6 +1742,65 @@ WHERE operation = 'refresh'
 ----
 true
 
+# The original DuckLake SQL keeps quoted names that LPTS sanitizes.
+statement ok
+CREATE VIEW quoted_limit_single_expected AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY "json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+CREATE MATERIALIZED VIEW dl.quoted_limit_single_mv AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY "json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+CREATE VIEW quoted_limit_composite_expected AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY k,"json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+CREATE MATERIALIZED VIEW dl.quoted_limit_composite_mv AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY k,"json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+
+foreach version fresh legacy
+
+statement ok
+UPDATE openivm_views
+SET group_columns = CASE view_sql_name
+    WHEN 'quoted_limit_single_mv' THEN 'json_q=json:q' ELSE 'k=k,json_q=json:q' END
+WHERE '{version}' = 'legacy'
+  AND view_sql_name IN ('quoted_limit_single_mv','quoted_limit_composite_mv');
+INSERT INTO dl.window_scope_namesake VALUES
+    (CASE WHEN '{version}' = 'fresh' THEN 1 ELSE 0 END, 9, 90, 100),(90,91,92,93);
+UPDATE dl.window_scope_namesake SET v=v+1 WHERE id=90;
+DELETE FROM dl.window_scope_namesake WHERE id=90;
+
+foreach scope single composite
+
+statement ok
+PRAGMA refresh('dl.quoted_limit_{scope}_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_limit_{scope}_mv EXCEPT ALL FROM quoted_limit_{scope}_expected)
+    UNION ALL
+    (FROM quoted_limit_{scope}_expected EXCEPT ALL FROM dl.quoted_limit_{scope}_mv)
+);
+----
+0
+
+query I
+SELECT bool_or(contains(sql, 'openivm_window_current') AND contains(sql, '"json:q"'))
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_limit_{scope}_mv')
+GROUP BY version ORDER BY version DESC LIMIT 1;
+----
+true
+
+endloop
+
+endloop
+
 # The change feed contains the challenger, but the unchanged old winner
 # can occupy a different window partition.
 statement ok

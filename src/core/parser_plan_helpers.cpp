@@ -50,6 +50,7 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -2943,21 +2944,26 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 	return metadata_op;
 }
 
-static bool RejectsNullPadding(const Expression &filter, const Expression &expression,
-                               const vector<ColumnBinding> &bindings) {
+static bool RejectsNullPadding(const Expression &filter, const vector<ColumnBinding> &bindings) {
+	auto type = filter.GetExpressionType();
+	if (type == ExpressionType::CONJUNCTION_AND || type == ExpressionType::CONJUNCTION_OR) {
+		const auto &children = filter.Cast<BoundConjunctionExpression>().GetChildren();
+		auto rejects = [&](const unique_ptr<Expression> &child) {
+			return RejectsNullPadding(*child, bindings);
+		};
+		return type == ExpressionType::CONJUNCTION_AND ? std::any_of(children.begin(), children.end(), rejects)
+		                                               : std::all_of(children.begin(), children.end(), rejects);
+	}
+
 	// An operand proved non-NULL by the filter cannot come from padding if
 	// it would become NULL when this join side's columns are all NULL.
-	if (FilterRejectsNull(filter, expression) &&
-	    ExpressionBecomesNull(expression, [&](const BoundColumnRefExpression &column) {
-		    return column.Depth() == 0 &&
-		           std::find(bindings.begin(), bindings.end(), column.Binding()) != bindings.end();
-	    })) {
-		return true;
-	}
 	bool rejects_padding = false;
-	ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) {
-		if (!rejects_padding) {
-			rejects_padding = RejectsNullPadding(filter, child, bindings);
+	ExpressionIterator::EnumerateChildren(filter, [&](const Expression &operand) {
+		if (!rejects_padding && FilterRejectsNull(filter, operand)) {
+			rejects_padding = ExpressionBecomesNull(operand, [&](const BoundColumnRefExpression &column) {
+				return column.Depth() == 0 &&
+				       std::find(bindings.begin(), bindings.end(), column.Binding()) != bindings.end();
+			});
 		}
 	});
 	return rejects_padding;
@@ -2988,7 +2994,7 @@ static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &
 				auto bindings = join->children[child]->GetColumnBindings();
 				const auto &predicates = filter->second->expressions;
 				if (std::any_of(predicates.begin(), predicates.end(), [&](const unique_ptr<Expression> &predicate) {
-					    return RejectsNullPadding(*predicate, *predicate, bindings);
+					    return RejectsNullPadding(*predicate, bindings);
 				    })) {
 					continue;
 				}
@@ -3852,7 +3858,9 @@ vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<str
 	for (auto &name : output_names) {
 		name = SanitizeOutputName(name);
 	}
-	AppendHiddenOutputNames(select_plan, output_names);
+	if (select_plan) {
+		AppendHiddenOutputNames(select_plan, output_names);
+	}
 	DeduplicateOutputNames(output_names);
 	return output_names;
 }

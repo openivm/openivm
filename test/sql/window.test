@@ -974,11 +974,21 @@ CREATE MATERIALIZED VIEW comparison_window_mv AS
            row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
     FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
     WHERE b.id > 0 AND a.v > 0;
+CREATE VIEW disjunction_window_expected AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
+    WHERE b.id > 0 OR b."p=key" > 0;
+CREATE MATERIALIZED VIEW disjunction_window_mv AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
+    WHERE b.id > 0 OR b."p=key" > 0;
 INSERT INTO nullable_window_right VALUES (1,200),(3,300),(4,400);
 UPDATE nullable_window_left SET v=35 WHERE id=3;
 DELETE FROM nullable_window_right WHERE id IN (2,4);
 
-foreach variant filtered_window comparison_window
+foreach variant filtered_window comparison_window disjunction_window
 
 statement ok
 PRAGMA refresh('{variant}_mv');
