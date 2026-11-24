@@ -1052,3 +1052,70 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'composite_join_mv');
 ----
 true
+
+# Different expressions named k can share one real partition key, q.
+statement ok
+CREATE TABLE window_namesake_left (id INT, k INT, q INT, v INT);
+CREATE TABLE window_namesake_right (id INT, k INT, q INT, v INT);
+INSERT INTO window_namesake_left VALUES (4,1,10,40),(5,2,10,50),(6,3,20,60);
+INSERT INTO window_namesake_right VALUES (11,1,10,90),(12,2,10,92),(13,3,20,94);
+CREATE VIEW window_namesake_expected AS
+    SELECT l.id AS lid,r.id AS rid,l.k,l.q,l.v+r.v AS v,
+           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS lrn,
+           row_number() OVER (PARTITION BY r.k,l.q ORDER BY l.id,r.id) AS rrn
+    FROM window_namesake_left AS l
+    JOIN (SELECT id,k AS join_k,q,v,v%2 AS k FROM window_namesake_right) r ON l.k=r.join_k AND l.q=r.q;
+CREATE MATERIALIZED VIEW window_namesake_mv AS
+    SELECT l.id AS lid,r.id AS rid,l.k,l.q,l.v+r.v AS v,
+           row_number() OVER (PARTITION BY l.k,l.q ORDER BY l.id,r.id) AS lrn,
+           row_number() OVER (PARTITION BY r.k,l.q ORDER BY l.id,r.id) AS rrn
+    FROM window_namesake_left AS l
+    JOIN (SELECT id,k AS join_k,q,v,v%2 AS k FROM window_namesake_right) r ON l.k=r.join_k AND l.q=r.q;
+
+statement ok
+INSERT INTO window_namesake_left VALUES (1,1,10,110),(2,1,10,20);
+UPDATE window_namesake_left SET v=41 WHERE id=4;
+DELETE FROM window_namesake_left WHERE id=2;
+
+statement ok
+PRAGMA refresh('window_namesake_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_namesake_mv EXCEPT ALL FROM window_namesake_expected)
+    UNION ALL
+    (FROM window_namesake_expected EXCEPT ALL FROM window_namesake_mv)
+);
+----
+0
+
+# Rebinding a legacy view must find the same common key.
+statement ok
+UPDATE openivm_views SET lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'window_namesake_mv';
+INSERT INTO window_namesake_left VALUES (2,1,10,20),(3,1,10,30);
+UPDATE window_namesake_left SET v=42 WHERE id=4;
+DELETE FROM window_namesake_left WHERE id IN (1,2,3);
+
+statement ok
+PRAGMA refresh('window_namesake_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_namesake_mv EXCEPT ALL FROM window_namesake_expected)
+    UNION ALL
+    (FROM window_namesake_expected EXCEPT ALL FROM window_namesake_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'SELECT DISTINCT q FROM')
+                          AND contains(sql, 'openivm_changed_partitions')
+                          AND contains(sql, 'openivm_delta_window_namesake_left')) >= 2
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_namesake_mv');
+----
+true

@@ -2730,6 +2730,23 @@ static const Expression &WindowKeyExpression(const Expression &expr, const Creat
 	return *current;
 }
 
+static bool IsCommonWindowKey(const CreateMVPlanFacts &facts, const Expression &key) {
+	for (const auto *window : facts.windows) {
+		for (const auto &expression : window->expressions) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+				continue;
+			}
+			const auto &partitions = expression->Cast<BoundWindowExpression>().Partitions();
+			if (std::none_of(partitions.begin(), partitions.end(), [&](const unique_ptr<Expression> &partition) {
+				    return Expression::Equals(WindowKeyExpression(*partition, facts), key);
+			    })) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 static bool HasPlainCoalescePartition(const Expression &key, const CreateMVPlanFacts &facts,
                                       const vector<OccurrenceColumnRef> &refs, const string &source_name) {
 	if (key.GetExpressionType() != ExpressionType::OPERATOR_COALESCE) {
@@ -3105,7 +3122,9 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				break;
 			}
 		}
-		if (!matches_projection) {
+		// Lineage only records resolvable source columns. Check every bound
+		// window so an unresolved or computed namesake cannot prove a common key.
+		if (!matches_projection || !IsCommonWindowKey(facts, *key)) {
 			continue;
 		}
 		const auto nullable_operand = [&](const WindowLineageOp &op) {
