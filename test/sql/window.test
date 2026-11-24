@@ -920,8 +920,40 @@ SELECT count(*) FROM (
 ----
 0
 
+# Legacy lookups can cover both tables while missing the padded NULL partition.
+statement ok
+UPDATE openivm_views SET group_columns = 'pk=p=key',
+    lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'nullable_window_mv';
+INSERT INTO nullable_window_left VALUES (5,50),(6,60);
+UPDATE nullable_window_left SET v=12 WHERE id=1;
+DELETE FROM nullable_window_left WHERE id=6;
+DELETE FROM nullable_window_right WHERE id=2;
+
+statement ok
+PRAGMA refresh('nullable_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM nullable_window_mv EXCEPT ALL FROM nullable_window_expected)
+    UNION ALL
+    (FROM nullable_window_expected EXCEPT ALL FROM nullable_window_mv)
+);
+----
+0
+
+query I
+SELECT bool_or(contains(sql, 'openivm_window_current'))
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'nullable_window_mv')
+GROUP BY version ORDER BY version DESC LIMIT 1;
+----
+true
+
 # A null-rejecting filter below the window makes the nullable-side key usable.
 statement ok
+INSERT INTO nullable_window_right VALUES (2,200);
 CREATE VIEW filtered_window_expected AS
     SELECT a.id, a.v, b."p=key" AS pk,
            row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
@@ -932,18 +964,30 @@ CREATE MATERIALIZED VIEW filtered_window_mv AS
            row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
     FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
     WHERE b.id IS NOT NULL AND a.v > 0;
+CREATE VIEW comparison_window_expected AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
+    WHERE b.id > 0 AND a.v > 0;
+CREATE MATERIALIZED VIEW comparison_window_mv AS
+    SELECT a.id, a.v, b."p=key" AS pk,
+           row_number() OVER (PARTITION BY b."p=key" ORDER BY a.id) AS rn
+    FROM nullable_window_left a LEFT JOIN nullable_window_right b ON a.id=b.id
+    WHERE b.id > 0 AND a.v > 0;
 INSERT INTO nullable_window_right VALUES (1,200),(3,300),(4,400);
 UPDATE nullable_window_left SET v=35 WHERE id=3;
 DELETE FROM nullable_window_right WHERE id IN (2,4);
 
+foreach variant filtered_window comparison_window
+
 statement ok
-PRAGMA refresh('filtered_window_mv');
+PRAGMA refresh('{variant}_mv');
 
 query I
 SELECT count(*) FROM (
-    (FROM filtered_window_mv EXCEPT ALL FROM filtered_window_expected)
+    (FROM {variant}_mv EXCEPT ALL FROM {variant}_expected)
     UNION ALL
-    (FROM filtered_window_expected EXCEPT ALL FROM filtered_window_mv)
+    (FROM {variant}_expected EXCEPT ALL FROM {variant}_mv)
 );
 ----
 0
@@ -955,9 +999,11 @@ SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')
        AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
 FROM openivm_compiled_statements
 WHERE operation = 'refresh'
-  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'filtered_window_mv');
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = '{variant}_mv');
 ----
 true
+
+endloop
 
 # A row admitted by a nested LIMIT can evict a row from another partition.
 statement ok

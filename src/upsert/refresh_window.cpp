@@ -229,7 +229,7 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
 	bool proven = lineage.IsProven(output_col);
 	bool use_coalesce =
 	    !proven && CanUseCoalesceLineage(metadata, view_name, delta_table_names, lineage, output_col, activity);
-	if (lineage.proven_columns && !proven && !use_coalesce) {
+	if ((require_proof || lineage.proven_columns) && !proven && !use_coalesce) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
 	auto build_arm = [&](const RefreshMetadata::WindowPartitionLineageOp &op, string &arm, string &source) {
@@ -251,13 +251,8 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
 	};
 	vector<string> arms;
 	auto result = BuildLineageAffectedKeyArms(output_col, lineage.ops, delta_table_names, build_arm, arms);
-	// Check legacy casts before requiring the occurrence proof. An unsafe
-	// lookup still selects the established full-recompute path.
 	if (result != LineageAffectedKeysResult::AVAILABLE) {
 		return result;
-	}
-	if (require_proof && !proven && !use_coalesce) {
-		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
 	auto key_cols = SqlUtils::QuoteIdentifier(output_col);
 	if (use_coalesce) {
@@ -533,18 +528,6 @@ static ReboundWindowPartition RebindWindowPartitionLineage(Connection &con, cons
 	return rebound;
 }
 
-static bool HasMultipleLegacyDirectArms(const string &partition_spec,
-                                        const RefreshMetadata::WindowPartitionLineage &lineage) {
-	auto output = RefreshMetadata::ParseWindowColumn(partition_spec).first;
-	idx_t direct_arms = 0;
-	for (const auto &op : lineage.ops) {
-		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, output) && ++direct_arms > 1) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static string BuildSingleSourceDuckLakeWindowRefresh(
     RefreshMetadata &metadata, Connection &con, const string &view_name, const string &view_query_sql,
     const vector<string> &partition_cols, const vector<string> &order_cols, const vector<string> &column_names,
@@ -667,12 +650,21 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	bool any_ducklake = AnyDuckLakeSource(metadata, view_name, delta_table_names);
 	auto ducklake_scope = any_ducklake ? DuckLakeWindowScope(partition_cols, column_names) : vector<string>();
 	optional<ReboundWindowPartition> rebound;
-	auto get_rebound = [&]() -> const ReboundWindowPartition & {
+	auto get_rebound = [&]() -> ReboundWindowPartition & {
 		if (!rebound) {
 			auto &scope = ducklake_scope.empty() ? partition_cols : ducklake_scope;
 			rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, scope);
 		}
 		return *rebound;
+	};
+	auto read_lineage = [&](bool require_proof) {
+		RefreshMetadata::WindowPartitionLineage lineage;
+		metadata.GetWindowPartitionLineage(view_name, lineage);
+		if (require_proof && !lineage.proven_columns) {
+			auto &bound = get_rebound();
+			lineage = bound.requires_result_diff ? RefreshMetadata::WindowPartitionLineage() : std::move(bound.lineage);
+		}
+		return lineage;
 	};
 	// Legacy metadata never recorded whether a LIMIT or DISTINCT ON could
 	// evict a row in an unchanged source partition.
@@ -687,19 +679,16 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		                                        publication_scope);
 	}
 	if (!ducklake_scope.empty()) {
+		// Narrowing a composite scope needs the same proof as a join:
+		// the selected output must represent the source key at every window.
+		bool require_proof = has_join || partition_cols.size() > 1;
 		RefreshMetadata::WindowPartitionLineage lineage;
-		if (delta_table_names.size() > 1 || has_join) {
-			metadata.GetWindowPartitionLineage(view_name, lineage);
-		}
-		if (has_join && !lineage.proven_columns) {
-			const auto &bound = get_rebound();
-			if (!bound.requires_result_diff) {
-				lineage = bound.lineage;
-			}
+		if (delta_table_names.size() > 1 || require_proof) {
+			lineage = read_lineage(require_proof);
 		}
 		if (delta_table_names.size() == 1 &&
-		    (!has_join || (lineage.IsProven(RefreshMetadata::ParseWindowColumn(ducklake_scope[0]).first) &&
-		                   HasDirectDuckLakeWindowPartitionOps(lineage, ducklake_scope[0])))) {
+		    (!require_proof || (lineage.IsProven(RefreshMetadata::ParseWindowColumn(ducklake_scope[0]).first) &&
+		                        HasDirectDuckLakeWindowPartitionOps(lineage, ducklake_scope[0])))) {
 			return BuildSingleSourceDuckLakeWindowRefresh(
 			    metadata, con, view_name, view_query_sql, ducklake_scope, order_cols, column_names, data_table,
 			    view_catalog_name, view_schema_name, attached_db_catalog_name, attached_db_schema_name,
@@ -720,45 +709,16 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	string composite_scope;
 	bool composite = partition_cols.size() > 1;
 	if (!requires_result_diff && !partition_cols.empty() && (!composite || has_join)) {
-		RefreshMetadata::WindowPartitionLineage lineage;
-		metadata.GetWindowPartitionLineage(view_name, lineage);
-		if (has_join && !lineage.proven_columns) {
-			if (composite) {
-				const auto &bound = get_rebound();
-				if (!bound.requires_result_diff) {
-					lineage = bound.lineage;
-				}
-			} else if (HasMultipleLegacyDirectArms(partition_cols[0], lineage)) {
-				// A binding proof distinguishes equal keys from alternatives.
-				const auto &bound = get_rebound();
-				lineage.proven_columns.emplace();
-				if (!bound.requires_result_diff) {
-					lineage.proven_columns = bound.lineage.proven_columns.value_or(vector<string>());
-					lineage.coalesce_columns = bound.lineage.coalesce_columns;
-					lineage.coalesce_preserved_source = bound.lineage.coalesce_preserved_source;
-				}
-			}
-		}
+		auto lineage = read_lineage(has_join);
 		for (const auto &partition : partition_cols) {
 			// A proven common key covers every affected partition under that key.
 			if (composite && !lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
 				continue;
 			}
-			auto build_keys = [&](const RefreshMetadata::WindowPartitionLineage &candidate) {
-				return BuildLineageStandardAffectedKeysSQL(
-				    metadata, con, view_name, delta_table_names, partition, delta_ts_filter, view_catalog_name,
-				    view_schema_name, attached_db_catalog_name, attached_db_schema_name,
-				    has_join && delta_table_names.size() == 1, activity, candidate, affected_keys_sql);
-			};
-			auto result = build_keys(lineage);
-			if (result == LineageAffectedKeysResult::UNAVAILABLE && !composite && has_join && !lineage.proven_columns) {
-				// Old single-key metadata can omit arms inferred from null-safe equality.
-				const auto &bound = get_rebound();
-				if (!bound.requires_result_diff &&
-				    bound.lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
-					result = build_keys(bound.lineage);
-				}
-			}
+			auto result = BuildLineageStandardAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition,
+			                                                  delta_ts_filter, view_catalog_name, view_schema_name,
+			                                                  attached_db_catalog_name, attached_db_schema_name,
+			                                                  has_join, activity, lineage, affected_keys_sql);
 			if (!composite || result == LineageAffectedKeysResult::AVAILABLE) {
 				lineage_result = result;
 				if (composite) {
