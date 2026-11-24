@@ -2654,7 +2654,12 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 	return ResolveBindingToOccurrenceRefsInternal(binding, facts, out, 0);
 }
 
-static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool signed_only = false);
+static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool integral_only = false);
+
+static bool IsLosslessIntegerJoinKey(const Expression &key, const CreateMVPlanFacts &facts) {
+	// A signed comparison type bounds the range of both raw operands.
+	return key.GetReturnType().IsSigned() && IsDirectWindowKey(key, facts, true);
+}
 
 static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
                                    const unordered_set<string> &null_extended_sources,
@@ -2719,8 +2724,9 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		}
 		if (join.join_type == JoinType::INNER) {
 			bool widened = !left_cast.empty() || !right_cast.empty();
-			if (!widened || (null_safe_inner && IsDirectWindowKey(*condition.LeftReference(), facts, true) &&
-			                 IsDirectWindowKey(*condition.RightReference(), facts, true))) {
+			if (!widened || (join.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+			                 IsLosslessIntegerJoinKey(*condition.LeftReference(), facts) &&
+			                 IsLosslessIntegerJoinKey(*condition.RightReference(), facts))) {
 				equivalence_edges.push_back({join_id, std::move(left_ref), std::move(right_ref), widened});
 			}
 		}
@@ -2741,14 +2747,14 @@ static const Expression &WindowKeyExpression(const Expression &expr, const Creat
 	return *current;
 }
 
-static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool signed_only) {
+static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool integral_only) {
 	const auto &expression = WindowKeyExpression(key, facts);
 	const auto &type = expression.GetReturnType();
-	if (signed_only && (!type.IsIntegral() || !type.IsSigned() || type.HasAlias())) {
+	if (integral_only && (!type.IsIntegral() || type.HasAlias())) {
 		return false;
 	}
 	if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
-		if (!signed_only) {
+		if (!integral_only) {
 			return true;
 		}
 		auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
@@ -2764,7 +2770,7 @@ static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &fa
 	const auto &from = child.GetReturnType();
 	const auto &to = expression.GetReturnType();
 	return from.IsIntegral() && to.IsIntegral() && !from.HasAlias() && !to.HasAlias() &&
-	       BoundCastExpression::CastIsInvertible(from, to) && IsDirectWindowKey(child, facts, signed_only);
+	       BoundCastExpression::CastIsInvertible(from, to) && IsDirectWindowKey(child, facts, integral_only);
 }
 
 static const OccurrenceColumnRef *OtherWindowKey(const WindowEquivalenceEdge &edge, const OccurrenceColumnRef &key) {
@@ -3176,7 +3182,17 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				equivalent.source_col = other->column;
 				// A wider source can contain unmatched values outside the
 				// projection's type. Let the key comparison widen as needed.
-				if (!edge.widened) {
+				if (edge.widened) {
+					auto key = window_keys.find(StringUtil::Lower(direct.output_col));
+					if (key == window_keys.end() || !key->second) {
+						continue;
+					}
+					const auto &type = key->second->GetReturnType();
+					// UHUGEINT has no lossless common type with signed keys.
+					if (!type.IsIntegral() || type.HasAlias() || type.id() == LogicalTypeId::UHUGEINT) {
+						continue;
+					}
+				} else {
 					equivalent.source_cast = direct.source_cast;
 				}
 				AddUniqueLineageOp(next_ops, std::move(equivalent));

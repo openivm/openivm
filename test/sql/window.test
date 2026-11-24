@@ -993,7 +993,7 @@ true
 # Both sides of an inner equijoin can supply the common window partition keys.
 statement ok
 CREATE TABLE composite_left_rows (id INT, k INT, q INT, v INT);
-CREATE TABLE composite_right_rows (id INT, k INT, q INT, v INT);
+CREATE TABLE composite_right_rows (id INT, k BIGINT, q BIGINT, v INT);
 INSERT INTO composite_left_rows VALUES (1,1,10,100),(2,1,10,90),(3,2,20,80),(4,3,30,70);
 INSERT INTO composite_right_rows VALUES (11,1,10,1),(12,2,20,2),(13,3,30,3);
 CREATE VIEW composite_join_expected AS
@@ -1009,6 +1009,7 @@ CREATE MATERIALIZED VIEW composite_join_mv AS
 
 statement ok
 INSERT INTO composite_left_rows VALUES (5,1,10,110),(6,2,20,1);
+INSERT INTO composite_right_rows VALUES (16,9223372036854775807,10,0);
 UPDATE composite_right_rows SET v=5 WHERE id=11;
 DELETE FROM composite_left_rows WHERE id IN (1,6);
 
@@ -1310,7 +1311,7 @@ true
 # Null-safe inner equijoins can discover affected partitions from either delta.
 statement ok
 CREATE TABLE window_nullsafe_a (id INT, k INT, q INT, v INT);
-CREATE TABLE window_nullsafe_b (id INT, k INT, q INT, v INT);
+CREATE TABLE window_nullsafe_b (id INT, k UINTEGER, q UINTEGER, v INT);
 INSERT INTO window_nullsafe_a VALUES (1,NULL,10,100),(2,NULL,10,90),(3,2,20,80),(4,3,30,70);
 INSERT INTO window_nullsafe_b VALUES (11,NULL,10,1),(12,2,20,2),(13,3,30,3);
 CREATE VIEW window_nullsafe_expected AS
@@ -1326,6 +1327,7 @@ CREATE MATERIALIZED VIEW window_nullsafe_mv AS
 
 statement ok
 INSERT INTO window_nullsafe_a VALUES (5,NULL,10,110),(6,2,20,1);
+INSERT INTO window_nullsafe_b VALUES (14,4294967295,10,50);
 UPDATE window_nullsafe_b SET v=5 WHERE id=11;
 DELETE FROM window_nullsafe_a WHERE id IN (1,6);
 
