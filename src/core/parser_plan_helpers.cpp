@@ -2866,6 +2866,16 @@ static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &
 	return sources;
 }
 
+bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts) {
+	// A limited input can evict a row from a different partition even if
+	// the evicted row's source never changed.
+	return std::any_of(
+	    facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [](const CreateMVPlanNodeFacts &node) {
+		    auto type = node.plan_node->type;
+		    return type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N;
+	    });
+}
+
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
@@ -2986,6 +2996,24 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		covered[StringUtil::Lower(op.output_col)].insert(OccurrenceKey(op.source_table, op.source_occurrence));
 	}
 	auto nullable_sources = NullExtendedWindowSources(facts);
+	string preserved_source;
+	if (facts.source_occurrences.size() == nullable_sources.size() + 1) {
+		for (const auto &source : facts.source_occurrences) {
+			if (!nullable_sources.count(OccurrenceKey(source.table, source.occurrence))) {
+				preserved_source = source.table;
+				break;
+			}
+		}
+		// A change to a physical source shared by an optional alias can also
+		// change that alias's match, even when it is the preserved input.
+		for (const auto &source : facts.source_occurrences) {
+			if (StringUtil::CIEquals(source.table, preserved_source) &&
+			    nullable_sources.count(OccurrenceKey(source.table, source.occurrence))) {
+				preserved_source.clear();
+				break;
+			}
+		}
+	}
 	auto spine = ViewOutputSpine(facts.root);
 	const auto *projection = spine.projections.empty() ? nullptr : spine.projections.front();
 	out.proven_columns.emplace();
@@ -3017,7 +3045,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			out.proven_columns->push_back(entry.first);
 			continue;
 		}
-		if (!coalesce_candidates.count(entry.first) || facts.source_occurrences.size() != nullable_sources.size() + 1) {
+		if (!coalesce_candidates.count(entry.first) || preserved_source.empty()) {
 			continue;
 		}
 		// For one preserved input, every alternative must be discoverable
@@ -3038,6 +3066,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		});
 		if (covers_alternatives) {
 			out.coalesce_columns.push_back(entry.first);
+			out.coalesce_preserved_source = preserved_source;
 		}
 	}
 	std::sort(out.proven_columns->begin(), out.proven_columns->end());

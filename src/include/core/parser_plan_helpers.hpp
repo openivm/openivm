@@ -156,6 +156,7 @@ string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
+bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
 /// A same-named source/output key for a single-source, key-local plan; empty if

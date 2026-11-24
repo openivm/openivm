@@ -1770,7 +1770,10 @@ pair<string, string> RefreshMetadata::ParseWindowColumn(const string &spec) {
 	return ParseLegacyWindowColumn(spec);
 }
 
-string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns) {
+string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns, bool requires_result_diff) {
+	if (requires_result_diff) {
+		return WINDOW_COLUMN_LIST_PREFIX + SqlUtils::JsonArray(columns) + ",\"requires_result_diff\":\"true\"}";
+	}
 	for (const auto &spec : columns) {
 		if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
 			// Identify the format at the list level. A legacy column name can
@@ -1781,12 +1784,21 @@ string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns) {
 	return SerializeViewList(columns);
 }
 
-vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const string &column) {
+vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const string &column,
+                                                  bool *requires_result_diff) {
 	auto text = ReadViewString(view_name, column);
+	if (requires_result_diff) {
+		*requires_result_diff = false;
+	}
 	if (StringUtil::StartsWith(text, WINDOW_COLUMN_LIST_PREFIX)) {
 		vector<string> columns;
 		if (!MetadataJson::ExtractJsonStringArray(text, "window_columns", columns)) {
 			throw InvalidInputException("Invalid OpenIVM window column list for view '%s'", view_name);
+		}
+		if (requires_result_diff) {
+			string flag;
+			*requires_result_diff =
+			    MetadataJson::ExtractJsonString(text, "requires_result_diff", flag) && flag == "true";
 		}
 		return columns;
 	}
@@ -1800,8 +1812,8 @@ vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const
 	return columns;
 }
 
-vector<string> RefreshMetadata::GetWindowPartitionColumns(const string &view_name) {
-	return ReadWindowColumns(view_name, "group_columns");
+vector<string> RefreshMetadata::GetWindowPartitionColumns(const string &view_name, bool *requires_result_diff) {
+	return ReadWindowColumns(view_name, "group_columns", requires_result_diff);
 }
 
 vector<string> RefreshMetadata::GetWindowOrderColumns(const string &view_name) {
@@ -2462,6 +2474,7 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, WindowP
 	if (!MetadataJson::ExtractJsonStringArray(json, "coalesce_columns", out.coalesce_columns)) {
 		out.coalesce_columns.clear();
 	}
+	MetadataJson::ExtractJsonString(json, "coalesce_preserved_source", out.coalesce_preserved_source);
 	bool complete;
 	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "ops", complete);
 	if (!complete) {
@@ -2487,6 +2500,7 @@ string RefreshMetadata::WindowPartitionLineageToJson(const WindowPartitionLineag
 	}
 	if (!lineage.coalesce_columns.empty()) {
 		writer.Arr("coalesce_columns", lineage.coalesce_columns);
+		writer.Str("coalesce_preserved_source", lineage.coalesce_preserved_source);
 	}
 	return writer.Finish();
 }

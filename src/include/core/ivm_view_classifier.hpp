@@ -88,6 +88,7 @@ struct DeltaViewModel {
 	vector<string> group_columns;
 	vector<string> window_partition_columns;
 	vector<string> window_order_columns;
+	bool window_requires_result_diff = false;
 	vector<string> aggregate_types;
 	vector<DeltaModelNode> nodes;
 	DeltaModelProfileCounts profile_counts;

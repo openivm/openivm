@@ -2,9 +2,12 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_plan_helpers.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
@@ -59,26 +62,34 @@ static bool AnyDuckLakeSource(RefreshMetadata &metadata, const string &view_name
 	return false;
 }
 
-static bool IsSafeForDuckLakeSnapshotDiff(const vector<string> &partition_cols, const vector<string> &column_names,
-                                          bool any_ducklake) {
-	if (!any_ducklake || partition_cols.empty()) {
-		return false;
+static vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const vector<string> &column_names) {
+	if (partition_cols.empty()) {
+		return {};
 	}
-	// The create-time metadata stores the union of window PARTITION BY columns,
-	// not each distinct partition key set. For DuckLake snapshot-diff refresh a
-	// multi-column tuple filter is only safe when every window uses that same
-	// tuple. Until the metadata can prove that, keep DuckLake partial refresh to
-	// the single-key case and use the existing full-recompute fallback otherwise.
-	if (partition_cols.size() != 1) {
-		return false;
+	if (partition_cols.size() == 1) {
+		auto key = RefreshMetadata::ParseWindowColumn(partition_cols[0]).first;
+		if (std::find(column_names.begin(), column_names.end(), key) != column_names.end()) {
+			return partition_cols;
+		}
+		return {};
 	}
+	// Preserve the existing single-key change-feed path when a quoted
+	// identifier adds a second common key. Filtering by the previously
+	// usable key covers every affected partition without filtering by a tuple.
+	string plain_key;
+	idx_t plain_count = 0;
 	for (auto &pc : partition_cols) {
 		auto parsed = RefreshMetadata::ParseWindowColumn(pc);
-		if (std::find(column_names.begin(), column_names.end(), parsed.first) == column_names.end()) {
-			return false;
+		if (parsed.first.find('=') != string::npos || parsed.second.find('=') != string::npos ||
+		    StringUtil::StartsWith(pc, "json:")) {
+			continue;
+		}
+		if (std::find(column_names.begin(), column_names.end(), parsed.first) != column_names.end()) {
+			plain_key = pc;
+			plain_count++;
 		}
 	}
-	return true;
+	return plain_count == 1 ? vector<string> {std::move(plain_key)} : vector<string>();
 }
 
 static string ResolveStandardTrackedTableSQL(RefreshMetadata &metadata, const string &view_name,
@@ -185,27 +196,21 @@ static bool CanUseCoalesceLineage(RefreshMetadata &metadata, const string &view_
                                   const vector<string> &delta_tables,
                                   const RefreshMetadata::WindowPartitionLineage &lineage, const string &column,
                                   optional_ptr<const DeltaActivityResult> activity) {
-	if (!activity || activity->sources.size() != delta_tables.size() ||
+	if (!activity || activity->sources.size() != delta_tables.size() || lineage.coalesce_preserved_source.empty() ||
 	    std::find(lineage.coalesce_columns.begin(), lineage.coalesce_columns.end(), StringUtil::Lower(column)) ==
 	        lineage.coalesce_columns.end()) {
 		return false;
 	}
-	unordered_set<string> nullable_sources;
-	for (const auto &op : lineage.ops) {
-		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, column)) {
-			nullable_sources.insert(op.source);
-		}
-	}
-	for (const auto &source : nullable_sources) {
-		auto key = ResolveDeltaMetadataKey(metadata, view_name, source, delta_tables);
-		auto entry =
-		    std::find_if(activity->sources.begin(), activity->sources.end(),
-		                 [&](const DeltaActivityResult::Source &item) { return item.delta_table_name == key; });
-		if (entry == activity->sources.end() || !entry->ok || entry->has_changes) {
+	auto preserved = ResolveDeltaMetadataKey(metadata, view_name, lineage.coalesce_preserved_source, delta_tables);
+	bool found_preserved = false;
+	for (const auto &source : activity->sources) {
+		if (source.delta_table_name == preserved) {
+			found_preserved = true;
+		} else if (!source.ok || source.has_changes) {
 			return false;
 		}
 	}
-	return !nullable_sources.empty();
+	return found_preserved;
 }
 
 static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
@@ -493,24 +498,61 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
 	return true;
 }
 
-static bool CanScanDuckLakeWindowPartitionKeys(const RefreshMetadata::WindowPartitionLineage &lineage,
-                                               const string &partition_spec) {
+static bool HasDirectDuckLakeWindowPartitionOps(const RefreshMetadata::WindowPartitionLineage &lineage,
+                                                const string &partition_spec) {
 	auto partition = RefreshMetadata::ParseWindowColumn(partition_spec);
-	if (!lineage.IsProven(partition.first)) {
-		return false;
-	}
 	bool found = false;
 	for (const auto &op : lineage.ops) {
 		if (!StringUtil::CIEquals(op.output_col, partition.first)) {
 			continue;
 		}
-		if (op.kind != WindowLineageKind::DIRECT || !StringUtil::CIEquals(op.source_col, partition.second) ||
-		    !op.source_cast.empty()) {
+		if (!StringUtil::CIEquals(op.source_col, partition.second) || !op.source_cast.empty() ||
+		    (op.kind == WindowLineageKind::LOOKUP && (!StringUtil::CIEquals(op.lookup_col, op.lookup_out) ||
+		                                              !op.lookup_cast.empty() || !op.lookup_out_cast.empty()))) {
 			return false;
 		}
 		found = true;
 	}
 	return found;
+}
+
+static bool CanScanDuckLakeWindowPartitionKeys(Connection &con, const string &view_query_sql,
+                                               const vector<string> &column_names, const string &partition_spec,
+                                               const RefreshMetadata::WindowPartitionLineage &lineage) {
+	if (!HasDirectDuckLakeWindowPartitionOps(lineage, partition_spec)) {
+		return false;
+	}
+	auto output = RefreshMetadata::ParseWindowColumn(partition_spec).first;
+	if (lineage.proven_columns) {
+		return lineage.IsProven(output);
+	}
+
+	// Legacy metadata does not identify occurrences. Rebind the saved query
+	// before using its candidate direct keys for a single physical source.
+	bool proven = false;
+	try {
+		con.context->RunFunctionInTransaction([&] {
+			auto parser = Parser::GetBuiltinParser();
+			parser.ParseQuery(view_query_sql);
+			if (parser.statements.size() != 1) {
+				return;
+			}
+			Planner planner(*con.context);
+			PlanWithSourceColumns(planner, std::move(parser.statements[0]));
+			if (!planner.plan) {
+				return;
+			}
+			auto facts =
+			    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(*con.context).catalog);
+			RefreshMetadata::WindowPartitionLineage rebound;
+			proven = !WindowPlanRequiresResultDiff(facts) &&
+			         BuildWindowPartitionLineageOps(facts, {partition_spec}, column_names, rebound) &&
+			         rebound.IsProven(output) && HasDirectDuckLakeWindowPartitionOps(rebound, partition_spec);
+		});
+	} catch (const std::exception &error) {
+		OPENIVM_DEBUG_PRINT("[UPSERT] Could not prove legacy DuckLake window key: %s\n", error.what());
+	}
+	return proven;
 }
 
 static string BuildSingleSourceDuckLakeWindowRefresh(
@@ -612,18 +654,27 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
-	auto partition_cols = metadata.GetWindowPartitionColumns(view_name);
+	bool requires_result_diff;
+	auto partition_cols = metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
 	bool any_ducklake = AnyDuckLakeSource(metadata, view_name, delta_table_names);
-	bool safe_for_snapdiff = IsSafeForDuckLakeSnapshotDiff(partition_cols, column_names, any_ducklake);
-
-	if (safe_for_snapdiff) {
+	if (any_ducklake && requires_result_diff && !partition_cols.empty()) {
+		auto keys = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols);
+		return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, keys,
+		                                        AffectedPartitionsTempTable(view_name), partition_cols,
+		                                        publication_scope);
+	}
+	if (any_ducklake) {
+		partition_cols = DuckLakeWindowScope(partition_cols, column_names);
+	}
+	if (any_ducklake && !partition_cols.empty()) {
 		RefreshMetadata::WindowPartitionLineage lineage;
 		if (delta_table_names.size() > 1 || has_join) {
 			metadata.GetWindowPartitionLineage(view_name, lineage);
 		}
 		if (delta_table_names.size() == 1 &&
-		    (!has_join || CanScanDuckLakeWindowPartitionKeys(lineage, partition_cols[0]))) {
+		    (!has_join ||
+		     CanScanDuckLakeWindowPartitionKeys(con, view_query_sql, column_names, partition_cols[0], lineage))) {
 			return BuildSingleSourceDuckLakeWindowRefresh(
 			    metadata, con, view_name, view_query_sql, partition_cols, order_cols, column_names, data_table,
 			    view_catalog_name, view_schema_name, attached_db_catalog_name, attached_db_schema_name,
@@ -639,17 +690,20 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
 	string affected_keys_sql;
-	auto lineage_result = BuildLineageStandardAffectedKeysSQL(
-	    metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
-	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, has_join && delta_table_names.size() == 1,
-	    activity, affected_keys_sql);
+	auto lineage_result =
+	    requires_result_diff
+	        ? LineageAffectedKeysResult::UNAVAILABLE
+	        : BuildLineageStandardAffectedKeysSQL(
+	              metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
+	              view_schema_name, attached_db_catalog_name, attached_db_schema_name,
+	              has_join && delta_table_names.size() == 1, activity, affected_keys_sql);
 	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",
 		                    view_name.c_str());
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
-	bool use_result_diff =
-	    has_join && lineage_result != LineageAffectedKeysResult::AVAILABLE && !partition_cols.empty();
+	bool use_result_diff = (has_join || requires_result_diff) &&
+	                       lineage_result != LineageAffectedKeysResult::AVAILABLE && !partition_cols.empty();
 	if (use_result_diff) {
 		// Matching column names in delta tables do not prove a partition relationship.
 		affected_keys_sql = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols);

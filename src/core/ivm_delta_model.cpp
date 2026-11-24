@@ -222,6 +222,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
 		                                                  model.window_lineage, &direct_lineage_ops);
 		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
+		model.window_requires_result_diff = WindowPlanRequiresResultDiff(facts);
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, facts) ||
 		     !WindowLineageCoversAllSources(model.window_lineage.ops, facts))) {
