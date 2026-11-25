@@ -1002,12 +1002,13 @@ void VisitSpineAggregateInputs(const OutputSpine &spine, TableIndex aggregate_in
 	}
 }
 
-OutputSpine ViewOutputSpine(LogicalOperator *root) {
-	return FindOutputSpine(root, [](const LogicalOperator &op) {
+OutputSpine ViewOutputSpine(LogicalOperator *root, bool include_distinct) {
+	return FindOutputSpine(root, [include_distinct](const LogicalOperator &op) {
 		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
 		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
 		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
+		       (include_distinct && op.type == LogicalOperatorType::LOGICAL_DISTINCT);
 	});
 }
 

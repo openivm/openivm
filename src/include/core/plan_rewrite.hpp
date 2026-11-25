@@ -28,7 +28,8 @@ OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(cons
 // Follow ORDER BY/LIMIT/TOP_N and materialized CTE consumers above aggregate state.
 OutputSpine FindAggregateOutputSpine(LogicalOperator *root);
 // Also follow CREATE TABLE and HAVING filters from the stored view output.
-OutputSpine ViewOutputSpine(LogicalOperator *root);
+// Include DISTINCT when locating output expressions through a row-selection boundary.
+OutputSpine ViewOutputSpine(LogicalOperator *root, bool include_distinct = false);
 /// The aggregate at the bottom of the spine, directly or below a HAVING filter.
 LogicalAggregate *SpineAggregate(const OutputSpine &spine);
 /// Visit each aggregate binding reached from the spine's output projection; `computed` is set below any expression

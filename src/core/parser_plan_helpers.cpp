@@ -1391,7 +1391,7 @@ LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root) {
 static string ProjectionOutputName(const LogicalProjection &projection, idx_t expr_index,
                                    const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                    const BoundColumnRefExpression &bcr) {
-	auto spine = ViewOutputSpine(facts.root);
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
 	// Stored names belong to the view's output projection, after sanitization and
 	// deduplication. A CTE body visited first can have a different output order.
 	if (!spine.projections.empty() && spine.projections.front() == &projection && expr_index < output_names.size() &&
@@ -3019,7 +3019,7 @@ static bool DistinctOnPreservesWindowPartitions(const LogicalDistinct &distinct,
                                                 const vector<string> &partition_columns,
                                                 const vector<string> &output_names,
                                                 const RefreshMetadata::WindowPartitionLineage &lineage) {
-	auto spine = ViewOutputSpine(facts.root);
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
 	if (partition_columns.empty() || spine.projections.empty()) {
 		return false;
 	}
@@ -3110,7 +3110,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	const WindowKeyEquality equal_keys {facts, edges, nullable_sources};
 	vector<WindowLineageOp> direct_ops;
 	unordered_map<string, const Expression *> window_keys;
-	auto spine = ViewOutputSpine(facts.root);
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
 	if (!spine.projections.empty()) {
 		const auto &projection = *spine.projections.front();
 		for (idx_t i = 0; i < projection.expressions.size() && i < output_names.size(); i++) {
@@ -3390,7 +3390,7 @@ void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &pa
 	for (auto &partition_column : partition_columns) {
 		if (partition_column.find('=') != string::npos) {
 			string source;
-			auto spine = ViewOutputSpine(facts.root);
+			auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
 			auto output = spine.projections.empty()
 			                  ? string()
 			                  : FindQuotedWindowOutput(facts, *spine.projections.front(), output_names,
