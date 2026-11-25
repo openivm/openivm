@@ -4,6 +4,7 @@
 #include "core/derived_aggregate_output.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/openivm_constants.hpp"
+#include "sql_dialect.hpp"
 #include "duckdb.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -54,6 +55,7 @@ struct AggregateGroupsOptions {
 	bool use_current_diff_affected_keys = false;
 	//! Non-null requests a cascade delta from the group-recompute fallback.
 	const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr;
+	ClientContext *cascade_context = nullptr;
 	//! Replace the compact inline companion with an exact affected-group multiset.
 	bool inline_cascade_delta = false;
 	unordered_map<string, string> derived_output_expressions;
@@ -61,6 +63,7 @@ struct AggregateGroupsOptions {
 	bool derived_output_expressions_complete = false;
 	vector<string> preserved_side_cols;
 	bool force_group_recompute = false;
+	SqlDialect dialect = SqlDialect::DUCKDB;
 };
 
 struct AggregateGroupsOutcome {
@@ -95,7 +98,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 /// Unscopable group/window refreshes must preserve the requested cascade delta for downstream MVs.
 /// Supply the data table's unique keys to avoid deleting and reinserting surviving indexed keys.
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "",
-                            bool emit_cascade_delta = false, const vector<string> &unique_keys = {});
+                            bool emit_cascade_delta = false, const vector<string> &unique_keys = {},
+                            const vector<string> &columns = {}, const vector<LogicalType> &column_types = {});
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE`
 /// (inner-DISTINCT under aggregate). For each base table T_i with a non-empty
@@ -109,11 +113,13 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 /// the source is a standard DuckDB delta table or a DuckLake snapshot-diff
 /// source. `catalog_prefix` is the SQL prefix used for the MV's data table —
 /// empty for the default catalog, "<cat>.<schema>." otherwise.
-string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
+string CompileGroupRecompute(ClientContext &context, const string &view_name, const string &view_query_sql,
+                             const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
                              const string &catalog_prefix = "", bool emit_cascade_delta = false,
                              GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF,
-                             const string &additional_affected_groups = "", const string &affected_query_sql = "");
+                             const string &additional_affected_groups = "", const string &affected_query_sql = "",
+                             bool has_source_deletes = true);
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM
 /// aggregate. Generates a multi-statement SQL batch:

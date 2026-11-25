@@ -57,19 +57,12 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 	vector<string> affected;
 	for (auto &views_table : RefreshMetadata::MetadataTables(con, openivm::VIEWS_TABLE)) {
 		// Publications live in the MV's internal location; report the user-facing name.
-		auto query = [&](const string &internal_expression) {
-			return con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name), " +
-			                 internal_expression + " FROM " + views_table + " WHERE " +
-			                 SqlUtils::IdentifierEqualsSQL("view_catalog", Value(catalog).ToSQLString()));
-		};
-		auto views = query("COALESCE(internal_schema, view_schema)");
-		if (views->HasError()) {
-			views = query("view_schema"); // Metadata written before internal schemas existed.
-		}
-		if (views->HasError()) {
-			throw CatalogException("Could not check snapshot publication before history deletion: %s",
-			                       views->GetError());
-		}
+		auto views = SqlUtils::QueryOrThrow(
+		    con,
+		    "SELECT view_name, view_schema, COALESCE(view_sql_name, view_name), COALESCE(internal_schema, "
+		    "view_schema) FROM " +
+		        views_table + " WHERE " + SqlUtils::IdentifierEqualsSQL("view_catalog", Value(catalog).ToSQLString()),
+		    "Could not check snapshot publication before history deletion: %s");
 		for (idx_t row = 0; row < views->RowCount(); row++) {
 			auto schema = views->Collection().GetValue(1, row).ToString();
 			auto internal_schema = views->Collection().GetValue(3, row).ToString();
@@ -195,8 +188,8 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	string group_list = column_list;
 	idx_t zero_sign_keys = 0;
 	for (idx_t index = 0; index < columns.size(); index++) {
-		if (column_types[index].id() == LogicalTypeId::FLOAT || column_types[index].id() == LogicalTypeId::DOUBLE) {
-			group_list += ", " + SqlUtils::NegativeZeroSQL(quoted_columns[index]);
+		if (column_types[index].IsFloating()) {
+			group_list += ", " + SqlUtils::NegativeZeroSQL(quoted_columns[index], dialect);
 			zero_sign_keys++;
 		}
 	}
