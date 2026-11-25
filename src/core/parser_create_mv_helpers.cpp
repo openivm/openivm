@@ -39,7 +39,7 @@ bool CanCreateGroupIndex(const vector<string> &groups, const vector<string> &nam
 
 string ViewListSqlLiteralOrNull(const vector<string> &values, bool window_columns,
                                 optional<bool> requires_result_diff) {
-	if (values.empty()) {
+	if (values.empty() && !requires_result_diff) {
 		return "null";
 	}
 	return Value(window_columns ? RefreshMetadata::SerializeWindowColumns(values, requires_result_diff)

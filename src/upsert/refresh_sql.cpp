@@ -213,7 +213,25 @@ void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
 	for (auto setting_name : PLANNING_SETTINGS) {
 		SqlUtils::CopySessionSetting(from, to, setting_name);
 	}
-	SqlUtils::CopyDefaultCollation(from, to);
+}
+
+void PropagateRefreshCollation(ClientContext &from, ClientContext &to, RefreshMetadata &metadata,
+                               const string &view_name) {
+	auto collation = Settings::Get<DefaultCollationSetting>(from);
+	if (collation == Settings::Get<DefaultCollationSetting>(to)) {
+		return;
+	}
+	if (metadata.GetViewType(view_name) == RefreshType::WINDOW_PARTITION) {
+		optional<bool> requires_result_diff;
+		metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
+		if (!requires_result_diff) {
+			// Older stored window SQL was replayed with the helper's default.
+			// It may have omitted explicit binary collations during serialization.
+			OPENIVM_DEBUG_PRINT("[REFRESH] Keeping helper collation for legacy window view '%s'\n", view_name.c_str());
+			return;
+		}
+	}
+	Settings::Set<DefaultCollationSetting>(to, SetScope::SESSION, Value(std::move(collation)));
 }
 
 namespace {
@@ -526,6 +544,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		view_record = metadata.LoadView(view_name);
 	}
 	if (owned_connection) {
+		PropagateRefreshCollation(context, planning_context, metadata, view_name);
 		RefreshMetadata::RegisterPlanningView(planning_context, view_record);
 	}
 	auto delta_metadata_tables = active_facts.target_dialect == SqlDialect::DUCKDB

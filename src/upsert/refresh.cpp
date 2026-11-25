@@ -258,7 +258,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
 	Connection exec_con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *exec_con.context, "TimeZone");
-	SqlUtils::CopyDefaultCollation(context, *exec_con.context);
+	PropagateRefreshCollation(context, *exec_con.context, probe_meta, vn);
 	TransactionalMVLockState::ShareMutationOwner(context, *exec_con.context);
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;

@@ -1215,20 +1215,56 @@ CREATE VIEW window_binary_winner_expected AS
     FROM window_binary_winner_rows ORDER BY label COLLATE "binary",score DESC,id;
 CREATE MATERIALIZED VIEW window_binary_winner_mv AS SELECT * FROM window_binary_winner_expected;
 
+# Legacy window metadata and SQL stored before refresh inherited the caller's collation.
+statement ok
+CREATE MATERIALIZED VIEW window_binary_legacy_mv AS SELECT * FROM window_binary_winner_expected;
+UPDATE openivm_views
+SET group_columns = 'id=id',
+    sql_string = 'SELECT id,label,score,total FROM (
+        SELECT id,label,score,sum(score) OVER (PARTITION BY id) AS total,
+               row_number() OVER (PARTITION BY label ORDER BY score DESC,id) AS winner
+        FROM window_binary_winner_rows
+    ) WHERE winner=1'
+WHERE view_sql_name = 'window_binary_legacy_mv';
+
+# With only the label in the output, dropping its DISTINCT ON expression loses COLLATE.
+statement ok
+CREATE VIEW window_binary_label_expected AS
+    SELECT DISTINCT ON (label COLLATE "binary") label
+    FROM window_binary_winner_rows
+    QUALIFY row_number() OVER (PARTITION BY id ORDER BY score DESC)=1;
+CREATE MATERIALIZED VIEW window_binary_label_mv AS SELECT * FROM window_binary_label_expected;
+
 statement ok
 DELETE FROM window_binary_winner_rows WHERE id=1;
 INSERT INTO window_binary_winner_rows VALUES (1,'A',11),(3,'a',12),(4,'b',40),(5,'x',5);
 UPDATE window_binary_winner_rows SET score=13 WHERE id=3;
 DELETE FROM window_binary_winner_rows WHERE id=5;
 
+foreach kind winner legacy
+
 statement ok
-PRAGMA refresh('window_binary_winner_mv');
+PRAGMA refresh('window_binary_${kind}_mv');
 
 query I
 SELECT count(*) FROM (
-    (SELECT *,hex(label) FROM window_binary_winner_mv EXCEPT ALL SELECT *,hex(label) FROM window_binary_winner_expected)
+    (SELECT *,hex(label) FROM window_binary_${kind}_mv EXCEPT ALL SELECT *,hex(label) FROM window_binary_winner_expected)
     UNION ALL
-    (SELECT *,hex(label) FROM window_binary_winner_expected EXCEPT ALL SELECT *,hex(label) FROM window_binary_winner_mv)
+    (SELECT *,hex(label) FROM window_binary_winner_expected EXCEPT ALL SELECT *,hex(label) FROM window_binary_${kind}_mv)
+);
+----
+0
+
+endloop
+
+statement ok
+PRAGMA refresh('window_binary_label_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT hex(label) FROM window_binary_label_mv EXCEPT ALL SELECT hex(label) FROM window_binary_label_expected)
+    UNION ALL
+    (SELECT hex(label) FROM window_binary_label_expected EXCEPT ALL SELECT hex(label) FROM window_binary_label_mv)
 );
 ----
 0

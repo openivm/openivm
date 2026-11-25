@@ -153,6 +153,8 @@ struct ProjectionDeleteRetryPlan {
 
 // Mirrors the caller's session-scoped OpenIVM planning settings onto a fresh connection.
 void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to);
+void PropagateRefreshCollation(ClientContext &from, ClientContext &to, RefreshMetadata &metadata,
+                               const string &view_name);
 // Rewrites DuckDB-only casts, now() and IS NOT DISTINCT FROM into Spark-portable SQL.
 string SparkPortableRefreshSQL(string sql);
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
