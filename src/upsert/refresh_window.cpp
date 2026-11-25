@@ -266,20 +266,6 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
 	return LineageAffectedKeysResult::AVAILABLE;
 }
 
-static bool AllWindowPartitionSourcesCovered(const vector<string> &delta_table_names,
-                                             const vector<WindowPartitionDeltaSpec> &partition_delta_specs) {
-	unordered_set<string> covered_sources;
-	for (auto &spec : partition_delta_specs) {
-		covered_sources.insert(StringUtil::Lower(spec.delta_table));
-	}
-	for (auto &dt : delta_table_names) {
-		if (!covered_sources.count(StringUtil::Lower(dt))) {
-			return false;
-		}
-	}
-	return !delta_table_names.empty();
-}
-
 static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeSourceSpec &source_spec,
                                                 const DuckLakeSourceSpec &lookup_spec,
                                                 const RefreshMetadata::WindowPartitionLineageOp &op) {
@@ -638,6 +624,43 @@ static string BuildChangedWindowPartitionsSQL(const string &data_table, const st
 	       "openivm_changed_rows";
 }
 
+struct WindowResultDiff {
+	string query;
+	string affected_keys;
+	string setup;
+	string cleanup;
+};
+
+static WindowResultDiff BuildWindowResultDiff(const string &view_name, const string &data_table,
+                                              const string &view_query_sql, const vector<string> &partition_cols,
+                                              const WindowOutput &output) {
+	WindowResultDiff diff;
+	if (output.dialect == SqlDialect::DUCKDB) {
+		// Both statements need the same current rows. In particular, a LIMIT can
+		// prevent the affected-partition predicate from being pushed into the query.
+		auto current_table = SqlUtils::QuoteIdentifier("openivm_window_current_" + view_name);
+		diff.setup = "CREATE OR REPLACE TEMP TABLE " + current_table + " AS\n" + view_query_sql + ";\n";
+		diff.query = "SELECT * FROM " + current_table;
+		diff.cleanup = "DROP TABLE IF EXISTS " + current_table + ";\n";
+		OPENIVM_DEBUG_PRINT("[UPSERT] Reusing materialized window results for '%s'\n", view_name.c_str());
+	} else {
+		diff.query = view_query_sql;
+	}
+	diff.affected_keys = BuildChangedWindowPartitionsSQL(data_table, diff.query, partition_cols, output);
+	return diff;
+}
+
+static string BuildResultDiffPartitionRefreshSQL(const string &view_name, const string &data_table,
+                                                 const string &view_query_sql, const vector<string> &partition_cols,
+                                                 const WindowOutput &output,
+                                                 RefreshPublicationScope *publication_scope) {
+	auto diff = BuildWindowResultDiff(view_name, data_table, view_query_sql, partition_cols, output);
+	return diff.setup +
+	       BuildAffectedPartitionRefreshSQL(data_table, diff.query, diff.affected_keys,
+	                                        AffectedPartitionsTempTable(view_name), partition_cols, publication_scope) +
+	       diff.cleanup;
+}
+
 static string BuildDuckLakeWindowRefreshWithLineage(
     RefreshMetadata &metadata, Connection &con, const string &view_name, const string &view_query_sql,
     const vector<string> &delta_table_names, const vector<string> &partition_cols, const string &data_table,
@@ -659,14 +682,11 @@ static string BuildDuckLakeWindowRefreshWithLineage(
 		                                        partition_cols, publication_scope);
 	}
 
-	auto fallback_affected_keys = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols, output);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 	                    "partition cols, %zu sources)\n",
 	                    partition_cols.size(), delta_table_names.size());
-	// Materialize the affected partition keys once; otherwise DuckDB/DuckLake repeats the
-	// full view diff independently for DELETE and INSERT.
-	return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, fallback_affected_keys, qtemp_affected,
-	                                        partition_cols, publication_scope);
+	return BuildResultDiffPartitionRefreshSQL(view_name, data_table, view_query_sql, partition_cols, output,
+	                                          publication_scope);
 }
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
@@ -689,6 +709,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	auto partition_cols = metadata.GetWindowPartitionColumns(view_name, &saved_result_diff);
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
 	bool any_ducklake = AnyDuckLakeSource(metadata, view_name, delta_table_names);
+	bool require_lineage = has_join || delta_table_names.size() > 1;
 	auto ducklake_scope = any_ducklake ? DuckLakeWindowScope(partition_cols, column_names) : vector<string>();
 	optional<ReboundWindowPartition> rebound;
 	auto get_rebound = [&]() -> ReboundWindowPartition & {
@@ -715,16 +736,15 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	}
 	if (any_ducklake && requires_result_diff && !partition_cols.empty()) {
 		auto scope = ResultDiffScope(partition_cols, column_names);
-		auto keys = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, scope, output);
-		return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, keys,
-		                                        AffectedPartitionsTempTable(view_name), scope, publication_scope);
+		return BuildResultDiffPartitionRefreshSQL(view_name, data_table, view_query_sql, scope, output,
+		                                          publication_scope);
 	}
 	if (!ducklake_scope.empty()) {
 		// Narrowing a composite scope needs the same proof as a join:
 		// the selected output must represent the source key at every window.
-		bool require_proof = has_join || partition_cols.size() > 1;
+		bool require_proof = require_lineage || partition_cols.size() > 1;
 		RefreshMetadata::WindowPartitionLineage lineage;
-		if (delta_table_names.size() > 1 || require_proof) {
+		if (require_proof) {
 			lineage = read_lineage(require_proof);
 		}
 		if (delta_table_names.size() == 1 &&
@@ -748,8 +768,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	auto lineage_result = LineageAffectedKeysResult::UNAVAILABLE;
 	string composite_scope;
 	bool composite = partition_cols.size() > 1;
-	if (!requires_result_diff && !partition_cols.empty() && (!composite || has_join)) {
-		auto lineage = read_lineage(has_join);
+	if (!requires_result_diff && !partition_cols.empty() && (!composite || require_lineage)) {
+		auto lineage = read_lineage(require_lineage);
 		for (const auto &partition : partition_cols) {
 			// A proven common key covers every affected partition under that key.
 			if (composite && !lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
@@ -758,7 +778,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 			auto result = BuildLineageStandardAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition,
 			                                                  delta_ts_filter, view_catalog_name, view_schema_name,
 			                                                  attached_db_catalog_name, attached_db_schema_name,
-			                                                  has_join, activity, lineage, affected_keys_sql);
+			                                                  require_lineage, activity, lineage, affected_keys_sql);
 			if (!composite || result == LineageAffectedKeysResult::AVAILABLE) {
 				lineage_result = result;
 				if (composite) {
@@ -773,12 +793,14 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		                    view_name.c_str());
 		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
-	bool use_result_diff = (has_join || requires_result_diff) &&
+	bool use_result_diff = (require_lineage || requires_result_diff) &&
 	                       lineage_result != LineageAffectedKeysResult::AVAILABLE && !partition_cols.empty();
+	WindowResultDiff result_diff;
 	if (use_result_diff) {
 		// Matching column names in delta tables do not prove a partition relationship.
 		partition_cols = ResultDiffScope(partition_cols, column_names);
-		affected_keys_sql = BuildChangedWindowPartitionsSQL(data_table, view_query_sql, partition_cols, output);
+		result_diff = BuildWindowResultDiff(view_name, data_table, view_query_sql, partition_cols, output);
+		affected_keys_sql = std::move(result_diff.affected_keys);
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION uses result-diff keys for '%s'\n", view_name.c_str());
 	}
 	vector<WindowPartitionDeltaSpec> partition_delta_specs;
@@ -787,13 +809,6 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	} else if (!use_result_diff) {
 		partition_delta_specs =
 		    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols);
-	}
-	if (affected_keys_sql.empty() && delta_table_names.size() > 1 &&
-	    !AllWindowPartitionSourcesCovered(delta_table_names, partition_delta_specs)) {
-		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage incomplete for '%s' (%zu sources) — full recompute "
-		                    "fallback\n",
-		                    view_name.c_str(), delta_table_names.size());
-		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix, emit_cascade_delta);
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols, lineage keys: %s)\n",
 	                    partition_cols.size(), lineage_result == LineageAffectedKeysResult::AVAILABLE ? "yes" : "no");
@@ -815,10 +830,14 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 			    Catalog::GetCatalog(*con.context, Identifier(view_catalog_name)).SupportsMultipleDMLCTEs();
 		});
 	}
-	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
-	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql,
-	                              running_window_column_names, running_window_incremental, uses_running_suffix,
-	                              use_data_modifying_ctes);
+	auto refresh_sql = CompileWindowRecompute(
+	    view_name, use_result_diff ? result_diff.query : view_query_sql, delta_ts_filter, internal_catalog_prefix,
+	    partition_cols, partition_delta_specs, emit_cascade_delta, affected_keys_sql, running_window_column_names,
+	    running_window_incremental, uses_running_suffix, use_data_modifying_ctes);
+	if (use_result_diff) {
+		return result_diff.setup + refresh_sql + result_diff.cleanup;
+	}
+	return refresh_sql;
 }
 
 } // namespace duckdb

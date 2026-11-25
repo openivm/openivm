@@ -1044,8 +1044,10 @@ SELECT count(*) FROM (
 0
 
 query I
-SELECT count(*) > 0 FROM openivm_compiled_statements
-WHERE operation = 'refresh' AND sql LIKE '%openivm_window_current%'
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+   AND count(*) FILTER (WHERE contains(sql, 'row_number()')) = 1
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
 AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_limited_mv');
 ----
 true
@@ -1766,3 +1768,56 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_explicit_collation_mv');
 ----
 true
+
+statement ok
+CREATE TABLE window_union_left (k INT, v INT);
+CREATE TABLE window_union_right (k INT, v INT);
+INSERT INTO window_union_left VALUES (1,1),(11,2);
+INSERT INTO window_union_right VALUES (1,4),(2,8);
+CREATE VIEW window_union_direct_expected AS
+    SELECT k,v,sum(v) OVER (PARTITION BY k) AS total
+    FROM (SELECT k,v FROM window_union_left UNION ALL SELECT k,v FROM window_union_right) input;
+CREATE VIEW window_union_computed_expected AS
+    SELECT k,v,sum(v) OVER (PARTITION BY k) AS total
+    FROM (SELECT k,v FROM window_union_left UNION ALL SELECT k+10 AS k,v FROM window_union_right) input;
+CREATE VIEW window_union_self_expected AS
+    SELECT k,v,sum(v) OVER (PARTITION BY k) AS total
+    FROM (SELECT k,v FROM window_union_right UNION ALL SELECT k+10 AS k,v FROM window_union_right) input;
+
+foreach variant direct computed self
+
+statement ok
+CREATE MATERIALIZED VIEW window_union_{variant}_mv AS SELECT * FROM window_union_{variant}_expected;
+
+endloop
+
+statement ok
+UPDATE window_union_right SET v=5 WHERE k=1;
+INSERT INTO window_union_right VALUES (1,9),(2,10);
+DELETE FROM window_union_right WHERE k=2 AND v=10;
+
+foreach variant direct computed self
+
+statement ok
+PRAGMA refresh('window_union_{variant}_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_union_{variant}_mv EXCEPT ALL FROM window_union_{variant}_expected)
+    UNION ALL
+    (FROM window_union_{variant}_expected EXCEPT ALL FROM window_union_{variant}_mv)
+);
+----
+0
+
+query I
+SELECT CASE '{variant}' WHEN 'direct'
+    THEN bool_or(contains(sql, 'openivm_changed_partitions')) AND NOT bool_or(contains(sql, 'openivm_window_current'))
+    ELSE bool_or(contains(sql, 'openivm_window_current')) END
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_union_{variant}_mv');
+----
+true
+
+endloop

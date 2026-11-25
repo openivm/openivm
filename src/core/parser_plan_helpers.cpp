@@ -2517,14 +2517,36 @@ static void AddUniqueOccurrenceRef(vector<OccurrenceColumnRef> &refs, const Occu
 }
 
 static bool ResolveBindingToOccurrenceRefsInternal(ColumnBinding binding, const CreateMVPlanFacts &facts,
-                                                   vector<OccurrenceColumnRef> &out, int depth) {
+                                                   vector<OccurrenceColumnRef> &out, int depth,
+                                                   bool direct_only = false) {
 	if (depth >= 16) {
 		return false;
 	}
 	OccurrenceColumnRef direct_ref;
-	if (ResolveBindingToOccurrenceRef(binding, facts, direct_ref)) {
+	LogicalGet *get = nullptr;
+	string cast_type;
+	if (ResolveBindingToGetColumn(binding, facts, get, direct_ref.column, nullptr,
+	                              direct_only ? &cast_type : nullptr) &&
+	    cast_type.empty() && SetOccurrenceRef(*get, facts, direct_ref)) {
 		AddUniqueOccurrenceRef(out, direct_ref);
 		return true;
+	}
+	auto setop = facts.setops_by_index.find(binding.table_index);
+	if (setop != facts.setops_by_index.end()) {
+		// A set output represents different rows in each arm. Only use source
+		// deltas directly when every arm passes through the partition key.
+		vector<OccurrenceColumnRef> arms;
+		for (auto &child : setop->second->children) {
+			auto bindings = child->GetColumnBindings();
+			if (binding.column_index >= bindings.size() ||
+			    !ResolveBindingToOccurrenceRefsInternal(bindings[binding.column_index], facts, arms, depth + 1, true)) {
+				return false;
+			}
+		}
+		for (auto &arm : arms) {
+			AddUniqueOccurrenceRef(out, arm);
+		}
+		return !arms.empty();
 	}
 	auto proj_it = facts.projections_by_index.find(binding.table_index);
 	if (proj_it == facts.projections_by_index.end()) {
@@ -2534,8 +2556,14 @@ static bool ResolveBindingToOccurrenceRefsInternal(ColumnBinding binding, const 
 	if (binding.column_index >= proj->expressions.size()) {
 		return false;
 	}
+	auto &expression = *proj->expressions[binding.column_index];
+	if (direct_only) {
+		return expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+		       ResolveBindingToOccurrenceRefsInternal(expression.Cast<BoundColumnRefExpression>().Binding(), facts, out,
+		                                              depth + 1, true);
+	}
 	vector<ColumnBinding> child_bindings;
-	CollectLeafColumnBindings(proj->expressions[binding.column_index].get(), child_bindings);
+	CollectLeafColumnBindings(&expression, child_bindings);
 	bool found = false;
 	for (auto &child_binding : child_bindings) {
 		if (child_binding.table_index == binding.table_index && child_binding.column_index == binding.column_index) {
@@ -3021,6 +3049,12 @@ static bool DistinctOnPreservesWindowPartitions(const LogicalDistinct &distinct,
 bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                   const vector<string> &output_names,
                                   const RefreshMetadata::WindowPartitionLineage &lineage) {
+	if (!facts.setops_by_index.empty() &&
+	    std::none_of(partition_columns.begin(), partition_columns.end(), [&](const string &partition) {
+		    return lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first);
+	    })) {
+		return true;
+	}
 	// LIMIT and TOP_N can evict rows across partitions. DISTINCT ON can
 	// displace a winner only within its own key, which must include the
 	// bound window keys for the change feed to cover the evicted row.

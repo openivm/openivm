@@ -1736,6 +1736,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
        AND count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) = 0
+       AND count(*) FILTER (WHERE contains(sql, 'row_number()')) = 1
 FROM openivm_compiled_statements
 WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_scope_namesake_mv');
