@@ -350,6 +350,24 @@ void PreserveBinaryCollationsForSerialization(LogicalOperator &plan) {
 	}
 }
 
+string DuckLakeInitialLoadQuery(string query, const vector<string> &column_names,
+                                const vector<LogicalType> &column_types) {
+	D_ASSERT(column_names.size() == column_types.size());
+	vector<string> replacements;
+	for (idx_t i = 0; i < column_names.size(); i++) {
+		if (IsExplicitBinaryCollation(column_types[i])) {
+			auto column = SqlUtils::QuoteIdentifier(column_names[i]);
+			// DuckLake rejects collated storage types, even for bytewise collations.
+			// The UTF-8 round trip keeps the value and produces plain VARCHAR.
+			replacements.push_back("decode(encode(" + column + ")) AS " + column);
+		}
+	}
+	if (replacements.empty()) {
+		return query;
+	}
+	return "SELECT * REPLACE (" + StringUtil::Join(replacements, ", ") + ") FROM (" + query + ") openivm_initial";
+}
+
 void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
                                string &suffix, string &ordering) {
 	vector<LogicalProjection *> projections;

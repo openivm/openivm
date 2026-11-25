@@ -108,6 +108,8 @@ struct CreateMVPlanFacts {
 };
 
 void PreserveBinaryCollationsForSerialization(LogicalOperator &plan);
+string DuckLakeInitialLoadQuery(string query, const vector<string> &column_names,
+                                const vector<LogicalType> &column_types);
 void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
                                string &suffix, string &ordering);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.

@@ -1561,6 +1561,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			initial_query = SqlUtils::ReplaceTableReferences(meta.selected_view_sql, "openivm_distinct_selected",
 			                                                 get_aux_state_target(meta.SelectionTable()));
 		}
+		if (target_is_ducklake && !lpts_fallback) {
+			initial_query = DuckLakeInitialLoadQuery(std::move(initial_query), output_names, output_types);
+		}
 		ddl.push_back("create table " + initial_load_target + " as " + initial_query);
 	}
 	if (staged_cross_catalog_replace) {

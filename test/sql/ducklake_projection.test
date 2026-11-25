@@ -1288,3 +1288,69 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.retention_warning_mv EXCEPT ALL S
 
 statement ok
 DROP VIEW dl.retention_warning_mv;
+
+# Binary collation affects the logical query, but DuckLake stores plain VARCHAR.
+statement ok
+SET SESSION default_collation = 'nocase';
+
+statement ok
+CREATE TABLE dl.binary_output_source (id INT, k VARCHAR, n INT);
+
+statement ok
+INSERT INTO dl.binary_output_source VALUES (1,'A',1),(2,'a',2),(3,'Ä',3),(4,NULL,4);
+
+statement ok
+CREATE VIEW binary_output_projection AS
+SELECT id,k COLLATE "binary" AS k,n FROM dl.binary_output_source;
+
+statement ok
+CREATE VIEW binary_output_sum AS
+SELECT k COLLATE "binary" AS k,SUM(n) AS total FROM dl.binary_output_source GROUP BY k COLLATE "binary";
+
+statement ok
+CREATE VIEW binary_output_distinct AS
+SELECT DISTINCT k COLLATE "binary" AS k FROM dl.binary_output_source;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.binary_output_projection AS
+SELECT id,k COLLATE "binary" AS k,n FROM dl.binary_output_source;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.binary_output_sum AS
+SELECT k COLLATE "binary" AS k,SUM(n) AS total FROM dl.binary_output_source GROUP BY k COLLATE "binary";
+
+statement ok
+CREATE MATERIALIZED VIEW dl.binary_output_distinct AS
+SELECT DISTINCT k COLLATE "binary" AS k FROM dl.binary_output_source;
+
+statement ok
+DELETE FROM dl.binary_output_source WHERE id=2;
+
+statement ok
+INSERT INTO dl.binary_output_source VALUES (2,'a',20),(5,'A',10),(6,'ä',30),(7,'X',99);
+
+statement ok
+UPDATE dl.binary_output_source SET n=n+1 WHERE id IN (2,3);
+
+statement ok
+DELETE FROM dl.binary_output_source WHERE id=7;
+
+foreach shape projection sum distinct
+
+statement ok
+PRAGMA refresh('dl.binary_output_{shape}');
+
+query II
+SELECT (SELECT count(*) FROM (
+            SELECT *,hex(k) FROM dl.binary_output_{shape}
+            EXCEPT ALL SELECT *,hex(k) FROM binary_output_{shape})),
+       (SELECT count(*) FROM (
+            SELECT *,hex(k) FROM binary_output_{shape}
+            EXCEPT ALL SELECT *,hex(k) FROM dl.binary_output_{shape}));
+----
+0	0
+
+endloop
+
+statement ok
+SET SESSION default_collation = '';
