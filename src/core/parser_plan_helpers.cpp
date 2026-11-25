@@ -355,12 +355,17 @@ string DuckLakeInitialLoadQuery(string query, const vector<string> &column_names
 	D_ASSERT(column_names.size() == column_types.size());
 	vector<string> replacements;
 	for (idx_t i = 0; i < column_names.size(); i++) {
-		if (IsExplicitBinaryCollation(column_types[i])) {
-			auto column = SqlUtils::QuoteIdentifier(column_names[i]);
-			// DuckLake rejects collated storage types, even for bytewise collations.
-			// The UTF-8 round trip keeps the value and produces plain VARCHAR.
-			replacements.push_back("decode(encode(" + column + ")) AS " + column);
+		const auto &type = column_types[i];
+		if (!TypeVisitor::Contains(type, IsExplicitBinaryCollation) ||
+		    TypeVisitor::Contains(type, [](const LogicalType &child) {
+			    return SqlUtils::IsCollatedString(child, "") && !IsExplicitBinaryCollation(child);
+		    })) {
+			continue;
 		}
+		auto column = SqlUtils::QuoteIdentifier(column_names[i]);
+		// The SQL type spelling omits collations, including in nested types.
+		// cast_to_type preserves the requested type even for a no-op cast.
+		replacements.push_back("system.main.cast_to_type(" + column + ", NULL::" + type.ToString() + ") AS " + column);
 	}
 	if (replacements.empty()) {
 		return query;

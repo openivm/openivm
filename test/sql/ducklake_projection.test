@@ -1290,6 +1290,13 @@ statement ok
 DROP VIEW dl.retention_warning_mv;
 
 # Binary collation affects the logical query, but DuckLake stores plain VARCHAR.
+
+statement ok
+CREATE MACRO decode(x) AS 'shadowed';
+
+statement ok
+CREATE MACRO cast_to_type(x, t) AS 'shadowed';
+
 statement ok
 SET SESSION default_collation = 'nocase';
 
@@ -1312,6 +1319,14 @@ CREATE VIEW binary_output_distinct AS
 SELECT DISTINCT k COLLATE "binary" AS k FROM dl.binary_output_source;
 
 statement ok
+CREATE VIEW binary_output_nested AS
+SELECT id,k,
+       struct_pack("quoted key" := k COLLATE "binary", n := n) AS s,
+       [k COLLATE "binary", NULL] AS l,
+       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [n]) END AS m
+FROM dl.binary_output_source;
+
+statement ok
 CREATE MATERIALIZED VIEW dl.binary_output_projection AS
 SELECT id,k COLLATE "binary" AS k,n FROM dl.binary_output_source;
 
@@ -1322,6 +1337,14 @@ SELECT k COLLATE "binary" AS k,SUM(n) AS total FROM dl.binary_output_source GROU
 statement ok
 CREATE MATERIALIZED VIEW dl.binary_output_distinct AS
 SELECT DISTINCT k COLLATE "binary" AS k FROM dl.binary_output_source;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.binary_output_nested AS
+SELECT id,k,
+       struct_pack("quoted key" := k COLLATE "binary", n := n) AS s,
+       [k COLLATE "binary", NULL] AS l,
+       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [n]) END AS m
+FROM dl.binary_output_source;
 
 statement ok
 DELETE FROM dl.binary_output_source WHERE id=2;
@@ -1335,7 +1358,7 @@ UPDATE dl.binary_output_source SET n=n+1 WHERE id IN (2,3);
 statement ok
 DELETE FROM dl.binary_output_source WHERE id=7;
 
-foreach shape projection sum distinct
+foreach shape projection sum distinct nested
 
 statement ok
 PRAGMA refresh('dl.binary_output_{shape}');
@@ -1354,3 +1377,9 @@ endloop
 
 statement ok
 SET SESSION default_collation = '';
+
+statement ok
+DROP MACRO decode;
+
+statement ok
+DROP MACRO cast_to_type;
