@@ -580,8 +580,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// Delta DDL round-trips types through DESCRIBE, which omits explicit collations.
 		// Window diffs and projection deletes compare the stored data columns.
 		if (target_is_native && active_facts.target_dialect == SqlDialect::DUCKDB &&
-		    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::SIMPLE_PROJECTION) &&
-		    Settings::Get<DefaultCollationSetting>(context).empty()) {
+		    (view_query_type == RefreshType::WINDOW_PARTITION ||
+		     (view_query_type == RefreshType::SIMPLE_PROJECTION &&
+		      Settings::Get<DefaultCollationSetting>(context).empty()))) {
 			const auto &entry = Catalog::GetEntry<TableCatalogEntry>(
 			    planning_context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
 			                                    Identifier(data_table_bare)));

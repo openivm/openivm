@@ -1061,8 +1061,25 @@ INSERT INTO window_limited_scores VALUES (6,6,140),(7,7,1);
 UPDATE window_limited_scores SET score=150 WHERE id=6;
 DELETE FROM window_limited_scores WHERE id=7;
 
+# An explicit transaction runs the refresh in the caller's connection.
+# Keep a caller table with the old deterministic scratch name.
+statement ok
+CREATE TEMP TABLE openivm_window_current___openivm_mv_6d656d6f7279_6d61696e_77696e646f775f6c696d697465645f6d76_ (sentinel INT);
+INSERT INTO openivm_window_current___openivm_mv_6d656d6f7279_6d61696e_77696e646f775f6c696d697465645f6d76_ VALUES (42);
+
+statement ok
+BEGIN;
+
 statement ok
 PRAGMA refresh('window_limited_mv');
+
+statement ok
+COMMIT;
+
+query I
+SELECT sentinel FROM openivm_window_current___openivm_mv_6d656d6f7279_6d61696e_77696e646f775f6c696d697465645f6d76_;
+----
+42
 
 query I
 SELECT count(*) FROM (
@@ -1821,3 +1838,44 @@ WHERE operation = 'refresh'
 true
 
 endloop
+
+# The binary UNION key separates A from a even when a source arm uses session nocase.
+statement ok
+SET SESSION default_collation = 'nocase';
+CREATE TABLE window_union_binary (k VARCHAR COLLATE "binary", v INT);
+CREATE TABLE window_union_nocase (k VARCHAR, v INT);
+INSERT INTO window_union_binary VALUES ('A',1),('a',2);
+INSERT INTO window_union_nocase VALUES ('A',3),('a',4);
+CREATE VIEW window_union_collation_expected AS
+    SELECT k,v,sum(v) OVER (PARTITION BY k) AS total
+    FROM (SELECT k,v FROM window_union_binary UNION ALL SELECT k,v FROM window_union_nocase) input;
+CREATE MATERIALIZED VIEW window_union_collation_mv AS SELECT * FROM window_union_collation_expected;
+
+statement ok
+DELETE FROM window_union_nocase WHERE v=3;
+INSERT INTO window_union_nocase VALUES ('A',30),('a',40),('a',50);
+UPDATE window_union_nocase SET v=41 WHERE v=40;
+DELETE FROM window_union_nocase WHERE v=50;
+
+statement ok
+PRAGMA refresh('window_union_collation_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(k) FROM window_union_collation_mv EXCEPT ALL SELECT *,hex(k) FROM window_union_collation_expected)
+    UNION ALL
+    (SELECT *,hex(k) FROM window_union_collation_expected EXCEPT ALL SELECT *,hex(k) FROM window_union_collation_mv)
+);
+----
+0
+
+query I
+SELECT bool_or(contains(sql, 'openivm_changed_partitions')) AND NOT bool_or(contains(sql, 'openivm_window_current'))
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_union_collation_mv');
+----
+true
+
+statement ok
+SET SESSION default_collation = '';

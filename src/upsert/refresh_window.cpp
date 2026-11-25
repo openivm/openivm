@@ -1,5 +1,6 @@
 #include "upsert/refresh_internal.hpp"
 
+#include "core/compiled_sql_archive.hpp"
 #include "core/vector_utils.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -91,6 +92,11 @@ static string BuildLineageColumnExpr(const string &column_name, const string &ca
 	return SqlUtils::ApplyCastSpec(column, cast_type);
 }
 
+static string ProjectWindowKey(const string &expression, const string &output_col, const string &collation) {
+	return expression + (collation.empty() ? "" : " COLLATE " + SqlUtils::QuoteIdentifier(collation)) + " AS " +
+	       SqlUtils::QuoteIdentifier(output_col);
+}
+
 static string DescribeColumnType(Connection &con, const string &table_sql, const string &column_name) {
 	auto result = con.Query("DESCRIBE SELECT " + SqlUtils::QuoteIdentifier(column_name) + " FROM " + table_sql);
 	if (result->HasError() || result->RowCount() == 0) {
@@ -113,9 +119,9 @@ static bool LookupCastMetadataIsSafe(Connection &con, const string &delta_table,
 static string BuildStandardChangedValuesSQL(RefreshMetadata &metadata, const string &view_name,
                                             const vector<string> &delta_table_names, const string &table_name,
                                             const string &source_col, const string &source_cast,
-                                            const string &output_col, const string &delta_ts_filter,
-                                            const string &view_catalog_name, const string &view_schema_name,
-                                            const string &attached_db_catalog_name,
+                                            const string &output_col, const string &key_collation,
+                                            const string &delta_ts_filter, const string &view_catalog_name,
+                                            const string &view_schema_name, const string &attached_db_catalog_name,
                                             const string &attached_db_schema_name) {
 	string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, table_name,
 	                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
@@ -124,15 +130,17 @@ static string BuildStandardChangedValuesSQL(RefreshMetadata &metadata, const str
 		return "";
 	}
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	return "SELECT DISTINCT " + BuildLineageColumnExpr(source_col, source_cast) + " AS " +
-	       SqlUtils::QuoteIdentifier(output_col) + " FROM " + delta_table + filter;
+	return "SELECT DISTINCT " +
+	       ProjectWindowKey(BuildLineageColumnExpr(source_col, source_cast), output_col, key_collation) + " FROM " +
+	       delta_table + filter;
 }
 
 static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const string &view_name, Connection &con,
                                                 const vector<string> &delta_table_names,
                                                 const RefreshMetadata::WindowPartitionLineageOp &op,
-                                                const string &delta_ts_filter, const string &view_catalog_name,
-                                                const string &view_schema_name, const string &attached_db_catalog_name,
+                                                const string &key_collation, const string &delta_ts_filter,
+                                                const string &view_catalog_name, const string &view_schema_name,
+                                                const string &attached_db_catalog_name,
                                                 const string &attached_db_schema_name) {
 	string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, op.source,
 	                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
@@ -153,10 +161,9 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 	string source_expr = BuildLineageColumnExpr(op.source_col, op.source_cast);
 	string lookup_expr = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast);
 	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast);
-	string qoutput_col = SqlUtils::QuoteIdentifier(op.output_col);
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	return "SELECT DISTINCT " + lookup_out + " AS " + qoutput_col + " FROM " + lookup_table + " WHERE " + lookup_expr +
-	       " IN (SELECT DISTINCT " + source_expr + " FROM " + delta_table + filter + ")";
+	return "SELECT DISTINCT " + ProjectWindowKey(lookup_out, op.output_col, key_collation) + " FROM " + lookup_table +
+	       " WHERE " + lookup_expr + " IN (SELECT DISTINCT " + source_expr + " FROM " + delta_table + filter + ")";
 }
 
 enum class LineageAffectedKeysResult : uint8_t { UNAVAILABLE, AVAILABLE, UNSAFE };
@@ -218,12 +225,10 @@ static LineageAffectedKeysResult BuildLineageAffectedKeyArms(
 
 static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
     RefreshMetadata &metadata, Connection &con, const string &view_name, const vector<string> &delta_table_names,
-    const string &partition_spec, const string &delta_ts_filter, const string &view_catalog_name,
-    const string &view_schema_name, const string &attached_db_catalog_name, const string &attached_db_schema_name,
-    bool require_proof, optional_ptr<const DeltaActivityResult> activity,
+    const string &output_col, const string &key_collation, const string &delta_ts_filter,
+    const string &view_catalog_name, const string &view_schema_name, const string &attached_db_catalog_name,
+    const string &attached_db_schema_name, bool require_proof, optional_ptr<const DeltaActivityResult> activity,
     const RefreshMetadata::WindowPartitionLineage &lineage, string &affected_keys_sql) {
-	auto output_col = RefreshMetadata::ParseWindowColumn(partition_spec).first;
-
 	if (lineage.ops.empty()) {
 		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
@@ -236,12 +241,13 @@ static LineageAffectedKeysResult BuildLineageStandardAffectedKeysSQL(
 	auto build_arm = [&](const RefreshMetadata::WindowPartitionLineageOp &op, string &arm, string &source) {
 		if (op.kind == WindowLineageKind::DIRECT) {
 			arm = BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
-			                                    op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
-			                                    view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			                                    op.source_cast, op.output_col, key_collation, delta_ts_filter,
+			                                    view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                    attached_db_schema_name);
 		} else if (op.kind == WindowLineageKind::LOOKUP) {
-			arm = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op, delta_ts_filter,
-			                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
-			                                        attached_db_schema_name);
+			arm = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op, key_collation,
+			                                        delta_ts_filter, view_catalog_name, view_schema_name,
+			                                        attached_db_catalog_name, attached_db_schema_name);
 		}
 		if (arm.empty()) {
 			return LineageAffectedKeysResult::UNSAFE;
@@ -318,6 +324,21 @@ struct WindowOutput {
 	const vector<LogicalType> &column_types;
 	SqlDialect dialect;
 	string default_collation;
+
+	string KeyCollation(const string &column) const {
+		D_ASSERT(column_names.size() == column_types.size());
+		if (dialect != SqlDialect::DUCKDB) {
+			return "";
+		}
+		for (idx_t i = 0; i < column_names.size(); i++) {
+			if (column_types[i].id() == LogicalTypeId::VARCHAR && StringUtil::CIEquals(column, column_names[i])) {
+				// Deduplication in every source arm must use the destination key's collation.
+				const auto &collation = StringType::GetCollation(column_types[i]);
+				return collation.empty() ? (default_collation.empty() ? "binary" : default_collation) : collation;
+			}
+		}
+		return "";
+	}
 
 	vector<string> Identities(const string &prefix = "") const {
 		D_ASSERT(column_names.size() == column_types.size());
@@ -638,8 +659,9 @@ static WindowResultDiff BuildWindowResultDiff(const string &view_name, const str
 	if (output.dialect == SqlDialect::DUCKDB) {
 		// Both statements need the same current rows. In particular, a LIMIT can
 		// prevent the affected-partition predicate from being pushed into the query.
-		auto current_table = SqlUtils::QuoteIdentifier("openivm_window_current_" + view_name);
-		diff.setup = "CREATE OR REPLACE TEMP TABLE " + current_table + " AS\n" + view_query_sql + ";\n";
+		auto current_table =
+		    SqlUtils::FullName(TEMP_CATALOG, DEFAULT_SCHEMA, "openivm_window_current_" + NewCompilationId(view_name));
+		diff.setup = "CREATE TEMP TABLE " + current_table + " AS\n" + view_query_sql + ";\n";
 		diff.query = "SELECT * FROM " + current_table;
 		diff.cleanup = "DROP TABLE IF EXISTS " + current_table + ";\n";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Reusing materialized window results for '%s'\n", view_name.c_str());
@@ -771,14 +793,15 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	if (!requires_result_diff && !partition_cols.empty() && (!composite || require_lineage)) {
 		auto lineage = read_lineage(require_lineage);
 		for (const auto &partition : partition_cols) {
+			auto output_col = RefreshMetadata::ParseWindowColumn(partition).first;
 			// A proven common key covers every affected partition under that key.
-			if (composite && !lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first)) {
+			if (composite && !lineage.IsProven(output_col)) {
 				continue;
 			}
-			auto result = BuildLineageStandardAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition,
-			                                                  delta_ts_filter, view_catalog_name, view_schema_name,
-			                                                  attached_db_catalog_name, attached_db_schema_name,
-			                                                  require_lineage, activity, lineage, affected_keys_sql);
+			auto result = BuildLineageStandardAffectedKeysSQL(
+			    metadata, con, view_name, delta_table_names, output_col, output.KeyCollation(output_col),
+			    delta_ts_filter, view_catalog_name, view_schema_name, attached_db_catalog_name, attached_db_schema_name,
+			    require_lineage, activity, lineage, affected_keys_sql);
 			if (!composite || result == LineageAffectedKeysResult::AVAILABLE) {
 				lineage_result = result;
 				if (composite) {
