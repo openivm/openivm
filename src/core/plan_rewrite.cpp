@@ -1278,6 +1278,15 @@ static bool IsPreservedKeyBinding(LogicalOperator &plan, const ColumnBinding &bi
 		auto &projection = plan.Cast<LogicalProjection>();
 		preserved =
 		    IsPreservedKeyExpression(*projection.children[0], *projection.expressions[binding.column_index], cache);
+	} else if (plan.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+	           binding.table_index == plan.Cast<LogicalAggregate>().group_index) {
+		auto &aggregate = plan.Cast<LogicalAggregate>();
+		// The counting rewrite for DISTINCT passes its keys through unchanged.
+		if (binding.column_index < aggregate.groups.size() && !aggregate.expressions.empty() &&
+		    aggregate.expressions[0]->GetAlias().GetIdentifierName() == openivm::DISTINCT_COUNT_COL) {
+			preserved =
+			    IsPreservedKeyExpression(*aggregate.children[0], *aggregate.groups[binding.column_index], cache);
+		}
 	} else if (plan.type == LogicalOperatorType::LOGICAL_GET) {
 		auto columns = plan.GetColumnBindings();
 		preserved = std::find(columns.begin(), columns.end(), binding) != columns.end();
