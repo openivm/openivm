@@ -1321,9 +1321,10 @@ SELECT DISTINCT k COLLATE "binary" AS k FROM dl.binary_output_source;
 statement ok
 CREATE VIEW binary_output_nested AS
 SELECT id,k,
-       struct_pack("quoted key" := k COLLATE "binary", n := n) AS s,
+       struct_pack("quoted key" := k COLLATE "binary", folded := k COLLATE nocase, n := n) AS s,
        [k COLLATE "binary", NULL] AS l,
-       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [n]) END AS m
+       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [n]) END AS m,
+       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [k COLLATE nocase]) END AS mixed_m
 FROM dl.binary_output_source;
 
 statement ok
@@ -1341,9 +1342,10 @@ SELECT DISTINCT k COLLATE "binary" AS k FROM dl.binary_output_source;
 statement ok
 CREATE MATERIALIZED VIEW dl.binary_output_nested AS
 SELECT id,k,
-       struct_pack("quoted key" := k COLLATE "binary", n := n) AS s,
+       struct_pack("quoted key" := k COLLATE "binary", folded := k COLLATE nocase, n := n) AS s,
        [k COLLATE "binary", NULL] AS l,
-       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [n]) END AS m
+       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [n]) END AS m,
+       CASE WHEN k IS NOT NULL THEN MAP([k COLLATE "binary"], [k COLLATE nocase]) END AS mixed_m
 FROM dl.binary_output_source;
 
 statement ok

@@ -356,10 +356,7 @@ string DuckLakeInitialLoadQuery(string query, const vector<string> &column_names
 	vector<string> replacements;
 	for (idx_t i = 0; i < column_names.size(); i++) {
 		const auto &type = column_types[i];
-		if (!TypeVisitor::Contains(type, IsExplicitBinaryCollation) ||
-		    TypeVisitor::Contains(type, [](const LogicalType &child) {
-			    return SqlUtils::IsCollatedString(child, "") && !IsExplicitBinaryCollation(child);
-		    })) {
+		if (!TypeVisitor::Contains(type, IsExplicitBinaryCollation)) {
 			continue;
 		}
 		auto column = SqlUtils::QuoteIdentifier(column_names[i]);
