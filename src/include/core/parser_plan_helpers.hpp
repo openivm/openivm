@@ -107,6 +107,7 @@ struct CreateMVPlanFacts {
 	bool has_descendant_distinct = false;
 };
 
+void PreserveBinaryCollationsForSerialization(LogicalOperator &plan);
 void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
                                string &suffix, string &ordering);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
@@ -153,7 +154,8 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
                                     const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
 vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const vector<string> &column_names);
-bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+// Retain only keys common to all DISTINCT ON operators when a changed-key scope is proven.
+bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
                                   const vector<string> &output_names,
                                   const RefreshMetadata::WindowPartitionLineage &lineage);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,

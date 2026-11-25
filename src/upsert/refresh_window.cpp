@@ -535,7 +535,7 @@ struct ReboundWindowPartition {
 
 static ReboundWindowPartition RebindWindowPartitionLineage(Connection &con, const string &view_query_sql,
                                                            const vector<string> &column_names,
-                                                           const vector<string> &partitions) {
+                                                           vector<string> &partitions) {
 	ReboundWindowPartition rebound;
 	try {
 		con.context->RunFunctionInTransaction([&] {
@@ -742,6 +742,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		if (!rebound) {
 			auto &scope = ducklake_scope.empty() ? partition_cols : ducklake_scope;
 			rebound = RebindWindowPartitionLineage(con, view_query_sql, column_names, scope);
+			if (any_ducklake && ducklake_scope.empty()) {
+				ducklake_scope = DuckLakeWindowScope(partition_cols, column_names);
+			}
 		}
 		return *rebound;
 	};

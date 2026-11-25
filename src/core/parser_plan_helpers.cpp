@@ -317,6 +317,39 @@ void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement)
 	planner.CreatePlan(std::move(statement));
 }
 
+static bool IsExplicitBinaryCollation(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	const auto &collation = StringType::GetCollation(type);
+	return StringUtil::CIEquals(collation, "binary") || StringUtil::CIEquals(collation, "c") ||
+	       StringUtil::CIEquals(collation, "posix");
+}
+
+void PreserveBinaryCollationsForSerialization(LogicalOperator &plan) {
+	LogicalOperatorVisitor::EnumerateExpressions(plan, [](unique_ptr<Expression> *root) {
+		if (!root || !*root) {
+			return;
+		}
+		ExpressionIterator::VisitExpressionClassMutable(
+		    *root, ExpressionClass::BOUND_COLUMN_REF, [](unique_ptr<Expression> &expr) {
+			    if (!IsExplicitBinaryCollation(expr->GetReturnType())) {
+				    return;
+			    }
+			    // Binary collation binds without a comparison function. A
+			    // no-op VARCHAR cast gives LPTS an expression on which to emit
+			    // COLLATE, so rebinding cannot substitute the session default.
+			    auto type = expr->GetReturnType();
+			    auto alias = expr->GetAlias();
+			    expr = BoundCastExpression::CreateDefault(std::move(expr), type, DefaultCasts::NopCast);
+			    expr->SetAlias(std::move(alias));
+		    });
+	});
+	for (auto &child : plan.children) {
+		PreserveBinaryCollationsForSerialization(*child);
+	}
+}
+
 void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
                                string &suffix, string &ordering) {
 	vector<LogicalProjection *> projections;
@@ -397,6 +430,10 @@ void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperato
 				PropagateHiddenBindingThroughProjectionPath(ancestors, binding, type, alias);
 				output_names.push_back(alias);
 				expression = SqlUtils::QuoteIdentifier(alias);
+			}
+			if (IsExplicitBinaryCollation(order.expression->GetReturnType())) {
+				expression = "(" + expression + ") COLLATE " +
+				             SqlUtils::QuoteIdentifier(StringType::GetCollation(order.expression->GetReturnType()));
 			}
 			order_sql.push_back(expression + " " + order.GetOrderModifier());
 		}
@@ -3015,38 +3052,7 @@ vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const v
 	return plain_count == 1 ? vector<string> {std::move(plain_key)} : vector<string>();
 }
 
-static bool DistinctOnPreservesWindowPartitions(const LogicalDistinct &distinct, const CreateMVPlanFacts &facts,
-                                                const vector<string> &partition_columns,
-                                                const vector<string> &output_names,
-                                                const RefreshMetadata::WindowPartitionLineage &lineage) {
-	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
-	if (partition_columns.empty() || spine.projections.empty()) {
-		return false;
-	}
-	auto &projection = *spine.projections.front();
-	for (const auto &partition : partition_columns) {
-		auto output = RefreshMetadata::ParseWindowColumn(partition).first;
-		if (!lineage.IsProven(output)) {
-			return false;
-		}
-		auto position = std::find_if(output_names.begin(), output_names.end(),
-		                             [&](const string &name) { return StringUtil::CIEquals(output, name); });
-		auto index = static_cast<idx_t>(position - output_names.begin());
-		if (position == output_names.end() || index >= projection.expressions.size()) {
-			return false;
-		}
-		const auto &key = WindowKeyExpression(*projection.expressions[index], facts);
-		if (std::none_of(distinct.distinct_targets.begin(), distinct.distinct_targets.end(),
-		                 [&](const unique_ptr<Expression> &target) {
-			                 return Expression::Equals(WindowKeyExpression(*target, facts), key);
-		                 })) {
-			return false;
-		}
-	}
-	return true;
-}
-
-bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
                                   const vector<string> &output_names,
                                   const RefreshMetadata::WindowPartitionLineage &lineage) {
 	if (!facts.setops_by_index.empty() &&
@@ -3055,22 +3061,60 @@ bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, const vector<s
 	    })) {
 		return true;
 	}
-	// LIMIT and TOP_N can evict rows across partitions. DISTINCT ON can
-	// displace a winner only within its own key, which must include the
-	// bound window keys for the change feed to cover the evicted row.
-	return std::any_of(
-	    facts.plan_nodes_post_order.begin(), facts.plan_nodes_post_order.end(), [&](const CreateMVPlanNodeFacts &node) {
-		    auto type = node.plan_node->type;
-		    if (type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N) {
-			    return true;
-		    }
-		    if (type != LogicalOperatorType::LOGICAL_DISTINCT) {
-			    return false;
-		    }
-		    auto &distinct = node.plan_node->Cast<LogicalDistinct>();
-		    return distinct.distinct_type == DistinctType::DISTINCT_ON &&
-		           !DistinctOnPreservesWindowPartitions(distinct, facts, partition_columns, output_names, lineage);
-	    });
+	vector<const LogicalDistinct *> distinct_ops;
+	for (const auto &node : facts.plan_nodes_post_order) {
+		auto type = node.plan_node->type;
+		if (type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N) {
+			return true;
+		}
+		if (type == LogicalOperatorType::LOGICAL_DISTINCT) {
+			auto &distinct = node.plan_node->Cast<LogicalDistinct>();
+			if (distinct.distinct_type == DistinctType::DISTINCT_ON) {
+				distinct_ops.push_back(&distinct);
+			}
+		}
+	}
+	if (distinct_ops.empty()) {
+		return false;
+	}
+
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
+	if (spine.projections.empty()) {
+		return true;
+	}
+	const auto &projection = *spine.projections.front();
+	vector<string> scoped_columns;
+	for (const auto &partition : partition_columns) {
+		auto output = RefreshMetadata::ParseWindowColumn(partition).first;
+		if (!lineage.IsProven(output)) {
+			continue;
+		}
+		auto position = std::find_if(output_names.begin(), output_names.end(),
+		                             [&](const string &name) { return StringUtil::CIEquals(output, name); });
+		auto index = static_cast<idx_t>(position - output_names.begin());
+		if (position == output_names.end() || index >= projection.expressions.size()) {
+			continue;
+		}
+		const auto &key = WindowKeyExpression(*projection.expressions[index], facts);
+		// A key common to every window and DISTINCT ON keeps both row
+		// contributions and winner replacements within the refresh scope.
+		if (std::all_of(distinct_ops.begin(), distinct_ops.end(), [&](const LogicalDistinct *distinct) {
+			    return std::any_of(distinct->distinct_targets.begin(), distinct->distinct_targets.end(),
+			                       [&](const unique_ptr<Expression> &target) {
+				                       return Expression::Equals(WindowKeyExpression(*target, facts), key);
+			                       });
+		    })) {
+			scoped_columns.push_back(partition);
+		}
+	}
+	if (scoped_columns.empty()) {
+		return true;
+	}
+	if (scoped_columns.size() != partition_columns.size()) {
+		OPENIVM_DEBUG_PRINT("[WINDOW] Narrowing DISTINCT ON refresh to %zu shared keys\n", scoped_columns.size());
+		partition_columns = std::move(scoped_columns);
+	}
+	return false;
 }
 
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,

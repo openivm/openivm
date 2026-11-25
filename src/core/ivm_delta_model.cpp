@@ -204,7 +204,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		auto ducklake_scope = has_ducklake_source && model.window_partition_columns.size() > 1
 		                          ? DuckLakeWindowScope(model.window_partition_columns, output_names)
 		                          : vector<string>();
-		const auto &refresh_scope = ducklake_scope.empty() ? model.window_partition_columns : ducklake_scope;
+		auto &refresh_scope = ducklake_scope.empty() ? model.window_partition_columns : ducklake_scope;
 		model.window_requires_result_diff =
 		    WindowPlanRequiresResultDiff(facts, refresh_scope, output_names, model.window_lineage);
 		if (analysis.found_asof_join &&
