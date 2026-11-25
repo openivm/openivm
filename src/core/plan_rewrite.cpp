@@ -52,13 +52,13 @@ namespace duckdb {
 
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
 /// Returns whether a DISTINCT state aggregate replaced `node` itself.
-static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node) {
+static bool RewriteDistinct(Binder &binder, unique_ptr<LogicalOperator> &node, unique_ptr<LogicalOperator> &root) {
 	// A projection can drop DISTINCT keys or map them to duplicate output rows, so a child's count is
 	// internal state. DISTINCT ON picks winners by ORDER BY, not by full-row multiplicity.
 	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT ||
 	    node->Cast<LogicalDistinct>().distinct_type == DistinctType::DISTINCT_ON) {
 		for (auto &child : node->children) {
-			RewriteDistinct(context, binder, child);
+			RewriteDistinct(binder, child, root);
 		}
 		return false;
 	}
@@ -69,7 +69,7 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	if (ProducesAtMostOneRow(*node->children[0]) || IsRedundantDistinctOverGroupKeys(*node)) {
 		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over a single row or group keys\n");
 		node = std::move(node->children[0]);
-		RewriteDistinct(context, binder, node);
+		RewriteDistinct(binder, node, root);
 		return false;
 	}
 	auto &child = node->children[0];
@@ -92,8 +92,17 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	}
 	auto agg_node = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(child));
 
+	// DISTINCT passed through its child's bindings. The aggregate exposes
+	// fresh group bindings, so rebind consumers without rewriting its inputs.
+	ColumnBindingReplacer replacer;
+	for (idx_t i = 0; i < child_bindings.size(); i++) {
+		replacer.replacement_bindings.emplace_back(child_bindings[i],
+		                                           ColumnBinding(agg_node->group_index, ProjectionIndex(i)));
+	}
+	replacer.stop_operator = agg_node.get();
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
+	replacer.VisitOperator(*root);
 	return true;
 }
 
@@ -1870,7 +1879,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	     &PlanRewriteNeeds::aggregate_filters},
 	    {"distinct",
 	     [](PlanRewriteContext &c) {
-		     if (RewriteDistinct(c.context, c.binder, c.plan)) {
+		     if (RewriteDistinct(c.binder, c.plan, c.plan)) {
 			     c.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 		     }
 		     InjectHiddenGroupKeys(c.plan);

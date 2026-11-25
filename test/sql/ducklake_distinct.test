@@ -166,3 +166,59 @@ query I
 SELECT count(*) FROM (SELECT tag FROM dl.mv_tags EXCEPT ALL SELECT DISTINCT tag FROM dl.tags);
 ----
 0
+
+# Consumers of inner DISTINCT must use the new aggregate's group bindings.
+statement ok
+SET SESSION default_collation = 'nocase';
+
+foreach db memory dl
+
+foreach aux false true
+
+statement ok
+SET openivm_distinct_aux_state = {aux};
+
+statement ok
+CREATE TABLE {db}.binary_distinct_input_{aux} (k VARCHAR, n INT);
+INSERT INTO {db}.binary_distinct_input_{aux} VALUES ('A',1),('A',1),('a',2),('Ä',3),(NULL,4);
+
+statement ok
+CREATE VIEW binary_distinct_expected_{db}_{aux} AS
+SELECT k COLLATE "binary" AS k, SUM(n) AS total
+FROM (SELECT DISTINCT k COLLATE "binary" AS k,n FROM {db}.binary_distinct_input_{aux}) AS input
+GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW {db}.binary_distinct_agg_{aux} AS
+SELECT k COLLATE "binary" AS k, SUM(n) AS total
+FROM (SELECT DISTINCT k COLLATE "binary" AS k,n FROM {db}.binary_distinct_input_{aux}) AS input
+GROUP BY k;
+
+statement ok
+DELETE FROM {db}.binary_distinct_input_{aux} WHERE n=2;
+INSERT INTO {db}.binary_distinct_input_{aux} VALUES ('a',20),('A',10),('b',30),('X',99);
+UPDATE {db}.binary_distinct_input_{aux} SET n=n+1 WHERE n IN (20,3);
+DELETE FROM {db}.binary_distinct_input_{aux} WHERE n=99;
+
+statement ok
+PRAGMA refresh('{db}.binary_distinct_agg_{aux}');
+
+query II
+SELECT (SELECT count(*) FROM (
+            SELECT hex(k),total FROM {db}.binary_distinct_agg_{aux}
+            EXCEPT ALL SELECT hex(k),total FROM binary_distinct_expected_{db}_{aux})),
+       (SELECT count(*) FROM (
+            SELECT hex(k),total FROM binary_distinct_expected_{db}_{aux}
+            EXCEPT ALL SELECT hex(k),total FROM {db}.binary_distinct_agg_{aux}));
+----
+0	0
+
+endloop
+
+endloop
+
+statement ok
+SET SESSION default_collation = '';
+
+statement ok
+SET openivm_distinct_aux_state = false;
