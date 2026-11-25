@@ -174,7 +174,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
                                   const string &recompute_temp_table = "",
                                   RefreshPublicationScope *publication_scope = nullptr,
-                                  const vector<string> &upsert_columns = {}, SqlDialect dialect = SqlDialect::DUCKDB);
+                                  const vector<string> &upsert_columns = {}, SqlDialect dialect = SqlDialect::DUCKDB,
+                                  bool replace_affected_table = true);
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
 // Insert column list plus the select lists that project a row as a retraction (-1) or an insertion (+1).
@@ -299,8 +300,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &internal_catalog_prefix, const string &view_catalog_name,
                                    const string &view_schema_name, const string &attached_db_catalog_name,
                                    const string &attached_db_schema_name, bool cross_system, bool has_join,
-                                   optional_ptr<const DeltaActivityResult> activity, bool emit_cascade_delta = false,
-                                   bool running_window_incremental = false, bool *uses_running_suffix = nullptr,
+                                   optional_ptr<const DeltaActivityResult> activity, bool caller_transaction,
+                                   bool emit_cascade_delta = false, bool running_window_incremental = false,
+                                   bool *uses_running_suffix = nullptr,
                                    RefreshPublicationScope *publication_scope = nullptr);
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,

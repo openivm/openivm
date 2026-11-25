@@ -540,7 +540,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table, const vector<string> &upsert_keys,
                                   const string &recompute_temp_table, RefreshPublicationScope *publication_scope,
-                                  const vector<string> &upsert_columns, SqlDialect dialect) {
+                                  const vector<string> &upsert_columns, SqlDialect dialect,
+                                  bool replace_affected_table) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -550,7 +551,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 
 	string result;
 	if (!affected_temp_table.empty()) {
-		result += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
+		result = replace_affected_table ? "CREATE OR REPLACE TEMP TABLE " : "CREATE TEMP TABLE ";
+		result += affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
 	}
 	if (!upsert_keys.empty() && !recompute_temp_table.empty()) {
 		// Upsert form, for data tables carrying a UNIQUE index. Materialize the recomputed rows for

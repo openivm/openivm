@@ -1839,6 +1839,39 @@ true
 
 endloop
 
+# The new direct UNION path uses an affected-key table. Keep the caller's table
+# with the old scratch name when the refresh runs in an explicit transaction.
+statement ok
+CREATE TEMP TABLE openivm_affected___openivm_mv_6d656d6f7279_6d61696e_77696e646f775f756e696f6e5f6469726563745f6d76_ (sentinel INT);
+INSERT INTO openivm_affected___openivm_mv_6d656d6f7279_6d61696e_77696e646f775f756e696f6e5f6469726563745f6d76_ VALUES (42);
+DELETE FROM window_union_right WHERE k=2 AND v=8;
+INSERT INTO window_union_right VALUES (2,12),(2,20);
+UPDATE window_union_right SET v=13 WHERE k=2 AND v=12;
+DELETE FROM window_union_right WHERE k=2 AND v=20;
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('window_union_direct_mv');
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM (
+    (FROM window_union_direct_mv EXCEPT ALL FROM window_union_direct_expected)
+    UNION ALL
+    (FROM window_union_direct_expected EXCEPT ALL FROM window_union_direct_mv)
+);
+----
+0
+
+query I
+SELECT sentinel FROM openivm_affected___openivm_mv_6d656d6f7279_6d61696e_77696e646f775f756e696f6e5f6469726563745f6d76_;
+----
+42
+
 # The binary UNION key separates A from a even when a source arm uses session nocase.
 statement ok
 SET SESSION default_collation = 'nocase';

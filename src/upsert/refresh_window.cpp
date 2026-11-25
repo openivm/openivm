@@ -162,8 +162,12 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 	string lookup_expr = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast);
 	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast);
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	// A session collation can merge source keys that the lookup's explicit
+	// collation distinguishes. Let IN perform matching before any deduplication.
+	bool dedup_source = Settings::Get<DefaultCollationSetting>(*con.context).empty();
 	return "SELECT DISTINCT " + ProjectWindowKey(lookup_out, op.output_col, key_collation) + " FROM " + lookup_table +
-	       " WHERE " + lookup_expr + " IN (SELECT DISTINCT " + source_expr + " FROM " + delta_table + filter + ")";
+	       " WHERE " + lookup_expr + " IN (SELECT " + (dedup_source ? "DISTINCT " : "") + source_expr + " FROM " +
+	       delta_table + filter + ")";
 }
 
 enum class LineageAffectedKeysResult : uint8_t { UNAVAILABLE, AVAILABLE, UNSAFE };
@@ -718,8 +722,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &internal_catalog_prefix, const string &view_catalog_name,
                                    const string &view_schema_name, const string &attached_db_catalog_name,
                                    const string &attached_db_schema_name, bool cross_system, bool has_join,
-                                   optional_ptr<const DeltaActivityResult> activity, bool emit_cascade_delta,
-                                   bool running_window_incremental, bool *uses_running_suffix,
+                                   optional_ptr<const DeltaActivityResult> activity, bool caller_transaction,
+                                   bool emit_cascade_delta, bool running_window_incremental, bool *uses_running_suffix,
                                    RefreshPublicationScope *publication_scope) {
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
@@ -856,7 +860,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	auto refresh_sql = CompileWindowRecompute(
 	    view_name, use_result_diff ? result_diff.query : view_query_sql, delta_ts_filter, internal_catalog_prefix,
 	    partition_cols, partition_delta_specs, emit_cascade_delta, affected_keys_sql, running_window_column_names,
-	    running_window_incremental, uses_running_suffix, use_data_modifying_ctes);
+	    running_window_incremental, uses_running_suffix, use_data_modifying_ctes,
+	    caller_transaction && dialect == SqlDialect::DUCKDB);
 	if (use_result_diff) {
 		return result_diff.setup + refresh_sql + result_diff.cleanup;
 	}

@@ -1,5 +1,6 @@
 #include "upsert/refresh_compiler.hpp"
 
+#include "core/compiled_sql_archive.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
@@ -1591,8 +1592,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const vector<string> &column_names,
-                              bool running_window_incremental, bool *uses_running_suffix,
-                              bool use_data_modifying_ctes) {
+                              bool running_window_incremental, bool *uses_running_suffix, bool use_data_modifying_ctes,
+                              bool isolate_affected_table) {
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
@@ -1616,7 +1617,14 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	}
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	string affected_temp_table;
+	if (have_affected_keys) {
+		// An explicit transaction shares the caller's temporary catalog.
+		affected_temp_table =
+		    isolate_affected_table
+		        ? SqlUtils::FullName(TEMP_CATALOG, DEFAULT_SCHEMA, "openivm_affected_" + NewCompilationId(view_name))
+		        : SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	}
 	auto output_columns = PartitionOutputColumns(partition_columns);
 
 	OPENIVM_DEBUG_PRINT(
@@ -1635,7 +1643,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
 		                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
-		                                  affected_temp_table);
+		                                  affected_temp_table, {}, "", nullptr, {}, SqlDialect::DUCKDB,
+		                                  !isolate_affected_table);
 	}
 
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
@@ -1643,7 +1652,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
 	string sql;
 	if (have_affected_keys) {
-		sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
+		sql = isolate_affected_table ? "CREATE TEMP TABLE " : "CREATE OR REPLACE TEMP TABLE ";
+		sql += affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
 	}
 	string filter = have_affected_keys ? BuildAffectedTableFilter(output_columns, "openivm_target", affected_temp_table)
 	                                   : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
