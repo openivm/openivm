@@ -993,9 +993,8 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			               data_table + " v ON " + on_clause + ")";
 		}
 	}
-	const string inserted_count = finalize_in_actions && !group_count_column.empty()
-	                                  ? inserted_column_expressions.at(group_count_column)
-	                                  : "";
+	const string inserted_count =
+	    finalize_in_actions && !group_count_column.empty() ? inserted_column_expressions.at(group_count_column) : "";
 	// Build update_set and insert_vals in the SAME column order as aggregates.
 	// Derived columns (AVG, STDDEV, VARIANCE) get their formula inline rather
 	// than being appended at the end — this ensures INSERT column/value alignment.
