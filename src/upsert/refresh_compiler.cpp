@@ -1013,6 +1013,10 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 				update_set += render_finalized(derived->second, updated_column_expressions, group_count);
 				insert_vals += render_finalized(derived->second, inserted_column_expressions, inserted_count);
 			} else {
+				update_set += "d." + column;
+				insert_vals += "d." + column;
+			}
+		} else {
 			const string &raw_column = aggregate_raw_names.at(column);
 			update_set += column + " = " + updated_column_expressions.at(raw_column);
 			insert_vals += inserted_column_expressions.at(raw_column);
