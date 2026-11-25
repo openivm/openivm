@@ -217,19 +217,20 @@ void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
 
 void PropagateRefreshCollation(ClientContext &from, ClientContext &to, RefreshMetadata &metadata,
                                const string &view_name) {
+	// Window refreshes use the caller's collation to reconstruct changed partitions.
+	// Other refresh strategies still compile uncollated keys using the helper's default.
 	auto collation = Settings::Get<DefaultCollationSetting>(from);
-	if (collation == Settings::Get<DefaultCollationSetting>(to)) {
+	if (collation == Settings::Get<DefaultCollationSetting>(to) ||
+	    metadata.GetViewType(view_name) != RefreshType::WINDOW_PARTITION) {
 		return;
 	}
-	if (metadata.GetViewType(view_name) == RefreshType::WINDOW_PARTITION) {
-		optional<bool> requires_result_diff;
-		metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
-		if (!requires_result_diff) {
-			// Older stored window SQL was replayed with the helper's default.
-			// It may have omitted explicit binary collations during serialization.
-			OPENIVM_DEBUG_PRINT("[REFRESH] Keeping helper collation for legacy window view '%s'\n", view_name.c_str());
-			return;
-		}
+	optional<bool> requires_result_diff;
+	metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
+	if (!requires_result_diff) {
+		// Older stored window SQL was replayed with the helper's default.
+		// It may have omitted explicit binary collations during serialization.
+		OPENIVM_DEBUG_PRINT("[REFRESH] Keeping helper collation for legacy window view '%s'\n", view_name.c_str());
+		return;
 	}
 	Settings::Set<DefaultCollationSetting>(to, SetScope::SESSION, Value(std::move(collation)));
 }

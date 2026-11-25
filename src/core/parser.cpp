@@ -528,9 +528,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 		auto lpts_start = create_profile_now();
 		auto serialize_plan = [&](unique_ptr<LogicalOperator> &candidate) {
-			if (post_rewrite_facts.analysis.found_window) {
-				PreserveBinaryCollationsForSerialization(*candidate);
-			}
+			PreserveBinaryCollationsForSerialization(*candidate);
 			// CREATE MATERIALIZED VIEW always stores the view body in DuckDB's own dialect.
 			// Refresh-time target dialects are selected per CompileFacts.
 			SqlDialect dialect = SqlDialect::DUCKDB;
