@@ -3827,7 +3827,8 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 		out.ops.push_back(std::move(metadata_op));
 	}
-	return !out.proven_columns->empty();
+	// Ops without a proven key still identify every source a partition reads.
+	return !out.ops.empty();
 }
 
 static bool IsGroupScopeTieSafeType(const LogicalType &type) {
