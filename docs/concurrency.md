@@ -81,8 +81,11 @@ database open. While it holds the file, other processes can't open it at all, no
 
 Each database that loads OpenIVM has its own refresh daemon, so a process can keep several databases open and
 all of them get their scheduled refreshes. Closing a database stops its daemon. If the database is closed during a
-scheduling cycle, the refreshes of that cycle finish first: the daemon then closes the database, and the file
-stays open until it does.
+scheduling cycle, the refreshes of that cycle finish first, provided the process keeps running: the daemon then
+closes the database, and the file stays open until it does. Nothing waits for the daemon at process exit. If the
+process exits during a cycle, it can crash and the unfinished refresh is lost; its deltas stay pending, and the
+next refresh, manual or scheduled, applies them. To exit cleanly, set `openivm_disable_daemon` so no new
+cycle starts, then wait until `PRAGMA refresh_status` reports `idle`.
 
 The daemon reads settings through its own connection, so use `SET GLOBAL` for settings it should see. See
 [automatic refresh](refresh/automatic-refresh.md).

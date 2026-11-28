@@ -16,26 +16,35 @@ shared_ptr<RefreshDaemon> RefreshDaemon::Get(DatabaseInstance &db) {
 	return db.GetObjectCache().Get<RefreshDaemon>(ObjectType());
 }
 
-void RefreshDaemon::Start(DatabaseInstance &db, bool restart, bool wake) {
+void RefreshDaemon::Start(DatabaseInstance &db, bool restart) {
 	auto daemon = db.GetObjectCache().GetOrCreate<RefreshDaemon>(ObjectType());
 	if (!daemon) {
 		throw InternalException("OpenIVM refresh daemon cache key is used by another object");
 	}
-	daemon->StartThread(db, restart, wake);
+	daemon->StartThread(db, restart);
 }
 
-void RefreshDaemon::StartThread(DatabaseInstance &db, bool restart, bool wake) {
+static int64_t WakeSeconds(DatabaseInstance &db) {
+	Value value;
+	if (db.TryGetCurrentSetting(Identifier(RefreshDaemon::WAKE_SECONDS_SETTING), value) && !value.IsNull()) {
+		return value.GetValue<int64_t>();
+	}
+	return RefreshDaemon::DEFAULT_WAKE_SECONDS;
+}
+
+void RefreshDaemon::StartThread(DatabaseInstance &db, bool restart) {
 	std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
 	if (restart) {
 		StopThread();
 	}
 	if (!state_) {
-		auto state = make_shared_ptr<State>(weak_ptr<DatabaseInstance>(db.shared_from_this()));
+		auto state =
+		    make_shared_ptr<State>(weak_ptr<DatabaseInstance>(db.shared_from_this()), restart, WakeSeconds(db));
 		thread_ = std::thread(&RefreshDaemon::Run, state);
 		std::lock_guard<std::mutex> guard(state_mutex_);
 		state_ = std::move(state);
 	}
-	if (wake) {
+	if (restart) {
 		state_->Signal(false);
 	}
 }
@@ -47,10 +56,10 @@ void RefreshDaemon::StopThread() {
 	state_->Signal(true);
 	if (thread_.joinable()) {
 		if (thread_.get_id() == std::this_thread::get_id()) {
-			// The daemon thread dropped the last reference to its database, so the database (and this
-			// handle, which it owns) is being destroyed on that thread. A thread cannot join itself:
-			// detach it instead. Run sees the shutdown flag as soon as the destructor returns and touches
-			// only the State it co-owns, never this handle or the database.
+			// We are on the daemon thread: either it dropped the last reference to its database, which
+			// is now being destroyed (with this handle), or a refresh hook it runs restarted the daemon.
+			// A thread cannot join itself, so detach it. It finishes its current cycle, sees the shutdown
+			// flag and exits, touching only the State it co-owns, never this handle or a closed database.
 			thread_.detach();
 		} else {
 			thread_.join();
@@ -58,6 +67,18 @@ void RefreshDaemon::StopThread() {
 	}
 	std::lock_guard<std::mutex> guard(state_mutex_);
 	state_.reset();
+}
+
+void RefreshDaemon::SetWakeSeconds(int64_t seconds) {
+	auto state = CurrentState();
+	if (!state) {
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> guard(state->cv_mutex);
+		state->wake_seconds = seconds;
+	}
+	state->Signal(false);
 }
 
 RefreshDaemon::~RefreshDaemon() {
@@ -110,7 +131,7 @@ void RefreshDaemon::Run(shared_ptr<State> state) {
 	while (true) {
 		{
 			std::unique_lock<std::mutex> lock(state->cv_mutex);
-			state->cv.wait_for(lock, std::chrono::seconds(WAKE_INTERVAL_SECONDS),
+			state->cv.wait_for(lock, std::chrono::seconds(state->wake_seconds),
 			                   [&] { return state->shutdown || state->wake_requested; });
 			if (state->shutdown) {
 				break;
@@ -133,6 +154,11 @@ void RefreshDaemon::RunCycle(State &state, DatabaseInstance &db) {
 	try {
 		Connection con(db);
 		OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Woke up\n");
+		// Read on every cycle, so SET openivm_disable_daemon after LOAD also stops scheduled refresh.
+		if (!state.explicit_start && SqlUtils::GetBoolSetting(*con.context, "openivm_disable_daemon", false)) {
+			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Disabled by openivm_disable_daemon; skipping cycle\n");
+			return;
+		}
 
 		// Read cascade setting from the DB config
 		auto cascade_mode =

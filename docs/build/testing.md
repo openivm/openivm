@@ -82,9 +82,12 @@ make test_daemon_lifetime
 `test/integration/daemon_lifetime_test.cpp` checks that each database has its own
 daemon ([#34](https://github.com/openivm/openivm/issues/34)): two databases in one
 process both get scheduled refreshes, closing one leaves the other's daemon running,
-an idle daemon is joined as soon as its database closes, and a database closed while
-its daemon refreshes is closed by the daemon after that refresh commits. It waits for
-real daemon wake-ups, so it takes about a minute; the Python runner bounds hangs.
+an idle daemon is joined as soon as its database closes, a database closed while
+its daemon refreshes is closed by the daemon after that refresh commits, and
+`SET openivm_disable_daemon` after `LOAD` pauses scheduled refresh until it is
+cleared. It waits for real periodic wake-ups, shortened with
+`openivm_daemon_wake_seconds = 1`, and takes about 15 seconds; the Python runner
+bounds hangs.
 
 ## Remote metadata integration test
 

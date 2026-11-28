@@ -39,9 +39,13 @@ static void CheckBag(Connection &con, const string &view, const string &query) {
 	}
 }
 
-static void Configure(Connection &con, const string &directory) {
+static void Configure(Connection &con, const string &directory, bool fast_wake = true) {
 	// The daemon reads settings through its own connection, so they must be global.
 	Execute(con, "LOAD openivm; SET GLOBAL openivm_files_path=" + Value(directory).ToSQLString() + ";");
+	if (fast_wake) {
+		// The daemon setting is database-wide: plain SET reaches the daemon.
+		Execute(con, "SET openivm_daemon_wake_seconds = 1;");
+	}
 }
 
 static const char *AGG_QUERY = "SELECT k, SUM(v) AS s, COUNT(*) AS c FROM src GROUP BY k";
@@ -67,7 +71,6 @@ static void ChangeSource(Connection &con, int round) {
 	                 " FROM range(0, 50) t(i); "
 	                 "UPDATE src SET k = (k + 1) % 7 WHERE id % 11 = 0; "
 	                 "DELETE FROM src WHERE id BETWEEN 1100 AND 1110;");
-	MakeDue(con);
 }
 
 static void CreateScheduledView(Connection &con, const string &query) {
@@ -77,10 +80,10 @@ static void CreateScheduledView(Connection &con, const string &query) {
 	CheckBag(con, "mv", query);
 }
 
-// Wait for the views' own daemons to refresh them, without waking or restarting
-// any daemon: one wake interval (30 seconds) plus slack.
+// Wait for the views' own daemons to refresh them on their periodic wake, without
+// waking or restarting any daemon.
 static void WaitForScheduledRefresh(vector<std::pair<Connection *, const char *>> views, const string &what) {
-	auto deadline = steady_clock::now() + std::chrono::seconds(75);
+	auto deadline = steady_clock::now() + std::chrono::seconds(60);
 	while (true) {
 		bool all = true;
 		for (auto &view : views) {
@@ -114,6 +117,8 @@ static void TestTwoDatabases(const string &directory) {
 	if (BagEqual(*con_a, "mv", AGG_QUERY) || BagEqual(con_b, "mv", PROJ_QUERY)) {
 		throw InvalidInputException("The changes did not affect the views");
 	}
+	MakeDue(*con_a);
+	MakeDue(con_b);
 	WaitForScheduledRefresh({{con_a.get(), AGG_QUERY}, {&con_b, PROJ_QUERY}}, "both databases");
 
 	// Closing the first database stops only its daemon.
@@ -123,6 +128,7 @@ static void TestTwoDatabases(const string &directory) {
 	if (BagEqual(con_b, "mv", PROJ_QUERY)) {
 		throw InvalidInputException("The changes did not affect the view");
 	}
+	MakeDue(con_b);
 	WaitForScheduledRefresh({{&con_b, PROJ_QUERY}}, "the remaining database");
 }
 
@@ -133,7 +139,8 @@ static void TestCloseIdle(const string &directory) {
 		auto db = make_uniq<DuckDB>(directory + "/idle.db");
 		{
 			Connection con(*db);
-			Configure(con, directory);
+			// Keep the 30-second wake: the daemon must be idle when the database closes.
+			Configure(con, directory, false);
 			if (i == 0) {
 				CreateScheduledView(con, AGG_QUERY);
 			}
@@ -169,7 +176,8 @@ static void TestCloseDuringRefresh(const string &directory) {
 	{
 		auto db = cache.GetOrCreateInstance(path, config, true);
 		auto con = make_uniq<Connection>(*db);
-		Configure(*con, directory);
+		// Only the explicit wake below may start the refresh.
+		Configure(*con, directory, false);
 		CreateScheduledView(*con, AGG_QUERY);
 		// A large pending delta keeps the scheduled refresh running long enough to observe it.
 		Execute(*con, "INSERT INTO src SELECT i, i % 100000, i FROM range(2000, 4000000) t(i); "
@@ -222,6 +230,7 @@ static void TestKeepRunning(const string &directory) {
 	auto end = steady_clock::now() + std::chrono::seconds(5);
 	for (int round = 1; steady_clock::now() < end; round++) {
 		ChangeSource(con, round);
+		MakeDue(con);
 		Execute(con, "PRAGMA refresh_start_daemon;");
 		auto deadline = steady_clock::now() + std::chrono::seconds(30);
 		while (!BagEqual(con, "mv", PROJ_QUERY)) {
@@ -233,6 +242,28 @@ static void TestKeepRunning(const string &directory) {
 	}
 }
 
+// SET openivm_disable_daemon after LOAD stops scheduled refresh; clearing it resumes it.
+static void TestDisableAfterLoad(const string &directory) {
+	std::cerr << "CASE openivm_disable_daemon after LOAD" << std::endl;
+	DuckDB db(nullptr);
+	Connection con(db);
+	Configure(con, directory);
+	if (!con.Query("SET SESSION openivm_daemon_wake_seconds = 1;")->HasError()) {
+		throw InvalidInputException("A session-level daemon wake interval was accepted");
+	}
+	Execute(con, "SET openivm_disable_daemon = true;");
+	CreateScheduledView(con, AGG_QUERY);
+	ChangeSource(con, 1);
+	MakeDue(con);
+	// Several one-second wakes pass without a refresh.
+	std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+	if (BagEqual(con, "mv", AGG_QUERY)) {
+		throw InvalidInputException("A disabled daemon refreshed a view");
+	}
+	Execute(con, "SET openivm_disable_daemon = false;");
+	WaitForScheduledRefresh({{&con, AGG_QUERY}}, "a re-enabled daemon");
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		return 2;
@@ -242,6 +273,7 @@ int main(int argc, char **argv) {
 		TestCloseDuringRefresh(argv[1]);
 		TestKeepRunning(argv[1]);
 		TestTwoDatabases(argv[1]);
+		TestDisableAfterLoad(argv[1]);
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &ex) {
 		std::cerr << ex.what() << std::endl;

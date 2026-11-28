@@ -148,7 +148,8 @@ MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fas
 | `openivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model (learned regression + IVM vs recompute decision) |
 | `openivm_cascade_refresh` | VARCHAR | `"downstream"` | Cascade mode: `"off"`, `"upstream"`, `"downstream"`, `"both"` |
 | `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh exceeds interval |
-| `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon |
+| `openivm_disable_daemon` | BOOLEAN | `false` | Disable the database's background refresh daemon (database-wide; checked every cycle; `PRAGMA refresh_start_daemon` overrides) |
+| `openivm_daemon_wake_seconds` | BIGINT | `30` | Seconds between the refresh daemon's checks for due views (database-wide) |
 | `openivm_files_path` | VARCHAR | — | Path for compiled query reference files |
 | `openivm_metadata_catalog` | VARCHAR | `""` | Database-wide attached catalog (native DuckDB or `TYPE postgres`) for OpenIVM metadata; empty keeps it next to each native view catalog. See `docs/internals/metadata-placement.md` |
 | `openivm_metadata_schema` | VARCHAR | `""` | Schema for control metadata per native catalog; empty keeps the existing schema (`main` for new metadata). Internal MV/delta objects never follow it (`docs/internals/metadata-placement.md`) |
