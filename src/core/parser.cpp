@@ -747,8 +747,37 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	};
 	auto semi_anti_extracted = analysis.found_semi_anti_join && !analysis.found_aggregation &&
 	                           ExtractSemiAntiQuery(local_view_query, semi_anti_extract, describe_columns);
+	// Refresh reads each semi/anti relation through its own delta. A plain view's changes are
+	// tracked on its base tables instead; a materialized view has its own delta.
+	auto is_plain_view = [&](const string &relation) {
+		vector<string> parts;
+		try {
+			parts = SqlUtils::ParseQualifiedIdentifier(qualify_source(relation));
+		} catch (const ParserException &) {
+			return false;
+		}
+		if (parts.size() != 3) {
+			return false;
+		}
+		QueryErrorContext error_context;
+		auto view = Catalog::GetEntry(
+		    context,
+		    SqlUtils::QualifyLookup(
+		        EntryLookupInfo(CatalogType::VIEW_ENTRY, QualifiedName(Identifier(parts[2])), error_context),
+		        Identifier(parts[0]), Identifier(parts[1])),
+		    OnEntryNotFound::RETURN_NULL);
+		return view && view->type == CatalogType::VIEW_ENTRY &&
+		       RefreshMetadata(con).FindViewKey(parts[0], parts[1], parts[2]).empty();
+	};
+	if (semi_anti_extracted) {
+		auto relations =
+		    semi_anti_extract.left_is_subquery ? semi_anti_extract.left_sources : vector<string> {semi_anti.left_table};
+		relations.push_back(semi_anti.right_table);
+		semi_anti_extracted = std::none_of(relations.begin(), relations.end(), is_plain_view);
+	}
 	if (semi_anti_extracted) {
 		bool derived_left = semi_anti_extract.left_is_subquery;
+		semi_anti.derived_left = derived_left;
 		auto base_cols = derived_left ? vector<string>() : describe_columns(semi_anti.left_table);
 		if (semi_anti.output_cols.empty()) {
 			for (auto &name : base_cols) {
@@ -1382,7 +1411,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		emit_aux("create_mv_semi_anti_aux", meta.aux_table, "semi_anti_aux_meta_json", RefreshMetadata::ToJson(meta),
 		         [&](const string &aux_target) {
 			         string left_source = qualify_source(meta.left_table);
-			         if (IsDerivedSemiAntiLeft(meta.left_table)) {
+			         if (meta.derived_left) {
 				         vector<SemiAntiLeftSource> leaves;
 				         for (auto &leaf : SemiAntiLeftSourceNames(meta.left_table)) {
 					         leaves.push_back({qualify_source(leaf), "", ""});

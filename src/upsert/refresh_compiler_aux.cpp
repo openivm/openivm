@@ -1321,10 +1321,6 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
 	       " FROM left_counts lc LEFT JOIN match_counts mc ON " + lc_mc_match + right_stats_from;
 }
 
-bool IsDerivedSemiAntiLeft(const string &left_table) {
-	return StringUtil::StartsWith(left_table, "(");
-}
-
 static unique_ptr<SelectStatement> ParseSemiAntiLeftInput(const string &left_table) {
 	auto statement = SqlUtils::TryParseSelect("SELECT * FROM " + left_table + " openivm_left");
 	if (!statement || statement->node->type != QueryNodeType::SELECT_NODE ||
@@ -1357,7 +1353,7 @@ static vector<reference<unique_ptr<TableRef>>> SemiAntiLeftLeaves(SelectStatemen
 	return leaves;
 }
 
-// Adds the multiplicity columns that delta leaves expose to every SELECT enclosing them.
+// Adds the multiplicity columns that leaves expose to every SELECT enclosing them.
 static vector<string> CarrySemiAntiLeftMultiplicities(TableRef &ref, const unordered_map<TableRef *, string> &mults) {
 	vector<string> result;
 	if (ref.type == TableReferenceType::JOIN) {
@@ -1377,11 +1373,16 @@ static vector<string> CarrySemiAntiLeftMultiplicities(TableRef &ref, const unord
 	return result;
 }
 
-// The left input with the leaves in delta_mask read from their deltas since last_update and
-// the others from their current tables; mults receives the delta leaves' multiplicity columns.
-static string RenderSemiAntiLeftTerm(const string &left_table, const vector<SemiAntiLeftSource> &sources,
-                                     idx_t delta_mask, const string &catalog_prefix, vector<string> &mults) {
-	auto statement = ParseSemiAntiLeftInput(left_table);
+// How a term of the left delta reads one leaf: its current rows, its delta since the last
+// refresh, or its state before that delta (current rows minus the delta).
+enum class SemiAntiLeafState : uint8_t { CURRENT, DELTA, OLD };
+
+// The left input reading leaf i as states[i]; mults receives the multiplicity columns of the
+// leaves read as DELTA or OLD, whose product weighs each row.
+static string RenderSemiAntiLeftTerm(const SelectStatement &parsed, const vector<SemiAntiLeftSource> &sources,
+                                     const vector<SemiAntiLeafState> &states, const string &catalog_prefix,
+                                     vector<string> &mults) {
+	auto statement = unique_ptr_cast<SQLStatement, SelectStatement>(parsed.Copy());
 	auto leaves = SemiAntiLeftLeaves(*statement);
 	if (leaves.size() != sources.size()) {
 		throw InternalException("Derived semi/anti left input has %llu leaves but %llu sources", leaves.size(),
@@ -1392,21 +1393,24 @@ static string RenderSemiAntiLeftTerm(const string &left_table, const vector<Semi
 		auto &slot = leaves[i].get();
 		auto &base = slot->Cast<BaseTableRef>();
 		auto alias = base.alias.empty() ? base.Table() : base.alias;
-		string relation = "SELECT * FROM " + sources[i].table_sql;
-		string mult;
-		if (delta_mask & (idx_t(1) << i)) {
-			mult = "openivm_saj_m" + std::to_string(i);
-			relation = "SELECT * EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
-			           string(openivm::TIMESTAMP_COL) + "), " + string(openivm::MULTIPLICITY_COL) + " AS " + mult +
-			           " FROM " + DeltaSourceRef(sources[i].delta_sql, catalog_prefix) + " WHERE " +
-			           string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(sources[i].last_update) +
-			           "'::TIMESTAMP";
+		auto state = states.empty() ? SemiAntiLeafState::CURRENT : states[i];
+		string mult = state == SemiAntiLeafState::CURRENT ? "" : "openivm_saj_m" + std::to_string(i);
+		string relation =
+		    "SELECT *" + string(mult.empty() ? "" : ", 1::INTEGER AS " + mult) + " FROM " + sources[i].table_sql;
+		if (state != SemiAntiLeafState::CURRENT) {
+			string delta = "SELECT * EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
+			               string(openivm::TIMESTAMP_COL) + "), " + (state == SemiAntiLeafState::OLD ? "-" : "") +
+			               string(openivm::MULTIPLICITY_COL) + " AS " + mult + " FROM " +
+			               DeltaSourceRef(sources[i].delta_sql, catalog_prefix) + " WHERE " +
+			               string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(sources[i].last_update) +
+			               "'::TIMESTAMP";
+			relation = state == SemiAntiLeafState::DELTA ? delta : relation + " UNION ALL BY NAME " + delta;
 		}
-		auto parsed = SqlUtils::TryParseSelect(relation);
-		if (!parsed) {
+		auto leaf = SqlUtils::TryParseSelect(relation);
+		if (!leaf) {
 			throw InternalException("Invalid derived semi/anti leaf relation: %s", relation);
 		}
-		slot = make_uniq<SubqueryRef>(std::move(parsed), alias);
+		slot = make_uniq<SubqueryRef>(std::move(leaf), alias);
 		if (!mult.empty()) {
 			leaf_mults[slot.get()] = mult;
 		}
@@ -1432,38 +1436,36 @@ vector<string> SemiAntiLeftSourceNames(const string &left_table) {
 
 string RenderSemiAntiLeftInput(const string &left_table, const vector<SemiAntiLeftSource> &sources) {
 	vector<string> mults;
-	return "(" + RenderSemiAntiLeftTerm(left_table, sources, 0, "", mults) + ")";
+	return "(" + RenderSemiAntiLeftTerm(*ParseSemiAntiLeftInput(left_table), sources, {}, "", mults) + ")";
 }
 
 string BuildSemiAntiLeftInputDelta(const string &left_table, const vector<string> &left_cols,
                                    const vector<SemiAntiLeftSource> &sources, const string &last_update,
                                    const string &catalog_prefix) {
-	if (sources.size() > openivm::MAX_JOIN_TABLES) {
-		throw NotImplementedException("Derived semi/anti left input over more than %llu tables",
-		                              openivm::MAX_JOIN_TABLES);
-	}
-	idx_t delta_leaves = 0;
+	auto parsed = ParseSemiAntiLeftInput(left_table);
+	vector<idx_t> changed;
 	for (idx_t i = 0; i < sources.size(); i++) {
 		if (!sources[i].last_update.empty()) {
-			delta_leaves |= idx_t(1) << i;
+			changed.push_back(i);
 		}
 	}
-	// Current tables already include their deltas (R_now = R_old + dR), so a term reading the
-	// deltas of k leaves carries the inclusion-exclusion sign (-1)^(k-1), as in the join rule.
+	// Telescoping over the changed leaves c_1..c_k, as for DuckLake joins: L(new) - L(old) is the sum
+	// over t of L with c_<t new, c_t's delta and c_>t old, since the left input is linear in each leaf.
 	vector<string> terms;
-	for (idx_t mask = 1; mask < (idx_t(1) << sources.size()); mask++) {
-		if (mask & ~delta_leaves) {
-			continue;
+	for (idx_t t = 0; t < changed.size(); t++) {
+		vector<SemiAntiLeafState> states(sources.size(), SemiAntiLeafState::CURRENT);
+		states[changed[t]] = SemiAntiLeafState::DELTA;
+		for (idx_t later = t + 1; later < changed.size(); later++) {
+			states[changed[later]] = SemiAntiLeafState::OLD;
 		}
 		vector<string> mults;
-		auto term = RenderSemiAntiLeftTerm(left_table, sources, mask, catalog_prefix, mults);
-		string sign = mults.size() % 2 == 1 ? "" : "-1 * ";
-		terms.push_back("SELECT " + SqlUtils::JoinQuotedColumns(left_cols) + ", (" + sign +
-		                StringUtil::Join(mults, " * ") + ")::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", '" +
+		auto term = RenderSemiAntiLeftTerm(*parsed, sources, states, catalog_prefix, mults);
+		terms.push_back("SELECT " + SqlUtils::JoinQuotedColumns(left_cols) + ", (" + StringUtil::Join(mults, " * ") +
+		                ")::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", '" +
 		                SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AS " + string(openivm::TIMESTAMP_COL) +
 		                " FROM (" + term + ") openivm_saj_term");
 	}
-	OPENIVM_DEBUG_PRINT("[SEMI/ANTI] Derived left delta: %zu leaves, %zu terms\n", sources.size(), terms.size());
+	OPENIVM_DEBUG_PRINT("[SEMI/ANTI] Derived left delta: %zu leaves, %zu changed\n", sources.size(), changed.size());
 	return terms.empty() ? "" : "(" + StringUtil::Join(terms, "\nUNION ALL\n") + ")";
 }
 

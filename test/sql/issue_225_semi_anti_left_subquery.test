@@ -294,3 +294,243 @@ SELECT count(*) FROM ((SELECT * FROM r225_vs EXCEPT ALL SELECT id, x FROM (SELEC
     UNION ALL (SELECT id, x FROM (SELECT id, x FROM r225_a) s WHERE id IN (SELECT r225_b.id FROM r225_b) EXCEPT ALL SELECT * FROM r225_vs));
 ----
 0
+
+# A plain DuckDB view is not a tracked source: its changes are recorded on its base tables, so a
+# semi/anti relation that is a view is maintained by full refresh. A materialized view has its own
+# delta and keeps the incremental path.
+statement ok
+CREATE VIEW l225_va AS SELECT id, x FROM l225_a WHERE x > 0;
+
+statement ok
+CREATE VIEW l225_vb AS SELECT id, w FROM l225_b WHERE w >= 0;
+
+statement ok
+CREATE MATERIALIZED VIEW l225_parent AS SELECT id, x FROM l225_a WHERE x > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW l225_view_sub AS
+    SELECT id, x FROM (SELECT id, x FROM l225_va) s WHERE EXISTS (SELECT 1 FROM l225_b b WHERE b.id = s.id);
+
+statement ok
+CREATE VIEW expected_l225_view_sub AS
+    SELECT id, x FROM (SELECT id, x FROM l225_va) s WHERE EXISTS (SELECT 1 FROM l225_b b WHERE b.id = s.id);
+
+statement ok
+CREATE MATERIALIZED VIEW l225_view_plain AS SELECT id, x FROM l225_va WHERE id IN (SELECT id FROM l225_b);
+
+statement ok
+CREATE VIEW expected_l225_view_plain AS SELECT id, x FROM l225_va WHERE id IN (SELECT id FROM l225_b);
+
+statement ok
+CREATE MATERIALIZED VIEW l225_view_right AS SELECT id, x FROM l225_a WHERE id IN (SELECT id FROM l225_vb);
+
+statement ok
+CREATE VIEW expected_l225_view_right AS SELECT id, x FROM l225_a WHERE id IN (SELECT id FROM l225_vb);
+
+statement ok
+CREATE MATERIALIZED VIEW l225_mv_leaf AS
+    SELECT id, x FROM (SELECT id, x FROM l225_parent) s WHERE id IN (SELECT id FROM l225_b);
+
+statement ok
+CREATE VIEW expected_l225_mv_leaf AS
+    SELECT id, x FROM (SELECT id, x FROM l225_parent) s WHERE id IN (SELECT id FROM l225_b);
+
+# An outer DISTINCT is not the per-tuple aux state's bag semantics; such views used to fail at CREATE.
+statement ok
+CREATE MATERIALIZED VIEW l225_distinct_join AS
+    SELECT DISTINCT a.id FROM l225_a a JOIN l225_c c ON a.id = c.id
+    WHERE EXISTS (SELECT 1 FROM l225_b b WHERE b.id = a.id);
+
+statement ok
+CREATE VIEW expected_l225_distinct_join AS
+    SELECT DISTINCT a.id FROM l225_a a JOIN l225_c c ON a.id = c.id
+    WHERE EXISTS (SELECT 1 FROM l225_b b WHERE b.id = a.id);
+
+statement ok
+CREATE MATERIALIZED VIEW l225_distinct_plain AS SELECT DISTINCT id FROM l225_a WHERE id IN (SELECT id FROM l225_b);
+
+statement ok
+CREATE VIEW expected_l225_distinct_plain AS SELECT DISTINCT id FROM l225_a WHERE id IN (SELECT id FROM l225_b);
+
+# A left join of four relations (two self-joins): refresh applies one telescoping term per changed leaf.
+statement ok
+CREATE MATERIALIZED VIEW l225_four AS
+    SELECT a.id, c.z, d.z AS z2, e.x AS x2
+    FROM l225_a a JOIN l225_c c ON a.id = c.id JOIN l225_c d ON d.id = a.id JOIN l225_a e ON e.id = c.id
+    WHERE a.id NOT IN (SELECT id FROM l225_b WHERE id IS NOT NULL);
+
+statement ok
+CREATE VIEW expected_l225_four AS
+    SELECT a.id, c.z, d.z AS z2, e.x AS x2
+    FROM l225_a a JOIN l225_c c ON a.id = c.id JOIN l225_c d ON d.id = a.id JOIN l225_a e ON e.id = c.id
+    WHERE a.id NOT IN (SELECT id FROM l225_b WHERE id IS NOT NULL);
+
+query II
+SELECT view_sql_name, type FROM openivm_views
+WHERE view_sql_name IN ('l225_view_sub', 'l225_view_plain', 'l225_view_right', 'l225_mv_leaf', 'l225_distinct_join',
+    'l225_distinct_plain', 'l225_four')
+ORDER BY 1;
+----
+l225_distinct_join	3
+l225_distinct_plain	3
+l225_four	9
+l225_mv_leaf	9
+l225_view_plain	3
+l225_view_right	3
+l225_view_sub	3
+
+# Rounds that change only the subquery table, only one left table, only the other, then every table,
+# each a conflicting batch before one refresh. The last round also reads every leaf's delta table
+# without skipping empty ones.
+loop round 0 4
+
+statement ok
+SET openivm_skip_empty_deltas = {round} < 3;
+
+statement ok
+INSERT INTO l225_b SELECT 20 + {round}, {round} WHERE {round} IN (0, 3);
+
+statement ok
+UPDATE l225_b SET w = w + 1 WHERE id = 3 AND {round} IN (0, 3);
+
+statement ok
+DELETE FROM l225_b WHERE (id = 4 OR id IS NULL) AND {round} IN (0, 3);
+
+statement ok
+INSERT INTO l225_b SELECT 4, 40 WHERE {round} IN (0, 3);
+
+statement ok
+INSERT INTO l225_a SELECT 20 + {round}, 200 WHERE {round} IN (1, 3);
+
+statement ok
+UPDATE l225_a SET x = x + 2 WHERE id IN (2, 3) AND {round} IN (1, 3);
+
+statement ok
+DELETE FROM l225_a WHERE id = 6 AND {round} IN (1, 3);
+
+statement ok
+INSERT INTO l225_a SELECT 6, 66 WHERE {round} IN (1, 3);
+
+statement ok
+INSERT INTO l225_c SELECT 20 + {round}, 2000 WHERE {round} IN (2, 3);
+
+statement ok
+UPDATE l225_c SET z = z + 3 WHERE id IN (1, 6) AND {round} IN (2, 3);
+
+statement ok
+DELETE FROM l225_c WHERE id = 3 AND {round} IN (2, 3);
+
+statement ok
+INSERT INTO l225_c SELECT 3, 333 WHERE {round} IN (2, 3);
+
+statement ok
+PRAGMA refresh('l225_parent');
+
+foreach mv l225_in_sub l225_notin_subjoin l225_exists_join l225_in_selfjoin l225_view_sub l225_view_plain l225_view_right l225_mv_leaf l225_distinct_join l225_distinct_plain l225_four
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv}));
+----
+0
+
+endloop
+
+endloop
+
+statement ok
+RESET openivm_skip_empty_deltas;
+
+# A full-mode refresh rebuilds the semi/anti aux state; a later incremental refresh starts from it.
+statement ok
+CREATE MATERIALIZED VIEW l225_full_sub AS
+    SELECT id, x FROM (SELECT id, x FROM l225_a WHERE x > 0) s WHERE EXISTS (SELECT 1 FROM l225_b b WHERE b.id = s.id);
+
+statement ok
+CREATE VIEW expected_l225_full_sub AS
+    SELECT id, x FROM (SELECT id, x FROM l225_a WHERE x > 0) s WHERE EXISTS (SELECT 1 FROM l225_b b WHERE b.id = s.id);
+
+statement ok
+CREATE MATERIALIZED VIEW l225_full_plain AS
+    SELECT id, x FROM l225_a WHERE NOT EXISTS (SELECT 1 FROM l225_b b WHERE b.id = l225_a.id);
+
+statement ok
+CREATE VIEW expected_l225_full_plain AS
+    SELECT id, x FROM l225_a WHERE NOT EXISTS (SELECT 1 FROM l225_b b WHERE b.id = l225_a.id);
+
+query II
+SELECT view_sql_name, type FROM openivm_views WHERE view_sql_name LIKE 'l225_full_%' ORDER BY 1;
+----
+l225_full_plain	9
+l225_full_sub	9
+
+loop round 0 2
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+INSERT INTO l225_b VALUES (30 + {round}, 0), (6, 0);
+
+statement ok
+INSERT INTO l225_a VALUES (30 + {round}, 300), (31 + {round}, 310);
+
+statement ok
+DELETE FROM l225_a WHERE id = 2;
+
+foreach mv l225_full_sub l225_full_plain
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv}));
+----
+0
+
+endloop
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+DELETE FROM l225_b WHERE id = 30 + {round} OR (id = 6 AND w = 0);
+
+statement ok
+INSERT INTO l225_a VALUES (2, 22);
+
+statement ok
+UPDATE l225_a SET x = x + 1 WHERE id = 31 + {round};
+
+foreach mv l225_full_sub l225_full_plain
+
+statement ok
+PRAGMA refresh('{mv}');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM {mv} EXCEPT ALL SELECT * FROM expected_{mv})
+    UNION ALL (SELECT * FROM expected_{mv} EXCEPT ALL SELECT * FROM {mv}));
+----
+0
+
+endloop
+
+endloop
+
+# Metadata written before derived_left stored the left subquery as an opaque wrapper whose deltas
+# refresh never read. Such a view asks to be recreated instead of refreshing wrongly.
+statement ok
+UPDATE openivm_views SET semi_anti_aux_meta_json = replace(semi_anti_aux_meta_json, '"derived_left":"true",', '')
+WHERE view_sql_name = 'l225_full_sub';
+
+statement ok
+INSERT INTO l225_a VALUES (40, 400);
+
+statement error
+PRAGMA refresh('l225_full_sub');
+----
+recreate the materialized view

@@ -134,12 +134,17 @@ static string RenameQualifier(ParsedExpression &expression, const string &table,
 }
 
 // A left input whose delta is the inclusion-exclusion sum over its leaf tables: inner joins
-// of base tables and of SELECTs that only filter and project, without subqueries. Refresh
-// unions one term per subset of the leaves, so their number is capped as for joins.
-static bool IsLinearLeftInput(const TableRef &ref, idx_t &leaves) {
+// of base tables and of SELECTs that only filter and project, without subqueries. Its leaf
+// relations are capped as for joins.
+static bool IsLinearLeftInput(TableRef &ref, vector<string> &leaves) {
 	if (ref.type == TableReferenceType::BASE_TABLE) {
-		auto &base = ref.Cast<BaseTableRef>();
-		return !base.at_clause && base.column_name_alias.empty() && ++leaves <= openivm::MAX_JOIN_TABLES;
+		string table;
+		string alias;
+		if (!ReadSource(ref, table, alias)) {
+			return false;
+		}
+		leaves.push_back(table);
+		return leaves.size() <= openivm::MAX_JOIN_TABLES;
 	}
 	if (ref.type == TableReferenceType::JOIN) {
 		auto &join = ref.Cast<JoinRef>();
@@ -414,6 +419,12 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out,
 	if (!select->where_clause) {
 		return false;
 	}
+	// The aux state keeps one row per left tuple with its count; it does not deduplicate.
+	for (auto &modifier : select->modifiers) {
+		if (modifier->type == ResultModifierType::DISTINCT_MODIFIER) {
+			return false;
+		}
+	}
 	vector<ParsedExpression *> conjuncts;
 	Conjuncts(*select->where_clause, conjuncts);
 	SubqueryExpression *subquery = nullptr;
@@ -459,9 +470,8 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out,
 		// must be linear; the right columns tell its correlated references apart.
 		bool right_has_subquery = (right->where_clause && right->where_clause->HasSubquery()) ||
 		                          (!exists && right->select_list[0]->HasSubquery());
-		idx_t leaves = 0;
 		if (!right_columns_known || !select->cte_map.map.empty() || filter_has_subquery || right_has_subquery ||
-		    !IsLinearLeftInput(*select->from_table, leaves)) {
+		    !IsLinearLeftInput(*select->from_table, out.left_sources)) {
 			return false;
 		}
 		out.left_is_subquery = true;

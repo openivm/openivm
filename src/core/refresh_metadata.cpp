@@ -2310,6 +2310,7 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::SemiAnti
 	io.Str("aux_table", m.aux_table);
 	io.Enum("join_type", m.join_type, SEMI_ANTI_JOIN_TYPE_NAMES);
 	io.Str("left_table", m.left_table);
+	io.Bool("derived_left", m.derived_left, Presence::OPTIONAL);
 	io.Str("left_alias", m.left_alias);
 	io.Str("right_table", m.right_table);
 	io.Str("right_alias", m.right_alias);

@@ -419,6 +419,16 @@ static TrackedSourceInput ResolveTrackedSourceInput(RefreshMetadata &metadata, C
 	return input;
 }
 
+// Before derived_left, a subquery left input was stored as an opaque wrapper whose left-side deltas
+// refresh never read (#225).
+static void RequireMaintainableSemiAntiLeft(const RefreshMetadata::SemiAntiAuxMeta &meta, const string &view_name) {
+	if (!meta.derived_left && StringUtil::StartsWith(meta.left_table, "(")) {
+		throw InvalidInputException("Materialized view '%s' was created by an OpenIVM version that cannot maintain "
+		                            "its subquery left input; recreate the materialized view",
+		                            view_name);
+	}
+}
+
 static bool HasPendingDeltaRows(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                 const string &delta_table, const string &view_catalog_name,
                                 const string &view_schema_name) {
@@ -785,6 +795,33 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		return query;
 	};
+	// Semi/anti aux state over the current sources. A full recompute rebuilds it too: its watermarks
+	// consume the deltas a later incremental refresh would otherwise apply to the stale state.
+	auto build_semi_anti_aux = [&](const RefreshMetadata::SemiAntiAuxMeta &meta) {
+		RequireMaintainableSemiAntiLeft(meta, view_name);
+		string left_source = aux_source_table(meta.left_table);
+		if (meta.derived_left) {
+			vector<SemiAntiLeftSource> leaves;
+			for (auto &leaf : SemiAntiLeftSourceNames(meta.left_table)) {
+				leaves.push_back({aux_source_table(leaf), "", ""});
+			}
+			left_source = RenderSemiAntiLeftInput(meta.left_table, leaves);
+		}
+		return BuildSemiAntiAuxStateCreateSQL(aux_table_sql(meta.aux_table), left_source, meta.left_alias,
+		                                      aux_source_table(meta.right_table), meta.right_alias, meta.predicate,
+		                                      meta.post_filter, meta.right_filter, meta.left_cols, meta.left_exprs,
+		                                      /*replace=*/true, meta.null_aware, meta.null_aware_right_expr);
+	};
+	auto rebuild_aux_state = [&](string &source_sql) {
+		auto query = rebuild_distinct_aux(source_sql);
+		RefreshMetadata::SemiAntiAuxMeta semi_anti;
+		if (metadata.GetSemiAntiAuxMeta(view_name, semi_anti)) {
+			OPENIVM_DEBUG_PRINT("[UPSERT] Rebuilding semi/anti aux state for %s with full refresh\n",
+			                    view_name.c_str());
+			query += build_semi_anti_aux(semi_anti) + ";\n";
+		}
+		return query;
+	};
 	auto in_progress_sql = [&](bool value) {
 		return "UPDATE " + views_metadata_table + " SET refresh_in_progress = " + (value ? "true" : "false") +
 		       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
@@ -836,7 +873,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			source_sql = RenderStoredViewQueryForDialect(con, view_query_sql, vector<string>(),
 			                                             active_facts.target_dialect, view_time_travel_pins);
 		}
-		auto aux_rebuild = rebuild_distinct_aux(source_sql);
+		auto aux_rebuild = rebuild_aux_state(source_sql);
 		string ducklake_checkpoints;
 		for (auto &source : delta_sources) {
 			if (StringUtil::CIEquals(source.catalog_type, "ducklake")) {
@@ -1523,21 +1560,31 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				return ResolveTrackedSourceInput(metadata, con, view_name, table, delta_table_names, view_catalog_name,
 				                                 view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 			};
+			RequireMaintainableSemiAntiLeft(aux_meta, view_name);
 			auto right_input = resolve(aux_meta.right_table);
-			vector<string> aux_sources {aux_meta.left_table, aux_meta.right_table};
+			auto left_sources = aux_meta.derived_left ? SemiAntiLeftSourceNames(aux_meta.left_table)
+			                                          : vector<string> {aux_meta.left_table};
+			auto aux_sources = left_sources;
+			aux_sources.push_back(aux_meta.right_table);
+			ensure_aux_state(aux_meta.aux_table, RefreshMetadata::ExpectedSemiAntiAuxColumns(aux_meta), aux_sources,
+			                 [&]() { return build_semi_anti_aux(aux_meta); });
 			string left_table_sql;
 			string left_delta;
 			string left_ts;
-			if (IsDerivedSemiAntiLeft(aux_meta.left_table)) {
-				// Each leaf table of the derived left input is a tracked source with its own delta.
+			if (aux_meta.derived_left) {
+				// Each leaf of the derived left input is a tracked source with its own delta; a
+				// leaf without pending rows contributes no term.
+				bool skip_empty = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 				vector<SemiAntiLeftSource> leaves;
-				aux_sources = SemiAntiLeftSourceNames(aux_meta.left_table);
-				for (auto &leaf : aux_sources) {
+				for (auto &leaf : left_sources) {
 					auto input = resolve(leaf);
+					if (skip_empty && !HasPendingDeltaRows(metadata, con, view_name, aux_source_key(leaf),
+					                                       view_catalog_name, view_schema_name)) {
+						input.last_update.clear();
+					}
 					leaves.push_back({input.table_sql, input.delta_sql, input.last_update});
 					left_ts = left_ts.empty() ? input.last_update : left_ts;
 				}
-				aux_sources.push_back(aux_meta.right_table);
 				left_table_sql = RenderSemiAntiLeftInput(aux_meta.left_table, leaves);
 				left_delta = BuildSemiAntiLeftInputDelta(aux_meta.left_table, aux_meta.left_cols, leaves, left_ts,
 				                                         internal_catalog_prefix);
@@ -1547,16 +1594,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				left_delta = left_input.delta_sql;
 				left_ts = left_input.last_update;
 			}
-			ensure_aux_state(
-			    aux_meta.aux_table, RefreshMetadata::ExpectedSemiAntiAuxColumns(aux_meta), aux_sources, [&]() {
-				    return BuildSemiAntiAuxStateCreateSQL(
-				        aux_table_sql(aux_meta.aux_table),
-				        IsDerivedSemiAntiLeft(aux_meta.left_table) ? left_table_sql
-				                                                   : aux_source_table(aux_meta.left_table),
-				        aux_meta.left_alias, aux_source_table(aux_meta.right_table), aux_meta.right_alias,
-				        aux_meta.predicate, aux_meta.post_filter, aux_meta.right_filter, aux_meta.left_cols,
-				        aux_meta.left_exprs, /*replace=*/true, aux_meta.null_aware, aux_meta.null_aware_right_expr);
-			    });
 			if (left_ts.empty()) {
 				left_delta.clear();
 			}
@@ -1605,7 +1642,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		[[fallthrough]];
 	case RefreshType::FULL_REFRESH: {
 		string full_recompute_query = view_query_sql;
-		auto aux_rebuild = rebuild_distinct_aux(full_recompute_query);
+		auto aux_rebuild = rebuild_aux_state(full_recompute_query);
 		if (active_facts.target_dialect == SqlDialect::SPARK) {
 			full_recompute_query =
 			    RenderStoredViewQueryForDialect(con, full_recompute_query, SqlUtils::WithoutMultiplicity(column_names),

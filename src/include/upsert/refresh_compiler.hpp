@@ -178,10 +178,8 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
                                       const string &post_filter, const string &right_filter,
                                       const vector<string> &left_cols, const vector<string> &left_exprs, bool replace,
                                       bool null_aware = false, const string &null_aware_right_expr = "");
-// A derived semi/anti left input is stored as "(SELECT <left cols> FROM <inner joins of tables and
-// filtering/projecting subqueries> [WHERE ...])" (#225); a plain left input is a relation name.
-bool IsDerivedSemiAntiLeft(const string &left_table);
-// One leaf table of a derived left input, resolved for refresh. An empty last_update means no delta.
+// One leaf table of a derived semi/anti left input (SemiAntiAuxMeta::derived_left), resolved for
+// refresh. An empty last_update means it has no delta to apply.
 struct SemiAntiLeftSource {
 	string table_sql;
 	string delta_sql;
@@ -192,7 +190,7 @@ vector<string> SemiAntiLeftSourceNames(const string &left_table);
 // The derived left input reading each leaf from its resolved current table.
 string RenderSemiAntiLeftInput(const string &left_table, const vector<SemiAntiLeftSource> &sources);
 // The signed delta of a derived left input with columns left_cols, openivm_multiplicity and
-// openivm_timestamp (= last_update): the inclusion-exclusion sum over leaf subsets, as for joins.
+// openivm_timestamp (= last_update): one telescoping term per leaf with a delta.
 string BuildSemiAntiLeftInputDelta(const string &left_table, const vector<string> &left_cols,
                                    const vector<SemiAntiLeftSource> &sources, const string &last_update,
                                    const string &catalog_prefix = "");

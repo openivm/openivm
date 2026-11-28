@@ -15,6 +15,8 @@ struct SemiAntiExtract {
 	bool left_is_subquery = false;
 	string left_from;
 	string left_filter;
+	// The relations the left FROM tree reads, as written.
+	vector<string> left_sources;
 	// Left-side columns the right subquery references, as (column, expression); the extracted
 	// predicate and right filter name them as openivm_left.<column>.
 	vector<pair<string, string>> left_refs;
