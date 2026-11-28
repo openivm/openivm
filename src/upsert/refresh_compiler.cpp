@@ -9,6 +9,9 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -17,6 +20,7 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
@@ -148,6 +152,29 @@ static bool IsPositiveJoinSelect(const SelectNode &select) {
 	       !select.qualify && !select.sample && (!select.where_clause || !select.where_clause->HasSubquery());
 }
 
+// Whether every function is a consistent scalar function (no aggregate or volatile function).
+static bool AreConsistentScalarFunctions(ClientContext &context,
+                                         const vector<reference<const FunctionExpression>> &functions) {
+	if (functions.empty()) {
+		return true;
+	}
+	bool scalar = false;
+	context.RunFunctionInTransaction([&] {
+		scalar = std::all_of(functions.begin(), functions.end(), [&](const FunctionExpression &function) {
+			EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, function.GetQualifiedName());
+			auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+			if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+				return false;
+			}
+			auto &overloads = entry->Cast<ScalarFunctionCatalogEntry>().functions.functions;
+			return std::all_of(overloads.begin(), overloads.end(), [](const auto &overload) {
+				return overload->GetStability() == FunctionStability::CONSISTENT;
+			});
+		});
+	});
+	return scalar;
+}
+
 static bool CanIncludeDeletedJoinRows(ClientContext &context, const string &sql, const vector<string> &group_columns) {
 	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(sql);
@@ -193,24 +220,324 @@ static bool CanIncludeDeletedJoinRows(ClientContext &context, const string &sql,
 			    *expr, [&](const FunctionExpression &function) { functions.emplace_back(function); });
 		}
 	}
-	if (functions.empty()) {
-		return true;
+	return AreConsistentScalarFunctions(context, functions);
+}
+
+// Stands for the substituted delta occurrence while a variant is parsed.
+static constexpr const char *DELTA_PROBE = "openivm_affected_delta_probe";
+static constexpr const char *MARK_JOIN_MARKER = "__mark_join_marker";
+static constexpr const char *ANY_MARKER = "openivm_any_marker";
+
+// What a subtree reads of the substituted delta: nothing, only rows derived row by row from
+// changed rows, or values (aggregates, windows, LIMIT, null extension, set difference) that the
+// changed rows do not bound.
+enum class DeltaTaint : uint8_t { NONE, CHANGED_ROWS, DERIVED };
+
+// Delta substitution reads only a source's changed rows. Above them, a SEMI/ANTI/MARK join
+// does not filter the changed rows the way it filters the view rows:
+// - a changed right row changes the membership of the left rows it matches, so an ANTI join
+//   becomes a SEMI join, and a MARK join (NOT IN, null-aware) keeps the left rows whose marker
+//   is not FALSE, as a NULL comparison makes the marker NULL;
+// - a changed left row may have passed against the old right side, so the join is dropped.
+// The view then tests a marker taking all three values, so a row passes whatever it tests.
+// This yields a superset of the affected groups.
+class FilteringJoinAffectedRewriter {
+public:
+	explicit FilteringJoinAffectedRewriter(ClientContext &context) : context(context) {
 	}
-	bool scalar_projections = false;
-	context.RunFunctionInTransaction([&] {
-		scalar_projections = std::all_of(functions.begin(), functions.end(), [&](const FunctionExpression &function) {
-			EntryLookupInfo lookup(CatalogType::SCALAR_FUNCTION_ENTRY, function.GetQualifiedName());
-			auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
-			if (!entry || entry->type != CatalogType::SCALAR_FUNCTION_ENTRY) {
+
+	//! False when no superset of the affected groups can be derived.
+	bool Rewrite(QueryNode &node, bool root) {
+		for (auto &cte : node.cte_map.map) {
+			if (!Rewrite(*cte.second->query_node, false)) {
 				return false;
 			}
-			auto &overloads = entry->Cast<ScalarFunctionCatalogEntry>().functions.functions;
-			return std::all_of(overloads.begin(), overloads.end(), [](const auto &overload) {
-				return overload->GetStability() == FunctionStability::CONSISTENT;
-			});
+			taint[cte.first.GetIdentifierName()] = TaintOf(*cte.second->query_node);
+		}
+		if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+			auto &set_operation = node.Cast<SetOperationNode>();
+			row_local_view = row_local_view && set_operation.setop_type != SetOperationType::EXCEPT &&
+			                 set_operation.setop_type != SetOperationType::INTERSECT;
+			for (auto &child : set_operation.children) {
+				if (!Rewrite(*child, root)) {
+					return false;
+				}
+			}
+			return true;
+		}
+		if (node.type != QueryNodeType::SELECT_NODE) {
+			row_local_view = false;
+			return true;
+		}
+		auto &select = node.Cast<SelectNode>();
+		row_local_view = row_local_view && (root ? !HasSubquery(select) : IsRowLocal(select));
+		idx_t pending_before = pending_markers.size();
+		if (select.from_table && !Rewrite(select.from_table)) {
+			return false;
+		}
+		if (pending_markers.size() == pending_before) {
+			return true;
+		}
+		if (pending_markers.size() > pending_before + 1) {
+			return false;
+		}
+		bool filter = pending_markers.back();
+		pending_markers.pop_back();
+		ReplaceMarker(select.select_list);
+		ReplaceMarker(select.groups.group_expressions);
+		for (auto expression : {&select.where_clause, &select.having, &select.qualify}) {
+			if (*expression) {
+				ReplaceMarker(*expression);
+			}
+		}
+		if (filter) {
+			unique_ptr<ParsedExpression> keep = make_uniq<ComparisonExpression>(
+			    ExpressionType::COMPARE_DISTINCT_FROM, make_uniq<ColumnRefExpression>(MARK_JOIN_MARKER),
+			    ConstantExpression::Boolean(false));
+			if (select.where_clause) {
+				keep = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(select.where_clause),
+				                                        std::move(keep));
+			}
+			select.where_clause = std::move(keep);
+		}
+		return true;
+	}
+
+	bool changed = false;
+	bool has_filtering_join = false;
+	//! No outer join, subquery expression or non-row-local SELECT below the root.
+	bool row_local_view = true;
+
+private:
+	bool HasSubquery(SelectNode &select) {
+		bool found = false;
+		ForEachExpression(select, [&](ParsedExpression &expression) { found = found || expression.HasSubquery(); });
+		return found;
+	}
+
+	template <class CALLBACK>
+	static void ForEachExpression(SelectNode &select, CALLBACK &&callback) {
+		for (auto &expression : select.select_list) {
+			callback(*expression);
+		}
+		for (auto &expression : select.groups.group_expressions) {
+			callback(*expression);
+		}
+		for (auto expression : {&select.where_clause, &select.having, &select.qualify}) {
+			if (*expression) {
+				callback(**expression);
+			}
+		}
+	}
+
+	// Each output row depends on one input row only (DISTINCT and key-only GROUP BY deduplicate).
+	bool IsRowLocal(SelectNode &select) {
+		auto cached = row_local_selects.find(&select);
+		if (cached != row_local_selects.end()) {
+			return cached->second;
+		}
+		return row_local_selects[&select] = ComputeRowLocal(select);
+	}
+
+	bool ComputeRowLocal(SelectNode &select) {
+		if (select.having || select.qualify || select.sample || HasSubquery(select)) {
+			return false;
+		}
+		for (auto &modifier : select.modifiers) {
+			if (modifier->type != ResultModifierType::DISTINCT_MODIFIER &&
+			    modifier->type != ResultModifierType::ORDER_MODIFIER) {
+				return false;
+			}
+		}
+		bool window = false;
+		vector<reference<const FunctionExpression>> functions;
+		ForEachExpression(select, [&](ParsedExpression &expression) {
+			window = window || expression.IsWindow();
+			ParsedExpressionIterator::VisitExpression<FunctionExpression>(
+			    expression, [&](const FunctionExpression &function) { functions.emplace_back(function); });
 		});
-	});
-	return scalar_projections;
+		return !window && AreConsistentScalarFunctions(context, functions);
+	}
+
+	DeltaTaint TaintOf(QueryNode &node) {
+		if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+			auto &set_operation = node.Cast<SetOperationNode>();
+			auto result = DeltaTaint::NONE;
+			for (auto &child : set_operation.children) {
+				result = std::max(result, TaintOf(*child));
+			}
+			bool difference = set_operation.setop_type == SetOperationType::EXCEPT ||
+			                  set_operation.setop_type == SetOperationType::INTERSECT;
+			return result != DeltaTaint::NONE && difference ? DeltaTaint::DERIVED : result;
+		}
+		if (node.type != QueryNodeType::SELECT_NODE) {
+			return DeltaTaint::NONE;
+		}
+		auto &select = node.Cast<SelectNode>();
+		auto result = select.from_table ? TaintOf(*select.from_table) : DeltaTaint::NONE;
+		ForEachExpression(select, [&](ParsedExpression &expression) {
+			ParsedExpressionIterator::VisitExpressionClassMutable(
+			    expression, ExpressionClass::SUBQUERY, [&](ParsedExpression &subquery) {
+				    if (TaintOf(*subquery.Cast<SubqueryExpression>().Subquery()->node) != DeltaTaint::NONE) {
+					    result = DeltaTaint::DERIVED;
+				    }
+			    });
+		});
+		return result == DeltaTaint::CHANGED_ROWS && !IsRowLocal(select) ? DeltaTaint::DERIVED : result;
+	}
+
+	DeltaTaint TaintOf(TableRef &ref) {
+		switch (ref.type) {
+		case TableReferenceType::BASE_TABLE: {
+			auto &table = ref.Cast<BaseTableRef>();
+			if (!table.GetQualifiedName().Schema().GetIdentifierName().empty()) {
+				return DeltaTaint::NONE;
+			}
+			auto name = table.Table().GetIdentifierName();
+			auto entry = taint.find(name);
+			return name == DELTA_PROBE    ? DeltaTaint::CHANGED_ROWS
+			       : entry == taint.end() ? DeltaTaint::NONE
+			                              : entry->second;
+		}
+		case TableReferenceType::JOIN: {
+			auto &join = ref.Cast<JoinRef>();
+			auto left = TaintOf(*join.left);
+			auto right = TaintOf(*join.right);
+			// A change on the null-supplying side changes which rows are null-extended.
+			bool left_null_side = join.type == JoinType::RIGHT || join.type == JoinType::OUTER;
+			bool right_null_side = join.type == JoinType::LEFT || join.type == JoinType::OUTER;
+			if ((left_null_side && left != DeltaTaint::NONE) || (right_null_side && right != DeltaTaint::NONE)) {
+				return DeltaTaint::DERIVED;
+			}
+			return std::max(left, right);
+		}
+		case TableReferenceType::SUBQUERY:
+			return TaintOf(*ref.Cast<SubqueryRef>().subquery->node);
+		default:
+			return DeltaTaint::NONE;
+		}
+	}
+
+	static unique_ptr<TableRef> WithAnyMarker(unique_ptr<TableRef> input) {
+		auto values = make_uniq<ExpressionListRef>();
+		values->alias = Identifier("openivm_any_mark");
+		values->expected_names.emplace_back(ANY_MARKER);
+		for (idx_t i = 0; i < 3; i++) {
+			values->values.emplace_back();
+			values->values.back().push_back(i == 2 ? ConstantExpression::Null() : ConstantExpression::Boolean(i == 0));
+		}
+		auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+		cross->left = std::move(input);
+		cross->right = std::move(values);
+		return std::move(cross);
+	}
+
+	static void ReplaceMarker(unique_ptr<ParsedExpression> &expression) {
+		if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &column = expression->Cast<ColumnRefExpression>();
+			if (!column.IsQualified() &&
+			    StringUtil::CIEquals(column.GetColumnName().GetIdentifierName(), MARK_JOIN_MARKER)) {
+				expression = make_uniq<ColumnRefExpression>(ANY_MARKER);
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(*expression,
+		                                            [](unique_ptr<ParsedExpression> &child) { ReplaceMarker(child); });
+	}
+
+	static void ReplaceMarker(vector<unique_ptr<ParsedExpression>> &expressions) {
+		for (auto &expression : expressions) {
+			ReplaceMarker(expression);
+		}
+	}
+
+	bool Rewrite(unique_ptr<TableRef> &ref) {
+		if (ref->type == TableReferenceType::SUBQUERY) {
+			return Rewrite(*ref->Cast<SubqueryRef>().subquery->node, false);
+		}
+		if (ref->type != TableReferenceType::JOIN) {
+			return true;
+		}
+		auto &join = ref->Cast<JoinRef>();
+		if (!Rewrite(join.left) || !Rewrite(join.right)) {
+			return false;
+		}
+		row_local_view = row_local_view && join.type != JoinType::LEFT && join.type != JoinType::RIGHT &&
+		                 join.type != JoinType::OUTER;
+		bool filtering = join.ref_type == JoinRefType::REGULAR &&
+		                 (join.type == JoinType::SEMI || join.type == JoinType::ANTI || join.type == JoinType::MARK);
+		if (!filtering) {
+			return true;
+		}
+		has_filtering_join = true;
+		auto left = TaintOf(*join.left);
+		auto right = TaintOf(*join.right);
+		if (left == DeltaTaint::NONE && right == DeltaTaint::NONE) {
+			return true;
+		}
+		if ((left != DeltaTaint::NONE && right != DeltaTaint::NONE) || left == DeltaTaint::DERIVED ||
+		    right == DeltaTaint::DERIVED) {
+			return false;
+		}
+		if (right != DeltaTaint::NONE && join.type == JoinType::SEMI) {
+			return true;
+		}
+		changed = true;
+		bool mark = join.type == JoinType::MARK;
+		if (left != DeltaTaint::NONE) {
+			ref = std::move(join.left);
+		} else if (!mark) {
+			join.type = JoinType::SEMI;
+		}
+		if (mark) {
+			// A kept MARK join stays a hash join; its marker then filters the affected rows.
+			pending_markers.push_back(left == DeltaTaint::NONE);
+			ref = WithAnyMarker(std::move(ref));
+		}
+		return true;
+	}
+
+	ClientContext &context;
+	case_insensitive_map_t<DeltaTaint> taint;
+	unordered_map<const SelectNode *, bool> row_local_selects;
+	//! Per rewritten MARK join: whether the enclosing SELECT keeps only rows whose marker is not FALSE.
+	vector<bool> pending_markers;
+};
+
+struct FilteringJoinVariant {
+	bool has_filtering_join = false;
+	bool row_local_view = false;
+};
+
+// Rewrites the variant for one delta occurrence, with DELTA_PROBE still in place.
+// False when no superset can be derived, so the caller diffs the current view.
+static bool RewriteFilteringJoinsForAffectedGroups(ClientContext &context, string &variant_sql,
+                                                   FilteringJoinVariant &result) {
+	auto lower = StringUtil::Lower(variant_sql);
+	if (!StringUtil::Contains(lower, "semi join") && !StringUtil::Contains(lower, "anti join") &&
+	    !StringUtil::Contains(lower, "(type mark)")) {
+		return true;
+	}
+	auto parser = Parser::GetBuiltinParser();
+	try {
+		parser.ParseQuery(variant_sql);
+	} catch (const std::exception &) {
+		return false;
+	}
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return false;
+	}
+	FilteringJoinAffectedRewriter rewriter(context);
+	if (!rewriter.Rewrite(*parser.statements[0]->Cast<SelectStatement>().node, true)) {
+		return false;
+	}
+	result.has_filtering_join = rewriter.has_filtering_join;
+	result.row_local_view = rewriter.row_local_view;
+	if (rewriter.changed) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] Rewrote SEMI/ANTI/MARK joins over a delta for affected groups\n");
+		variant_sql = parser.statements[0]->ToString();
+	}
+	return true;
 }
 
 static string AffectedGroupFilter(const string &affected_temp, const vector<string> &group_columns) {
@@ -1544,14 +1871,31 @@ string CompileGroupRecompute(ClientContext &context, const string &view_name, co
 
 		// Replace one scan at a time, including each arm of a self-join. Source
 		// references have already been catalog-qualified, including legacy SQL.
-		auto filtered_variants =
-		    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, spec.source_sql, delta_subselect);
+		string probe = string("(SELECT * FROM ") + DELTA_PROBE + ")";
+		auto filtered_variants = SqlUtils::ReplaceEachTableReference(affected_view_query_sql, spec.source_sql, probe);
+		// Old tuples through SEMI/ANTI/MARK joins can need deleted rows of the other sources, as
+		// for inner joins; widening is sound only when every input below the root is row-local.
+		vector<bool> widen_deleted;
+		for (auto &variant : filtered_variants) {
+			FilteringJoinVariant filtering;
+			if (!RewriteFilteringJoinsForAffectedGroups(context, variant, filtering)) {
+				OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys; no affected-row "
+				                    "superset through a SEMI/ANTI/MARK join\n");
+				return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns,
+				                                         catalog_prefix, emit_cascade_delta);
+			}
+			variant = StringUtil::Replace(variant, DELTA_PROBE, delta_subselect);
+			widen_deleted.push_back(include_deleted_join_rows ||
+			                        (has_source_deletes && filtering.has_filtering_join && filtering.row_local_view &&
+			                         EstimateGroupRecomputeAffectedVariants(delta_table_specs) > 1));
+		}
 		if (filtered_variants.empty()) {
 			filtered_variants.push_back(affected_view_query_sql);
+			widen_deleted.push_back(include_deleted_join_rows);
 		}
 
 		for (idx_t occurrence = 0; occurrence < filtered_variants.size(); occurrence++) {
-			if (!affected_query_sql.empty() || include_deleted_join_rows) {
+			if (!affected_query_sql.empty() || widen_deleted[occurrence]) {
 				// A deleted join tuple can need deleted rows on several source occurrences.
 				// Current rows already contain new images; a DISTINCT ON discovery query
 				// retains its existing wider support for finding candidate winners.
@@ -1561,7 +1905,7 @@ string CompileGroupRecompute(ClientContext &context, const string &view_name, co
 						continue;
 					}
 					string candidates = "(SELECT * FROM " + source_ref + " UNION ALL SELECT * FROM " +
-					                    BuildGroupRecomputeDeltaRowsSQL(other, include_deleted_join_rows) + ")";
+					                    BuildGroupRecomputeDeltaRowsSQL(other, widen_deleted[occurrence]) + ")";
 					filtered_variants[occurrence] =
 					    SqlUtils::ReplaceTableReferences(filtered_variants[occurrence], source_ref, candidates);
 				}
