@@ -9,6 +9,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -211,6 +213,152 @@ static bool CanIncludeDeletedJoinRows(ClientContext &context, const string &sql,
 		});
 	});
 	return scalar_projections;
+}
+
+// Stands for the substituted delta occurrence while a variant is parsed.
+static constexpr const char *DELTA_PROBE = "openivm_affected_delta_probe";
+
+// Delta substitution reads only a source's changed rows. Above them, a SEMI/ANTI/MARK join
+// does not filter the changed rows the way it filters the view rows:
+// - a changed right row changes the membership of the left rows it matches, so an ANTI join
+//   becomes a SEMI join, and a MARK join (NOT IN, null-aware) becomes a SEMI join on rows whose
+//   condition is not FALSE, as a NULL comparison makes the marker NULL;
+// - a changed left row may have passed against the old right side, so a SEMI, ANTI or MARK
+//   join over it is dropped.
+// The marker of a rewritten MARK join takes all three values, so a row passes whatever the view
+// tests on it. This yields a superset of the affected groups.
+class FilteringJoinAffectedRewriter {
+public:
+	//! False when a join reads the delta on both sides.
+	bool Rewrite(QueryNode &node) {
+		for (auto &cte : node.cte_map.map) {
+			if (!Rewrite(*cte.second->query_node)) {
+				return false;
+			}
+			if (Reads(*cte.second->query_node)) {
+				tainted.insert(cte.first.GetIdentifierName());
+			}
+		}
+		if (node.type == QueryNodeType::SELECT_NODE) {
+			auto &select = node.Cast<SelectNode>();
+			return !select.from_table || Rewrite(select.from_table);
+		}
+		if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+			for (auto &child : node.Cast<SetOperationNode>().children) {
+				if (!Rewrite(*child)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	bool changed = false;
+
+private:
+	bool Reads(const QueryNode &node) const {
+		if (node.type == QueryNodeType::SELECT_NODE) {
+			auto &select = node.Cast<SelectNode>();
+			return select.from_table && Reads(*select.from_table);
+		}
+		if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+			auto &children = node.Cast<SetOperationNode>().children;
+			return std::any_of(children.begin(), children.end(), [&](const auto &child) { return Reads(*child); });
+		}
+		return false;
+	}
+
+	bool Reads(const TableRef &ref) const {
+		switch (ref.type) {
+		case TableReferenceType::BASE_TABLE: {
+			auto &table = ref.Cast<BaseTableRef>();
+			auto name = table.Table().GetIdentifierName();
+			return table.GetQualifiedName().Schema().GetIdentifierName().empty() &&
+			       (name == DELTA_PROBE || tainted.count(name));
+		}
+		case TableReferenceType::JOIN: {
+			auto &join = ref.Cast<JoinRef>();
+			return Reads(*join.left) || Reads(*join.right);
+		}
+		case TableReferenceType::SUBQUERY:
+			return Reads(*ref.Cast<SubqueryRef>().subquery->node);
+		default:
+			return false;
+		}
+	}
+
+	static unique_ptr<TableRef> WithAnyMarker(unique_ptr<TableRef> input) {
+		auto parser = Parser::GetBuiltinParser();
+		parser.ParseQuery("SELECT * FROM (VALUES (TRUE), (FALSE), (NULL)) AS openivm_any_mark(__mark_join_marker)");
+		auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+		cross->left = std::move(input);
+		cross->right = std::move(parser.statements[0]->Cast<SelectStatement>().node->Cast<SelectNode>().from_table);
+		return std::move(cross);
+	}
+
+	bool Rewrite(unique_ptr<TableRef> &ref) {
+		if (ref->type == TableReferenceType::SUBQUERY) {
+			return Rewrite(*ref->Cast<SubqueryRef>().subquery->node);
+		}
+		if (ref->type != TableReferenceType::JOIN) {
+			return true;
+		}
+		auto &join = ref->Cast<JoinRef>();
+		if (!Rewrite(join.left) || !Rewrite(join.right)) {
+			return false;
+		}
+		bool filtering = join.ref_type == JoinRefType::REGULAR &&
+		                 (join.type == JoinType::SEMI || join.type == JoinType::ANTI || join.type == JoinType::MARK);
+		bool left = Reads(*join.left);
+		bool right = Reads(*join.right);
+		if (!filtering || (!left && !right) || (right && !left && join.type == JoinType::SEMI)) {
+			return true;
+		}
+		if (left && right) {
+			return false;
+		}
+		bool mark = join.type == JoinType::MARK;
+		changed = true;
+		if (left) {
+			ref = std::move(join.left);
+		} else {
+			join.type = JoinType::SEMI;
+			if (mark) {
+				join.condition =
+				    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_DISTINCT_FROM, std::move(join.condition),
+				                                    ConstantExpression::Boolean(false));
+			}
+		}
+		if (mark) {
+			ref = WithAnyMarker(std::move(ref));
+		}
+		return true;
+	}
+
+	case_insensitive_set_t tainted;
+};
+
+// Returns the variant to evaluate for one delta occurrence, with DELTA_PROBE still in place.
+// False when no superset can be derived, so the caller diffs the current view.
+static bool RewriteFilteringJoinsForAffectedGroups(string &variant_sql) {
+	auto parser = Parser::GetBuiltinParser();
+	try {
+		parser.ParseQuery(variant_sql);
+	} catch (const std::exception &) {
+		return true;
+	}
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return true;
+	}
+	FilteringJoinAffectedRewriter rewriter;
+	if (!rewriter.Rewrite(*parser.statements[0]->Cast<SelectStatement>().node)) {
+		return false;
+	}
+	if (rewriter.changed) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] Rewrote SEMI/ANTI/MARK joins over a delta for affected groups\n");
+		variant_sql = parser.statements[0]->ToString();
+	}
+	return true;
 }
 
 static string AffectedGroupFilter(const string &affected_temp, const vector<string> &group_columns) {
@@ -1544,8 +1692,17 @@ string CompileGroupRecompute(ClientContext &context, const string &view_name, co
 
 		// Replace one scan at a time, including each arm of a self-join. Source
 		// references have already been catalog-qualified, including legacy SQL.
-		auto filtered_variants =
-		    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, spec.source_sql, delta_subselect);
+		string probe = string("(SELECT * FROM ") + DELTA_PROBE + ")";
+		auto filtered_variants = SqlUtils::ReplaceEachTableReference(affected_view_query_sql, spec.source_sql, probe);
+		for (auto &variant : filtered_variants) {
+			if (!RewriteFilteringJoinsForAffectedGroups(variant)) {
+				OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys; a SEMI/ANTI/MARK "
+				                    "join reads a delta on both sides\n");
+				return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns,
+				                                         catalog_prefix, emit_cascade_delta);
+			}
+			variant = StringUtil::Replace(variant, DELTA_PROBE, delta_subselect);
+		}
 		if (filtered_variants.empty()) {
 			filtered_variants.push_back(affected_view_query_sql);
 		}

@@ -1,0 +1,445 @@
+# name: test/sql/issue_208_grouped_anti_recompute.test
+# description: Issue #208: grouped NOT EXISTS / NOT IN (and EXISTS) views kept on GROUP_RECOMPUTE must
+# group: [sql]
+
+#   recompute the groups whose rows a subquery-table change excludes or re-includes
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE a(k1 INT, v INT);
+
+statement ok
+CREATE TABLE b(k2 INT);
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 10), (4, 20), (5, 30), (5, 30);
+
+statement ok
+INSERT INTO b VALUES (5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ne_k1 AS SELECT k1, COUNT(*) AS n, SUM(v) AS s FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY k1;
+
+statement ok
+CREATE VIEW q_ne_k1 AS SELECT k1, COUNT(*) AS n, SUM(v) AS s FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY k1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ne_mod AS SELECT k1 % 2 AS g, COUNT(*) AS n FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY k1 % 2;
+
+statement ok
+CREATE VIEW q_ne_mod AS SELECT k1 % 2 AS g, COUNT(*) AS n FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY k1 % 2;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ne_v AS SELECT v, COUNT(*) AS n FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY v;
+
+statement ok
+CREATE VIEW q_ne_v AS SELECT v, COUNT(*) AS n FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ni_k1 AS SELECT k1, COUNT(*) AS n, SUM(v) AS s FROM a WHERE k1 NOT IN (SELECT k2 FROM b) GROUP BY k1;
+
+statement ok
+CREATE VIEW q_ni_k1 AS SELECT k1, COUNT(*) AS n, SUM(v) AS s FROM a WHERE k1 NOT IN (SELECT k2 FROM b) GROUP BY k1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ni_mod AS SELECT k1 % 2 AS g, COUNT(*) AS n FROM a WHERE k1 NOT IN (SELECT k2 FROM b) GROUP BY k1 % 2;
+
+statement ok
+CREATE VIEW q_ni_mod AS SELECT k1 % 2 AS g, COUNT(*) AS n FROM a WHERE k1 NOT IN (SELECT k2 FROM b) GROUP BY k1 % 2;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ni_v AS SELECT v, COUNT(*) AS n FROM a WHERE k1 NOT IN (SELECT k2 FROM b) GROUP BY v;
+
+statement ok
+CREATE VIEW q_ni_v AS SELECT v, COUNT(*) AS n FROM a WHERE k1 NOT IN (SELECT k2 FROM b) GROUP BY v;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ex_k1 AS SELECT k1, COUNT(*) AS n FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY k1;
+
+statement ok
+CREATE VIEW q_ex_k1 AS SELECT k1, COUNT(*) AS n FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k2 = a.k1) GROUP BY k1;
+
+# Every view is maintained by scoped group-recompute, never full refresh.
+query III
+SELECT view_sql_name, type, group_recompute_affected_mode FROM openivm_views ORDER BY 1;
+----
+mv_ex_k1	6	source_delta
+mv_ne_k1	6	source_delta
+mv_ne_mod	6	source_delta
+mv_ne_v	6	source_delta
+mv_ni_k1	6	source_delta
+mv_ni_mod	6	source_delta
+mv_ni_v	6	source_delta
+
+# Issue repro: one insert into the subquery table excludes the rows of group k1 = 1.
+statement ok
+INSERT INTO b VALUES (1);
+
+# refresh after a single subquery-table insert
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+query III
+SELECT * FROM mv_ne_k1 ORDER BY ALL;
+----
+2	1	20
+3	1	10
+4	1	20
+
+
+# A delete from the subquery table re-includes the rows of k1 = 5.
+statement ok
+DELETE FROM b WHERE k2 = 5;
+
+# refresh after a subquery-table delete
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+query III
+SELECT * FROM mv_ne_k1 ORDER BY ALL;
+----
+2	1	20
+3	1	10
+4	1	20
+5	2	60
+
+
+# A NULL in the NOT IN subquery removes every group of the NOT IN views.
+statement ok
+INSERT INTO b VALUES (NULL);
+
+# refresh after inserting a NULL into the subquery table
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+query I
+SELECT COUNT(*) FROM mv_ni_k1;
+----
+0
+
+
+# Deleting that NULL brings them back.
+statement ok
+DELETE FROM b WHERE k2 IS NULL;
+
+# refresh after deleting the NULL from the subquery table
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+# A NULL left key passes NOT IN only while the subquery table is empty.
+statement ok
+INSERT INTO a VALUES (NULL, 40), (NULL, 10);
+
+statement ok
+DELETE FROM b;
+
+# refresh after emptying the subquery table with NULL left keys
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+query I
+SELECT COUNT(*) FROM mv_ni_k1 WHERE k1 IS NULL;
+----
+1
+
+
+statement ok
+INSERT INTO b VALUES (7);
+
+# refresh after the subquery table becomes non-empty
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+query I
+SELECT COUNT(*) FROM mv_ni_k1 WHERE k1 IS NULL;
+----
+0
+
+
+# Mixed batch on both tables: a left row is deleted while the subquery row that excluded it
+# is deleted, a left row is deleted while a matching subquery row is inserted, keys move
+# under UPDATE on both sides, and inserts and deletes cancel within the batch.
+statement ok
+INSERT INTO b VALUES (2), (3), (3);
+
+statement ok
+DELETE FROM a WHERE k1 = 1;
+
+statement ok
+DELETE FROM b WHERE k2 = 1;
+
+statement ok
+DELETE FROM a WHERE k1 = 4;
+
+statement ok
+INSERT INTO b VALUES (4);
+
+statement ok
+UPDATE a SET k1 = 9, v = 50 WHERE k1 = 2;
+
+statement ok
+UPDATE b SET k2 = 6 WHERE k2 = 7;
+
+statement ok
+INSERT INTO a VALUES (6, 60), (7, 70), (8, 10);
+
+statement ok
+UPDATE a SET v = 30 WHERE k1 = 7;
+
+statement ok
+DELETE FROM b WHERE k2 = 3;
+
+statement ok
+INSERT INTO b VALUES (8);
+
+statement ok
+DELETE FROM b WHERE k2 = 8;
+
+statement ok
+UPDATE b SET k2 = 5 WHERE k2 = 2;
+
+# refresh after a mixed batch on both tables
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+# Mixed batch with NULLs on both sides: a NULL enters the subquery and leaves again while
+# NULL-key left rows change and a key moves out of the subquery table.
+statement ok
+INSERT INTO b VALUES (NULL);
+
+statement ok
+INSERT INTO a VALUES (NULL, 70), (3, 70);
+
+statement ok
+DELETE FROM a WHERE k1 IS NULL AND v = 40;
+
+statement ok
+UPDATE b SET k2 = NULL WHERE k2 = 6;
+
+statement ok
+DELETE FROM b WHERE k2 IS NULL;
+
+statement ok
+UPDATE b SET k2 = 10 WHERE k2 = 5;
+
+statement ok
+UPDATE a SET k1 = NULL WHERE k1 = 9;
+
+# refresh after a mixed batch with NULLs
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+# A NULL left in the subquery table together with other changes.
+statement ok
+INSERT INTO b VALUES (NULL), (3);
+
+statement ok
+DELETE FROM a WHERE k1 = 3 AND v = 70;
+
+statement ok
+INSERT INTO a VALUES (11, 10);
+
+# refresh with a NULL left in the subquery table
+foreach view ne_k1 ne_mod ne_v ni_k1 ni_mod ni_v ex_k1
+
+statement ok
+PRAGMA refresh('mv_{view}');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_{view} EXCEPT ALL SELECT * FROM q_{view});
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_{view} EXCEPT ALL SELECT * FROM mv_{view});
+----
+0
+
+endloop
+
+query I
+SELECT COUNT(*) FROM mv_ni_k1;
+----
+0
+
+
+query III
+SELECT view_sql_name, type, group_recompute_affected_mode FROM openivm_views ORDER BY 1;
+----
+mv_ex_k1	6	source_delta
+mv_ne_k1	6	source_delta
+mv_ne_mod	6	source_delta
+mv_ne_v	6	source_delta
+mv_ni_k1	6	source_delta
+mv_ni_mod	6	source_delta
+mv_ni_v	6	source_delta
+
+# Correlated EXISTS with a non-equi predicate reads the outer table twice (outer scan and the
+# duplicate-eliminated correlation input). Deleting the only row must still repair its group.
+statement ok
+CREATE TABLE ea(id INT, k INT, v INT);
+
+statement ok
+CREATE TABLE ec(k INT, z INT);
+
+statement ok
+INSERT INTO ea VALUES (1, 1, 20), (2, 2, 20), (3, 2, 5000);
+
+statement ok
+INSERT INTO ec VALUES (1, 3000), (2, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ex_nonequi AS
+SELECT k, COUNT(*) AS n FROM ea WHERE EXISTS (SELECT 1 FROM ec WHERE ec.k = ea.k AND ec.z > ea.v) GROUP BY k;
+
+statement ok
+CREATE VIEW q_ex_nonequi AS
+SELECT k, COUNT(*) AS n FROM ea WHERE EXISTS (SELECT 1 FROM ec WHERE ec.k = ea.k AND ec.z > ea.v) GROUP BY k;
+
+query II
+SELECT type, group_recompute_affected_mode FROM openivm_views WHERE view_sql_name = 'mv_ex_nonequi';
+----
+6	source_delta
+
+statement ok
+DELETE FROM ea WHERE id = 1;
+
+statement ok
+UPDATE ec SET z = 6000 WHERE k = 2;
+
+statement ok
+DELETE FROM ea WHERE id = 2;
+
+statement ok
+PRAGMA refresh('mv_ex_nonequi');
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_ex_nonequi EXCEPT ALL SELECT * FROM q_ex_nonequi);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM q_ex_nonequi EXCEPT ALL SELECT * FROM mv_ex_nonequi);
+----
+0
+
+query II
+SELECT * FROM mv_ex_nonequi ORDER BY ALL;
+----
+2	1
