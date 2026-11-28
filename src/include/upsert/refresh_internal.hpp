@@ -67,6 +67,8 @@ string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const strin
 
 struct DeltaFastPathFlags {
 	bool insert_only = false;
+	// Set when insert-only sources can still retract view rows (a top-k evicts them); clears insert_only.
+	bool retracts_on_insert = false;
 	bool skip_agg_delete = false;
 	bool skip_proj_delete = false;
 	bool minmax_incremental = false;
@@ -207,6 +209,9 @@ string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &quer
 string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
                                const vector<string> &delta_table_names);
 string BaseTableNameFromDeltaKey(const string &delta_key);
+// A tracked delta's rows (both images) without the multiplicity and timestamp columns.
+string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                 const string &extra_predicate = "");
 string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec, bool deleted_only = false);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
@@ -221,6 +226,9 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
                            const vector<string> &delta_metadata_tables = {}, const string &data_catalog = "");
 
+// True when no active delta touches a LEFT/FULL OUTER JOIN null-extended source.
+bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
+                                const vector<string> &active_delta_table_names);
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,
                                           const string &data_table, const string &view_query_sql,

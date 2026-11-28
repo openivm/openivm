@@ -11,6 +11,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -109,9 +110,29 @@ static void CopyTableFilters(const LogicalGet &source, LogicalGet &target) {
 	}
 }
 
-static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder,
-                                          unique_ptr<LogicalOperator> delta_node, TableIndex output_table_index,
-                                          ColumnBinding mul_binding) {
+unique_ptr<Expression> MakeValueIdentityExpression(ClientContext &context, Optimizer &optimizer,
+                                                   unique_ptr<Expression> value) {
+	// Bound form of SqlUtils::ValueIdentitySQL.
+	auto type = value->GetReturnType();
+	if (type.IsFloating()) {
+		return MakeNegativeZeroExpression(context, optimizer, std::move(value));
+	}
+	// Collated bytes and the serialized value key are native DuckDB SQL; other dialects keep SQL equality.
+	if (openivm::CompileFactsContextSlot::Get(context).target_dialect != SqlDialect::DUCKDB) {
+		return nullptr;
+	}
+	if (SqlUtils::IsCollatedString(type, Settings::Get<DefaultCollationSetting>(context))) {
+		return optimizer.BindScalarFunction(Identifier("unhex"),
+		                                    optimizer.BindScalarFunction(Identifier("hex"), std::move(value)));
+	}
+	if (SqlUtils::EqualityCanHideValueIdentity(type)) {
+		return optimizer.BindScalarFunction(Identifier("openivm_internal_value_key"), std::move(value));
+	}
+	return nullptr;
+}
+
+DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
+                                   TableIndex output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
 	auto input_types = delta_node->types;
 	if (input_bindings.empty() || input_bindings.size() != input_types.size()) {
@@ -128,22 +149,15 @@ static DeltaPlanFragment CompactDeltaNode(ClientContext &context, Binder &binder
 	for (idx_t i = 0; i < base_col_count; i++) { // mull-ignore: cxx_lt_to_le
 		groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
 	}
-	// Keep representations that downstream expressions can distinguish.
+	// SQL equality merges values that projections can still tell apart: signed zeros, collated strings ('a' and 'A'
+	// under NOCASE), interval components ('1 month' and '30 days') and such values nested in composite types. Group
+	// by their identity too, so compaction never cancels a delete of one against an insert of the other.
 	Optimizer optimizer(binder, context);
-	const bool native = openivm::CompileFactsContextSlot::Get(context).target_dialect == SqlDialect::DUCKDB;
-	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
 	for (idx_t i = 0; i < base_col_count; i++) {
-		const auto &type = input_types[i];
-		if (type.IsFloating()) {
-			groups.push_back(MakeNegativeZeroExpression(context, optimizer,
-			                                            make_uniq<BoundColumnRefExpression>(type, input_bindings[i])));
-		} else if (native && SqlUtils::IsCollatedString(type, default_collation)) {
-			auto bytes =
-			    optimizer.BindScalarFunction("hex", make_uniq<BoundColumnRefExpression>(type, input_bindings[i]));
-			groups.push_back(optimizer.BindScalarFunction("unhex", std::move(bytes)));
-		} else if (native && SqlUtils::EqualityCanHideValueIdentity(type)) {
-			groups.push_back(optimizer.BindScalarFunction(
-			    "openivm_internal_value_key", make_uniq<BoundColumnRefExpression>(type, input_bindings[i])));
+		auto identity = MakeValueIdentityExpression(
+		    context, optimizer, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
+		if (identity) {
+			groups.push_back(std::move(identity));
 		}
 	}
 	auto aggregate = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(delta_node));

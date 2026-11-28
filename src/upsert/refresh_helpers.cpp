@@ -223,8 +223,8 @@ static string ResolveFullOuterDeltaSource(RefreshMetadata &metadata, const strin
 	    current_snapshot);
 }
 
-static string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
-                                        const string &extra_predicate = "") {
+string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                 const string &extra_predicate) {
 	string predicate;
 	if (!last_update.empty()) {
 		predicate = string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP";
@@ -1548,8 +1548,8 @@ static string NormalizeTableToken(string token) {
 	return StringUtil::Lower(BaseTableNameFromDeltaKey(StripOpenIVMDataPrefix(token)));
 }
 
-static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
-                                       const vector<string> &active_delta_table_names) {
+bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
+                                const vector<string> &active_delta_table_names) {
 	if (active_delta_table_names.empty()) {
 		return false;
 	}
