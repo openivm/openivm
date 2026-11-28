@@ -451,7 +451,10 @@ public:
 	struct SemiAntiAuxMeta {
 		string aux_table;
 		SemiAntiJoinType join_type = SemiAntiJoinType::SEMI;
+		// A plain relation name, or with derived_left a "(SELECT <left_cols> FROM <inner joins of
+		// tables and filtering/projecting subqueries> [WHERE ...])" whose leaf deltas refresh reads.
 		string left_table;
+		bool derived_left = false;
 		string left_alias;
 		string right_table;
 		string right_alias;
