@@ -766,8 +766,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		        EntryLookupInfo(CatalogType::VIEW_ENTRY, QualifiedName(Identifier(parts[2])), error_context),
 		        Identifier(parts[0]), Identifier(parts[1])),
 		    OnEntryNotFound::RETURN_NULL);
-		return view && view->type == CatalogType::VIEW_ENTRY &&
-		       RefreshMetadata(con).FindViewKey(parts[0], parts[1], parts[2]).empty();
+		if (!view || view->type != CatalogType::VIEW_ENTRY) {
+			return false;
+		}
+		// The view query reads a materialized view through its publication, named by the view key.
+		auto key = RefreshMetadata(con).AllocateViewKey(parts[0], parts[1], parts[2]);
+		return std::none_of(facts.source_table_info.begin(), facts.source_table_info.end(), [&](const auto &source) {
+			return StringUtil::CIEquals(PublishedSourceViewName(source.second.table_name), key);
+		});
 	};
 	if (semi_anti_extracted) {
 		auto relations =
