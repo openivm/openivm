@@ -9,8 +9,15 @@ namespace duckdb {
 struct SemiAntiExtract {
 	// The caller adds the aux table and its columns.
 	RefreshMetadata::SemiAntiAuxMeta meta;
-	// The left side is a derived table of the membership query rather than a relation.
+	// The left side is a FROM tree of inner joins and plain subqueries rather than one relation.
+	// Its expressions keep the query's own qualifiers; the caller wraps the FROM tree into
+	// meta.left_table once it knows every left column.
 	bool left_is_subquery = false;
+	string left_from;
+	string left_filter;
+	// Left-side columns the right subquery references, as (column, expression); the extracted
+	// predicate and right filter name them as openivm_left.<column>.
+	vector<pair<string, string>> left_refs;
 	string left_key_col;
 	string left_key_expr;
 	string right_key_expr;

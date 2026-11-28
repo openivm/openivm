@@ -1519,28 +1519,49 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::SEMI_ANTI_RECOMPUTE: {
 		RefreshMetadata::SemiAntiAuxMeta aux_meta;
 		if (metadata.GetSemiAntiAuxMeta(view_name, aux_meta)) {
-			ensure_aux_state(aux_meta.aux_table, RefreshMetadata::ExpectedSemiAntiAuxColumns(aux_meta),
-			                 {aux_meta.left_table, aux_meta.right_table}, [&]() {
-				                 return BuildSemiAntiAuxStateCreateSQL(
-				                     aux_table_sql(aux_meta.aux_table), aux_source_table(aux_meta.left_table),
-				                     aux_meta.left_alias, aux_source_table(aux_meta.right_table), aux_meta.right_alias,
-				                     aux_meta.predicate, aux_meta.post_filter, aux_meta.right_filter,
-				                     aux_meta.left_cols, aux_meta.left_exprs, /*replace=*/true, aux_meta.null_aware,
-				                     aux_meta.null_aware_right_expr);
-			                 });
-			auto left_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.left_table,
-			                                            delta_table_names, view_catalog_name, view_schema_name,
-			                                            attached_db_catalog_name, attached_db_schema_name);
-			auto right_input = ResolveTrackedSourceInput(metadata, con, view_name, aux_meta.right_table,
-			                                             delta_table_names, view_catalog_name, view_schema_name,
-			                                             attached_db_catalog_name, attached_db_schema_name);
-			string left_delta = left_input.delta_sql;
-			string left_ts = left_input.last_update;
+			auto resolve = [&](const string &table) {
+				return ResolveTrackedSourceInput(metadata, con, view_name, table, delta_table_names, view_catalog_name,
+				                                 view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+			};
+			auto right_input = resolve(aux_meta.right_table);
+			vector<string> aux_sources {aux_meta.left_table, aux_meta.right_table};
+			string left_table_sql;
+			string left_delta;
+			string left_ts;
+			if (IsDerivedSemiAntiLeft(aux_meta.left_table)) {
+				// Each leaf table of the derived left input is a tracked source with its own delta.
+				vector<SemiAntiLeftSource> leaves;
+				aux_sources = SemiAntiLeftSourceNames(aux_meta.left_table);
+				for (auto &leaf : aux_sources) {
+					auto input = resolve(leaf);
+					leaves.push_back({input.table_sql, input.delta_sql, input.last_update});
+					left_ts = left_ts.empty() ? input.last_update : left_ts;
+				}
+				aux_sources.push_back(aux_meta.right_table);
+				left_table_sql = RenderSemiAntiLeftInput(aux_meta.left_table, leaves);
+				left_delta = BuildSemiAntiLeftInputDelta(aux_meta.left_table, aux_meta.left_cols, leaves, left_ts,
+				                                         internal_catalog_prefix);
+			} else {
+				auto left_input = resolve(aux_meta.left_table);
+				left_table_sql = left_input.table_sql;
+				left_delta = left_input.delta_sql;
+				left_ts = left_input.last_update;
+			}
+			ensure_aux_state(
+			    aux_meta.aux_table, RefreshMetadata::ExpectedSemiAntiAuxColumns(aux_meta), aux_sources, [&]() {
+				    return BuildSemiAntiAuxStateCreateSQL(
+				        aux_table_sql(aux_meta.aux_table),
+				        IsDerivedSemiAntiLeft(aux_meta.left_table) ? left_table_sql
+				                                                   : aux_source_table(aux_meta.left_table),
+				        aux_meta.left_alias, aux_source_table(aux_meta.right_table), aux_meta.right_alias,
+				        aux_meta.predicate, aux_meta.post_filter, aux_meta.right_filter, aux_meta.left_cols,
+				        aux_meta.left_exprs, /*replace=*/true, aux_meta.null_aware, aux_meta.null_aware_right_expr);
+			    });
 			if (left_ts.empty()) {
 				left_delta.clear();
 			}
 			upsert_query = CompileSemiAntiRecompute(
-			    view_name, aux_meta.aux_table, aux_meta.join_type, left_input.table_sql, aux_meta.left_alias,
+			    view_name, aux_meta.aux_table, aux_meta.join_type, left_table_sql, aux_meta.left_alias,
 			    right_input.table_sql, aux_meta.right_alias, aux_meta.predicate, aux_meta.post_filter,
 			    aux_meta.right_filter, aux_meta.left_cols, aux_meta.left_exprs, aux_meta.output_cols, left_delta,
 			    right_input.delta_sql, left_ts, right_input.last_update, internal_catalog_prefix, aux_meta.null_aware,

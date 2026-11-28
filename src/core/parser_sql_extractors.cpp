@@ -133,6 +133,36 @@ static string RenameQualifier(ParsedExpression &expression, const string &table,
 	return copy->ToString();
 }
 
+// A left input whose delta is the inclusion-exclusion sum over its leaf tables: inner joins
+// of base tables and of SELECTs that only filter and project, without subqueries. Refresh
+// unions one term per subset of the leaves, so their number is capped as for joins.
+static bool IsLinearLeftInput(const TableRef &ref, idx_t &leaves) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		auto &base = ref.Cast<BaseTableRef>();
+		return !base.at_clause && base.column_name_alias.empty() && ++leaves <= openivm::MAX_JOIN_TABLES;
+	}
+	if (ref.type == TableReferenceType::JOIN) {
+		auto &join = ref.Cast<JoinRef>();
+		return join.type == JoinType::INNER &&
+		       (join.ref_type == JoinRefType::REGULAR || join.ref_type == JoinRefType::CROSS) &&
+		       (!join.condition || !join.condition->HasSubquery()) && IsLinearLeftInput(*join.left, leaves) &&
+		       IsLinearLeftInput(*join.right, leaves);
+	}
+	if (ref.type != TableReferenceType::SUBQUERY) {
+		return false;
+	}
+	auto select = AsSelect(*ref.Cast<SubqueryRef>().subquery->node);
+	if (!select || !select->cte_map.map.empty() || !select->modifiers.empty() ||
+	    !select->groups.group_expressions.empty() || select->having || select->qualify || select->sample ||
+	    (select->where_clause && select->where_clause->HasSubquery()) ||
+	    !IsLinearLeftInput(*select->from_table, leaves)) {
+		return false;
+	}
+	return std::none_of(select->select_list.begin(), select->select_list.end(), [](const auto &expression) {
+		return expression->HasSubquery() || expression->IsWindow() || expression->IsAggregate();
+	});
+}
+
 } // namespace
 
 bool ExtractInnerDistinct(const string &sql, vector<string> &out_cols) {
@@ -388,11 +418,13 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out,
 	Conjuncts(*select->where_clause, conjuncts);
 	SubqueryExpression *subquery = nullptr;
 	bool anti = false;
+	bool filter_has_subquery = false;
 	vector<string> filters;
 	for (auto expression : conjuncts) {
 		bool negated = expression->GetExpressionType() == ExpressionType::OPERATOR_NOT;
 		auto candidate = negated ? expression->Cast<OperatorExpression>().GetChildren()[0].get() : expression;
 		if (candidate->GetExpressionClass() != ExpressionClass::SUBQUERY) {
+			filter_has_subquery = filter_has_subquery || expression->HasSubquery();
 			filters.push_back("(" + expression->ToString() + ")");
 			continue;
 		}
@@ -411,62 +443,104 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out,
 	if (!right || !ReadSource(*right->from_table, meta.right_table, meta.right_alias)) {
 		return false;
 	}
+	bool exists = subquery->GetSubqueryType() == SubqueryType::EXISTS;
+	if (!exists && (!subquery->GetChild() || right->select_list.size() != 1)) {
+		return false;
+	}
 	meta.join_type = anti ? SemiAntiJoinType::ANTI : SemiAntiJoinType::SEMI;
 	meta.post_filter = StringUtil::Join(filters, " AND ");
+	auto &right_name = right->from_table->Cast<BaseTableRef>().Table();
+	// A CTE named like the subquery table is not that catalog table; its columns are unknown here.
+	bool right_columns_known =
+	    table_columns && !select->cte_map.map.contains(right_name) && !right->cte_map.map.contains(right_name);
 	bool simple_left = ReadSource(*select->from_table, meta.left_table, meta.left_alias);
-	if (subquery->GetSubqueryType() == SubqueryType::EXISTS) {
-		if (!simple_left) {
+	if (!simple_left) {
+		// Refresh substitutes deltas into the leaf tables of a derived left input (#225), so it
+		// must be linear; the right columns tell its correlated references apart.
+		bool right_has_subquery = (right->where_clause && right->where_clause->HasSubquery()) ||
+		                          (!exists && right->select_list[0]->HasSubquery());
+		idx_t leaves = 0;
+		if (!right_columns_known || !select->cte_map.map.empty() || filter_has_subquery || right_has_subquery ||
+		    !IsLinearLeftInput(*select->from_table, leaves)) {
 			return false;
+		}
+		out.left_is_subquery = true;
+		out.left_from = select->from_table->ToString();
+		out.left_filter = meta.post_filter;
+		meta.post_filter.clear();
+		meta.left_table.clear();
+		meta.left_alias = "openivm_left";
+		if (out.output_exprs.empty()) {
+			for (auto &name : table_columns(out.left_from)) {
+				if (std::any_of(meta.output_cols.begin(), meta.output_cols.end(),
+				                [&](const string &col) { return StringUtil::CIEquals(col, name); })) {
+					return false;
+				}
+				meta.output_cols.push_back(name);
+				out.output_exprs.push_back(SqlUtils::QuoteIdentifier(name));
+				out.output_refs.push_back({name});
+			}
+		}
+	}
+	auto original_right_alias = meta.right_alias;
+	// A bare subquery column binds to the right table when it has that column and is
+	// correlated otherwise; qualify it so the extracted predicate is not ambiguous. A
+	// derived left input exposes only its left columns, so its references become those.
+	auto right_columns = right_columns_known ? table_columns(meta.right_table) : vector<string>();
+	case_insensitive_set_t right_names(right_columns.begin(), right_columns.end());
+	std::function<void(ParsedExpression &, const case_insensitive_set_t &)> qualify;
+	qualify = [&](ParsedExpression &expression, const case_insensitive_set_t &lambda_params) {
+		if (expression.GetExpressionClass() == ExpressionClass::LAMBDA) {
+			// Lambda parameters shadow columns inside the lambda body.
+			string error;
+			auto &lambda = expression.Cast<LambdaExpression>();
+			auto params = lambda.ExtractColumnRefExpressions(error);
+			if (error.empty()) {
+				auto inner = lambda_params;
+				for (auto &param : params) {
+					inner.insert(param.get().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+				}
+				return qualify(*lambda.RightMutable(), inner);
+			}
+		} else if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &column = expression.Cast<ColumnRefExpression>();
+			auto &names = column.ColumnNames();
+			auto name = column.GetColumnName().GetIdentifierName();
+			if (names.size() == 1 && lambda_params.count(name)) {
+				return;
+			}
+			bool right_owned = names.size() == 1 ? right_names.count(name) > 0
+			                                     : StringUtil::CIEquals(names[names.size() - 2].GetIdentifierName(),
+			                                                            original_right_alias);
+			if (right_owned || simple_left) {
+				if (names.size() == 1) {
+					column.ColumnNamesMutable() = {Identifier(right_owned ? original_right_alias : meta.left_alias),
+					                               column.GetColumnName()};
+				}
+				return;
+			}
+			auto source = column.ToString();
+			auto ref = std::find_if(out.left_refs.begin(), out.left_refs.end(),
+			                        [&](const pair<string, string> &entry) { return entry.second == source; });
+			if (ref == out.left_refs.end()) {
+				out.left_refs.emplace_back("openivm_saj_ref_" + std::to_string(out.left_refs.size()), source);
+				ref = out.left_refs.end() - 1;
+			}
+			column.ColumnNamesMutable() = {Identifier(meta.left_alias), Identifier(ref->first)};
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expression,
+		                                            [&](ParsedExpression &child) { qualify(child, lambda_params); });
+	};
+	if (exists) {
+		if (!simple_left && right->where_clause) {
+			qualify(*right->where_clause, {});
 		}
 		meta.predicate = right->where_clause ? right->where_clause->ToString() : "true";
 		return true;
 	}
-	if (!subquery->GetChild() || right->select_list.size() != 1) {
-		return false;
-	}
-	if (!simple_left) {
-		auto left = select->Copy();
-		left->Cast<SelectNode>().where_clause.reset();
-		left->modifiers.clear();
-		meta.left_table = "(" + left->ToString() + ")";
-		meta.left_alias = "openivm_left";
-		out.left_is_subquery = true;
-	}
-	auto original_right_alias = meta.right_alias;
 	meta.right_alias = "openivm_right";
-	auto &right_name = right->from_table->Cast<BaseTableRef>().Table();
-	// A CTE named like the subquery table is not that catalog table; its columns are unknown here.
-	if (table_columns && !select->cte_map.map.contains(right_name) && !right->cte_map.map.contains(right_name)) {
-		// A bare subquery column binds to the right table when it has that column and is
-		// correlated otherwise; qualify it so the extracted predicate is not ambiguous.
-		auto right_columns = table_columns(meta.right_table);
-		case_insensitive_set_t right_names(right_columns.begin(), right_columns.end());
-		std::function<void(ParsedExpression &, const case_insensitive_set_t &)> qualify;
-		qualify = [&](ParsedExpression &expression, const case_insensitive_set_t &lambda_params) {
-			if (expression.GetExpressionClass() == ExpressionClass::LAMBDA) {
-				// Lambda parameters shadow columns inside the lambda body.
-				string error;
-				auto &lambda = expression.Cast<LambdaExpression>();
-				auto params = lambda.ExtractColumnRefExpressions(error);
-				if (error.empty()) {
-					auto inner = lambda_params;
-					for (auto &param : params) {
-						inner.insert(param.get().Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
-					}
-					return qualify(*lambda.RightMutable(), inner);
-				}
-			} else if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-				auto &column = expression.Cast<ColumnRefExpression>();
-				auto name = column.GetColumnName().GetIdentifierName();
-				if (column.ColumnNames().size() == 1 && !lambda_params.count(name)) {
-					auto &owner = right_names.count(name) ? original_right_alias : meta.left_alias;
-					column.ColumnNamesMutable() = {Identifier(owner), column.GetColumnName()};
-				}
-				return;
-			}
-			ParsedExpressionIterator::EnumerateChildren(
-			    expression, [&](ParsedExpression &child) { qualify(child, lambda_params); });
-		};
+	if (right_columns_known) {
 		qualify(*right->select_list[0], {});
 		if (right->where_clause) {
 			qualify(*right->where_clause, {});
@@ -475,8 +549,7 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out,
 	out.left_key_col = "openivm_saj_key";
 	out.left_key_expr = simple_left
 	                        ? RenameQualifier(*subquery->GetChild(), meta.left_table, meta.left_alias, meta.left_alias)
-	                        : SqlUtils::QuoteIdentifier(meta.left_alias) + "." +
-	                              SqlUtils::QuoteIdentifier(subquery->GetChild()->GetName());
+	                        : subquery->GetChild()->ToString();
 	out.right_key_expr =
 	    RenameQualifier(*right->select_list[0], meta.right_table, original_right_alias, meta.right_alias);
 	meta.predicate = out.left_key_expr + " = " + out.right_key_expr;
