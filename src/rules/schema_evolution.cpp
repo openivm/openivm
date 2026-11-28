@@ -514,10 +514,10 @@ static bool RewriteLineageMeta(Connection &con, RefreshMetadata &metadata, const
                                const string &table_name, const string &old_name, const string &new_name) {
 	vector<string> entries;
 	bool changed = false;
-	vector<RefreshMetadata::WindowPartitionLineageOp> window_ops;
-	if (metadata.GetWindowPartitionLineage(view_name, window_ops)) {
-		changed |= RewriteWindowLineageFields(window_ops, table_name, old_name, new_name);
-		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(window_ops));
+	RefreshMetadata::WindowPartitionLineage window_lineage;
+	if (metadata.GetWindowPartitionLineage(view_name, window_lineage)) {
+		changed |= RewriteWindowLineageFields(window_lineage.ops, table_name, old_name, new_name);
+		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(window_lineage));
 	}
 	RefreshMetadata::ProjectionKeyLineage projection;
 	if (metadata.GetProjectionKeyLineage(view_name, projection)) {
@@ -533,28 +533,26 @@ static bool RewriteLineageMeta(Connection &con, RefreshMetadata &metadata, const
 
 static bool RewriteWindowGroupColumnSources(Connection &con, RefreshMetadata &metadata, const string &view_name,
                                             const string &old_name, const string &new_name) {
-	auto group_columns = metadata.GetGroupColumns(view_name);
+	optional<bool> requires_result_diff;
+	auto group_columns = metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
 	if (group_columns.empty()) {
 		return false;
 	}
 	vector<string> rewritten;
 	bool changed = false;
 	for (auto &token : group_columns) {
-		auto pos = token.find('=');
-		if (pos != string::npos) {
-			string lhs = token.substr(0, pos);
-			string rhs = token.substr(pos + 1);
-			if (StringUtil::CIEquals(rhs, old_name)) {
-				rhs = new_name;
-				changed = true;
-			}
-			rewritten.push_back(lhs + "=" + rhs);
+		auto spec = RefreshMetadata::ParseWindowColumn(token);
+		if (StringUtil::CIEquals(spec.second, old_name)) {
+			changed = true;
+			bool tagged = RefreshMetadata::IsTaggedWindowColumn(token) || spec.second.find('=') != string::npos;
+			rewritten.push_back(RefreshMetadata::SerializeWindowColumn(spec.first, new_name, tagged));
 		} else {
 			rewritten.push_back(token);
 		}
 	}
 	if (changed) {
-		UpdateViewMetadataValue(con, view_name, "group_columns", RefreshMetadata::SerializeViewList(rewritten));
+		UpdateViewMetadataValue(con, view_name, "group_columns",
+		                        RefreshMetadata::SerializeWindowColumns(rewritten, requires_result_diff));
 	}
 	return changed;
 }
@@ -578,9 +576,9 @@ static bool AuxMetadataReferencesColumn(RefreshMetadata &metadata, const string 
 	    RewriteSemiAntiAuxMetaFields(semi, table_name, col_name, col_name, /*include_stable_left_predicate=*/true)) {
 		return true;
 	}
-	vector<RefreshMetadata::WindowPartitionLineageOp> window_ops;
-	if (metadata.GetWindowPartitionLineage(view_name, window_ops) &&
-	    RewriteWindowLineageFields(window_ops, table_name, col_name, col_name)) {
+	RefreshMetadata::WindowPartitionLineage window_lineage;
+	if (metadata.GetWindowPartitionLineage(view_name, window_lineage) &&
+	    RewriteWindowLineageFields(window_lineage.ops, table_name, col_name, col_name)) {
 		return true;
 	}
 	RefreshMetadata::ProjectionKeyLineage projection;
@@ -717,7 +715,9 @@ void RewriteDependentViewMetadataForRename(ClientContext &context, Connection &c
 			                       /*persist=*/true);
 			RewriteAuxMetas(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteLineageMeta(con, metadata, view.name, qualified_source, old_name, new_name);
-			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
+			if (metadata.GetViewType(view.name) == RefreshType::WINDOW_PARTITION) {
+				RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
+			}
 		}
 		auto after = SqlUtils::QueryOrThrow(con, "SELECT * FROM openivm_views ORDER BY view_name",
 		                                    "Cannot read materialized view rename metadata: %s");

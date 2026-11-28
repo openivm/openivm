@@ -55,6 +55,8 @@ private:
 	// One column of a view's openivm_delta_tables row for `table_name`; NULL when missing.
 	Value ReadDeltaValue(const string &view_name, const string &table_name, const string &column);
 	vector<string> ReadViewList(const string &view_name, const string &column);
+	vector<string> ReadWindowColumns(const string &view_name, const string &column,
+	                                 optional<bool> *requires_result_diff = nullptr);
 
 public:
 	explicit RefreshMetadata(Connection &con, optional_ptr<ClientContext> snapshot_context = nullptr)
@@ -307,6 +309,13 @@ public:
 	static string SerializeViewList(const vector<string> &values);
 	vector<string> GetGroupColumns(const string &view_name);
 
+	// Window partition and order specs map a stored output column to its source column.
+	static string SerializeWindowColumn(const string &output, const string &source, bool tagged = false);
+	static bool IsTaggedWindowColumn(const string &spec);
+	static pair<string, string> ParseWindowColumn(const string &spec);
+	static string SerializeWindowColumns(const vector<string> &columns, optional<bool> requires_result_diff = {});
+	vector<string> GetWindowPartitionColumns(const string &view_name, optional<bool> *requires_result_diff = nullptr);
+
 	// Get common window ORDER BY output/source mappings. Empty means the view
 	// predates this metadata or its window specifications do not share a simple key.
 	vector<string> GetWindowOrderColumns(const string &view_name);
@@ -488,8 +497,18 @@ public:
 		bool null_safe = false;
 	};
 
-	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
-	static string WindowPartitionLineageToJson(const vector<WindowPartitionLineageOp> &ops);
+	struct WindowPartitionLineage {
+		vector<WindowPartitionLineageOp> ops;
+		// Absent in older databases. An empty proof covers no output columns.
+		optional<vector<string>> proven_columns;
+		vector<string> coalesce_columns;
+		string coalesce_preserved_source;
+
+		bool IsProven(const string &column) const;
+	};
+
+	bool GetWindowPartitionLineage(const string &view_name, WindowPartitionLineage &out);
+	static string WindowPartitionLineageToJson(const WindowPartitionLineage &lineage);
 
 	struct ProjectionKeyLineageStep {
 		string table;

@@ -7234,6 +7234,37 @@ SELECT signbit(k), c, neg FROM fzr_down WHERE k = 0;
 ----
 true	2	true
 
+# Explicit binary aggregate keys remain separate under a nocase session.
+statement ok
+SET SESSION default_collation = 'nocase';
+CREATE TABLE binary_group_refresh_rows (id INT, k VARCHAR, v INT);
+INSERT INTO binary_group_refresh_rows VALUES (1,'A',10),(2,'B',20);
+CREATE VIEW binary_group_refresh_expected AS
+    SELECT k COLLATE "binary" AS k,sum(v) AS total
+    FROM binary_group_refresh_rows GROUP BY k COLLATE "binary";
+CREATE MATERIALIZED VIEW binary_group_refresh_mv AS SELECT * FROM binary_group_refresh_expected;
+
+statement ok
+DELETE FROM binary_group_refresh_rows WHERE id=1;
+INSERT INTO binary_group_refresh_rows VALUES (1,'A',11),(3,'a',12),(4,'b',41),(5,'x',5);
+UPDATE binary_group_refresh_rows SET v=13 WHERE id=3;
+DELETE FROM binary_group_refresh_rows WHERE id=5;
+
+statement ok
+PRAGMA refresh('binary_group_refresh_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT hex(k),total FROM binary_group_refresh_mv EXCEPT ALL SELECT hex(k),total FROM binary_group_refresh_expected)
+    UNION ALL
+    (SELECT hex(k),total FROM binary_group_refresh_expected EXCEPT ALL SELECT hex(k),total FROM binary_group_refresh_mv)
+);
+----
+0
+
+statement ok
+SET SESSION default_collation = '';
+
 # Preserve named and nested struct fields when HAVING is extracted.
 statement ok
 SET disabled_optimizers='expression_rewriter,common_subexpressions';

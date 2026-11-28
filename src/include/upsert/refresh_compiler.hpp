@@ -81,11 +81,12 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
                                const vector<LogicalType> &column_types = {},
                                const DerivedAggregateOutputInfo &derived_outputs = {},
                                const DerivedAggregateOutputRenderer &render_derived_output = {});
-string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const vector<LogicalType> &column_types, const string &delta_ts_filter = "",
-                                 const string &catalog_prefix = "", bool insert_only = false,
-                                 string *appended_rows = nullptr);
-string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
+string CompileProjectionsFilters(ClientContext &context, SqlDialect dialect, const string &view_name,
+                                 const vector<string> &column_names, const vector<LogicalType> &column_types,
+                                 const string &delta_ts_filter = "", const string &catalog_prefix = "",
+                                 bool insert_only = false, string *appended_rows = nullptr);
+string CompileProjectionDelta(ClientContext &context, SqlDialect dialect, const string &data_table,
+                              const string &delta_view, const vector<string> &column_names,
                               const vector<LogicalType> &column_types, const string &delta_ts_filter = "",
                               bool insert_only = false, string *appended_rows = nullptr);
 vector<string> PartitionOutputColumns(const vector<string> &partition_columns);
@@ -95,7 +96,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
                               const vector<string> &column_names = {}, bool running_window_incremental = false,
-                              bool *uses_running_suffix = nullptr, bool use_data_modifying_ctes = true);
+                              bool *uses_running_suffix = nullptr, bool use_data_modifying_ctes = true,
+                              bool isolate_affected_table = false);
 /// Full recompute, optionally emitting new_bag - old_bag into the view's delta table.
 /// Unscopable group/window refreshes must preserve the requested cascade delta for downstream MVs.
 /// Supply the data table's unique keys to avoid deleting and reinserting surviving indexed keys.

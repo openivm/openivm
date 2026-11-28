@@ -6,6 +6,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
@@ -124,7 +125,7 @@ bool PublishedDeltaHasConsumers(Connection &con, const string &view_name, const 
 	return probe->Collection().GetValue(0, 0).GetValue<bool>();
 }
 
-string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
+string BuildPublishViewSQL(ClientContext &context, const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, const vector<LogicalType> &column_types, bool ducklake,
                            const string &metadata_table, const vector<string> &scope_columns,
                            const string &timestamp_sql, SqlDialect dialect, const string &appended_rows,
@@ -198,18 +199,17 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	string create = dialect == SqlDialect::SPARK ? "CREATE TABLE " : "CREATE TEMP TABLE ";
 	string sql = create + next + " AS " + scoped_query + ";\n";
 	auto weight = quote("openivm_publish_weight");
-	// SQL equality merges signed zeros. Keep their sign-only retractions and
-	// insertions so downstream expressions observe the newly published value.
+	// Keep retractions and insertions for representations that SQL equality merges.
 	D_ASSERT(columns.size() == column_types.size());
 	string group_list = column_list;
-	idx_t zero_sign_keys = 0;
+	auto default_collation = Settings::Get<DefaultCollationSetting>(context);
 	for (idx_t index = 0; index < columns.size(); index++) {
-		if (column_types[index].IsFloating()) {
-			group_list += ", " + SqlUtils::NegativeZeroSQL(quoted_columns[index], dialect);
-			zero_sign_keys++;
+		auto identity =
+		    SqlUtils::ValueIdentitySQL(quoted_columns[index], column_types[index], dialect, default_collation);
+		if (!identity.empty()) {
+			group_list += ", " + identity;
 		}
 	}
-	OPENIVM_DEBUG_PRINT("[PUBLISH] Retained %zu zero-sign grouping keys for %s\n", zero_sign_keys, view_name.c_str());
 	sql += create + changes + " AS SELECT " + column_list + ", SUM(" + weight + ") AS " + weight +
 	       " FROM (SELECT *, CAST(-1 AS BIGINT) AS " + weight + " FROM (" + old_query +
 	       ") old_rows UNION ALL SELECT *, CAST(1 AS BIGINT) FROM " + next + ") signed_rows GROUP BY " + group_list +

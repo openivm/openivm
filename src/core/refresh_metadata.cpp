@@ -1843,6 +1843,7 @@ bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_p
 }
 
 static constexpr char VIEW_LIST_JSON_PREFIX[] = "json:";
+static constexpr char WINDOW_COLUMN_LIST_PREFIX[] = "json:{\"window_columns\":";
 
 string RefreshMetadata::SerializeViewList(const vector<string> &values) {
 	// Keep the original spelling of ordinary lists for readers of openivm_views.
@@ -1855,8 +1856,7 @@ string RefreshMetadata::SerializeViewList(const vector<string> &values) {
 	return StringUtil::Join(values, ",");
 }
 
-vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
-	auto text = ReadViewString(view_name, column);
+static vector<string> DecodeViewList(const string &text) {
 	if (StringUtil::StartsWith(text, VIEW_LIST_JSON_PREFIX)) {
 		return SqlUtils::ParseColumnList(text.substr(sizeof(VIEW_LIST_JSON_PREFIX) - 1));
 	}
@@ -1871,12 +1871,95 @@ vector<string> RefreshMetadata::ReadViewList(const string &view_name, const stri
 	return values;
 }
 
+vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
+	return DecodeViewList(ReadViewString(view_name, column));
+}
+
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
-	return ReadViewList(view_name, "group_columns");
+	auto text = ReadViewString(view_name, "group_columns");
+	// A window view stores partition mappings here, which are not GROUP BY keys.
+	return StringUtil::StartsWith(text, WINDOW_COLUMN_LIST_PREFIX) ? vector<string>() : DecodeViewList(text);
+}
+
+string RefreshMetadata::SerializeWindowColumn(const string &output, const string &source, bool tagged) {
+	if (tagged || output.find('=') != string::npos || IsTaggedWindowColumn(output)) {
+		return VIEW_LIST_JSON_PREFIX + SqlUtils::JsonArray({output, source});
+	}
+	return output + "=" + source;
+}
+
+bool RefreshMetadata::IsTaggedWindowColumn(const string &spec) {
+	return StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX);
+}
+
+static pair<string, string> ParseLegacyWindowColumn(const string &spec) {
+	auto separator = spec.find('=');
+	return separator == string::npos ? make_pair(spec, spec)
+	                                 : make_pair(spec.substr(0, separator), spec.substr(separator + 1));
+}
+
+pair<string, string> RefreshMetadata::ParseWindowColumn(const string &spec) {
+	if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
+		auto columns = SqlUtils::ParseColumnList(spec.substr(sizeof(VIEW_LIST_JSON_PREFIX) - 1));
+		if (columns.size() != 2) {
+			throw InvalidInputException("Invalid OpenIVM window column metadata: %s", spec);
+		}
+		return {std::move(columns[0]), std::move(columns[1])};
+	}
+	return ParseLegacyWindowColumn(spec);
+}
+
+string RefreshMetadata::SerializeWindowColumns(const vector<string> &columns, optional<bool> requires_result_diff) {
+	if (requires_result_diff) {
+		return WINDOW_COLUMN_LIST_PREFIX + SqlUtils::JsonArray(columns) + ",\"requires_result_diff\":\"" +
+		       (*requires_result_diff ? "true" : "false") + "\"}";
+	}
+	for (const auto &spec : columns) {
+		if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
+			// Identify the format at the list level. A legacy column name can
+			// itself have exactly the same spelling as an encoded mapping.
+			return WINDOW_COLUMN_LIST_PREFIX + SqlUtils::JsonArray(columns) + "}";
+		}
+	}
+	return SerializeViewList(columns);
+}
+
+vector<string> RefreshMetadata::ReadWindowColumns(const string &view_name, const string &column,
+                                                  optional<bool> *requires_result_diff) {
+	auto text = ReadViewString(view_name, column);
+	if (requires_result_diff) {
+		requires_result_diff->reset();
+	}
+	if (StringUtil::StartsWith(text, WINDOW_COLUMN_LIST_PREFIX)) {
+		vector<string> columns;
+		if (!MetadataJson::ExtractJsonStringArray(text, "window_columns", columns)) {
+			throw InvalidInputException("Invalid OpenIVM window column list for view '%s'", view_name);
+		}
+		if (requires_result_diff) {
+			string flag;
+			if (MetadataJson::ExtractJsonString(text, "requires_result_diff", flag)) {
+				*requires_result_diff = (flag != "false");
+			}
+		}
+		return columns;
+	}
+	auto columns = DecodeViewList(text);
+	for (auto &spec : columns) {
+		if (StringUtil::StartsWith(spec, VIEW_LIST_JSON_PREFIX)) {
+			auto legacy = ParseLegacyWindowColumn(spec);
+			spec = SerializeWindowColumn(legacy.first, legacy.second);
+		}
+	}
+	return columns;
+}
+
+vector<string> RefreshMetadata::GetWindowPartitionColumns(const string &view_name,
+                                                          optional<bool> *requires_result_diff) {
+	return ReadWindowColumns(view_name, "group_columns", requires_result_diff);
 }
 
 vector<string> RefreshMetadata::GetWindowOrderColumns(const string &view_name) {
-	return ReadViewList(view_name, "window_order_columns");
+	return ReadWindowColumns(view_name, "window_order_columns");
 }
 
 vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {
@@ -2361,6 +2444,14 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::Projecti
 }
 
 template <class IO>
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::ProjectionKeyLineageStep> &m) {
+	io.Str("table", m.table);
+	io.Index("occ", m.occurrence);
+	io.Str("lookup_col", m.lookup_col);
+	io.Str("lookup_out", m.lookup_out);
+}
+
+template <class IO>
 static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoinKeySource> &m) {
 	io.Tag("k", "left_join_key_source");
 	io.Str("table", m.table);
@@ -2536,22 +2627,51 @@ bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMet
 	return MetadataJson::Read(ReadViewString(view_name, "semi_anti_aux_meta_json"), out);
 }
 
-bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
-	out.clear();
-	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "window_partition");
-	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "ops")) {
-		WindowPartitionLineageOp op;
-		if (MetadataJson::Read(object, op)) {
-			out.push_back(std::move(op));
-		}
-	}
-	return !out.empty();
+bool RefreshMetadata::WindowPartitionLineage::IsProven(const string &column) const {
+	return proven_columns && std::any_of(proven_columns->begin(), proven_columns->end(),
+	                                     [&](const string &proven) { return StringUtil::CIEquals(column, proven); });
 }
 
-string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitionLineageOp> &ops) {
+bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, WindowPartitionLineage &out) {
+	out = WindowPartitionLineage();
+	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "window_partition");
+	if (MetadataJson::FindValue(json, "proven_columns") != string::npos) {
+		out.proven_columns.emplace();
+		if (!MetadataJson::ExtractJsonStringArray(json, "proven_columns", *out.proven_columns)) {
+			out.proven_columns->clear();
+		}
+	}
+	if (!MetadataJson::ExtractJsonStringArray(json, "coalesce_columns", out.coalesce_columns)) {
+		out.coalesce_columns.clear();
+	}
+	MetadataJson::ExtractJsonString(json, "coalesce_preserved_source", out.coalesce_preserved_source);
+	bool complete;
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "ops", complete);
+	if (!complete) {
+		return false;
+	}
+	for (auto &object : objects) {
+		WindowPartitionLineageOp op;
+		if (!MetadataJson::Read(object, op)) {
+			out.ops.clear();
+			return false;
+		}
+		out.ops.push_back(std::move(op));
+	}
+	return !out.ops.empty();
+}
+
+string RefreshMetadata::WindowPartitionLineageToJson(const WindowPartitionLineage &lineage) {
 	MetadataJson::Writer writer;
 	writer.Tag("k", "window_partition");
-	writer.Objects("ops", WriteEach(ops));
+	writer.Objects("ops", WriteEach(lineage.ops));
+	if (lineage.proven_columns) {
+		writer.Arr("proven_columns", *lineage.proven_columns);
+	}
+	if (!lineage.coalesce_columns.empty()) {
+		writer.Arr("coalesce_columns", lineage.coalesce_columns);
+		writer.Str("coalesce_preserved_source", lineage.coalesce_preserved_source);
+	}
 	return writer.Finish();
 }
 
@@ -2563,25 +2683,33 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "arms")) {
 		ProjectionKeyLineageArm arm;
 		if (!MetadataJson::Read(object, arm)) {
-			continue;
+			return false;
 		}
-		// Each step is "table|occurrence|lookup_col|lookup_out".
+		// Older arms store each step as "table|occurrence|lookup_col|lookup_out".
 		vector<string> steps;
-		MetadataJson::ExtractJsonStringArray(object, "steps", steps);
-		for (auto &step_text : steps) {
-			vector<string> parts(1);
-			for (char c : step_text) {
-				if (c == '|') {
-					parts.emplace_back();
-				} else {
-					parts.back() += c;
+		if (MetadataJson::ExtractJsonStringArray(object, "steps", steps)) {
+			for (auto &step_text : steps) {
+				auto parts = StringUtil::Split(step_text, '|');
+				ProjectionKeyLineageStep step;
+				if (parts.size() != 4 || !MetadataJson::ParseIndex(parts[1], step.occurrence)) {
+					return false;
 				}
+				step.table = std::move(parts[0]);
+				step.lookup_col = std::move(parts[2]);
+				step.lookup_out = std::move(parts[3]);
+				arm.steps.push_back(std::move(step));
 			}
-			ProjectionKeyLineageStep step;
-			if (parts.size() == 4 && MetadataJson::ParseIndex(parts[1], step.occurrence)) {
-				step.table = parts[0];
-				step.lookup_col = parts[2];
-				step.lookup_out = parts[3];
+		} else {
+			bool complete;
+			auto path = MetadataJson::ExtractJsonObjectsFromArray(object, "path", complete);
+			if (!complete || path.empty()) {
+				return false;
+			}
+			for (auto &entry : path) {
+				ProjectionKeyLineageStep step;
+				if (!MetadataJson::Read(entry, step)) {
+					return false;
+				}
 				arm.steps.push_back(std::move(step));
 			}
 		}
@@ -2595,12 +2723,19 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 	for (auto &arm : lineage.arms) {
 		MetadataJson::Writer arm_writer;
 		Fields(arm_writer, arm);
-		vector<string> steps;
-		for (auto &step : arm.steps) {
-			steps.push_back(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
-			                step.lookup_out);
+		if (std::any_of(arm.steps.begin(), arm.steps.end(), [](const ProjectionKeyLineageStep &step) {
+			    return step.table.find('|') != string::npos || step.lookup_col.find('|') != string::npos ||
+			           step.lookup_out.find('|') != string::npos;
+		    })) {
+			arm_writer.Objects("path", WriteEach(arm.steps));
+		} else {
+			vector<string> steps;
+			for (auto &step : arm.steps) {
+				steps.push_back(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
+				                step.lookup_out);
+			}
+			arm_writer.Arr("steps", steps);
 		}
-		arm_writer.Arr("steps", steps);
 		arms.push_back(arm_writer.Finish());
 	}
 	MetadataJson::Writer writer;

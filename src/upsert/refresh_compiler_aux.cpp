@@ -1,5 +1,6 @@
 #include "upsert/refresh_compiler.hpp"
 
+#include "core/compiled_sql_archive.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
@@ -25,12 +26,6 @@ static string DeltaSourceRef(const string &source, const string &catalog_prefix)
 		return source;
 	}
 	return catalog_prefix + SqlUtils::QuoteIdentifier(source);
-}
-
-static string PartitionOutputColumn(const string &input) {
-	auto pos = input.find('=');
-	// Metadata stores a column name, not a qualified SQL identifier.
-	return pos == string::npos ? input : input.substr(0, pos);
 }
 
 static string BuildAffectedTableFilter(const vector<string> &columns, const string &outer_alias,
@@ -173,7 +168,7 @@ static bool TryParseRunningWindowPlan(SelectNode &select, const vector<string> &
 	if (partition_columns.size() != 1 || !select.cte_map.map.empty()) {
 		return false;
 	}
-	plan.partition_column = PartitionOutputColumn(partition_columns[0]);
+	plan.partition_column = RefreshMetadata::ParseWindowColumn(partition_columns[0]).first;
 	for (auto &item : select.select_list) {
 		if (item->GetExpressionClass() == ExpressionClass::WINDOW) {
 			RunningWindowExpr expr;
@@ -269,7 +264,8 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 	}
 	auto window_count = output_names.size() - plan.passthrough_columns.size();
 	idx_t window_idx = 0;
-	string expected_partition = partition_columns.empty() ? "" : PartitionOutputColumn(partition_columns[0]);
+	string expected_partition =
+	    partition_columns.empty() ? "" : RefreshMetadata::ParseWindowColumn(partition_columns[0]).first;
 	string parsed_partition;
 	string parsed_order;
 	for (auto &entry : select.cte_map.map) {
@@ -810,7 +806,7 @@ vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
 	vector<string> output_columns;
 	output_columns.reserve(partition_columns.size());
 	for (auto &partition_column : partition_columns) {
-		output_columns.push_back(PartitionOutputColumn(partition_column));
+		output_columns.push_back(RefreshMetadata::ParseWindowColumn(partition_column).first);
 	}
 	return output_columns;
 }
@@ -1596,8 +1592,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const vector<string> &column_names,
-                              bool running_window_incremental, bool *uses_running_suffix,
-                              bool use_data_modifying_ctes) {
+                              bool running_window_incremental, bool *uses_running_suffix, bool use_data_modifying_ctes,
+                              bool isolate_affected_table) {
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
@@ -1621,7 +1617,14 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	}
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	string affected_temp_table;
+	if (have_affected_keys) {
+		// An explicit transaction shares the caller's temporary catalog.
+		affected_temp_table =
+		    isolate_affected_table
+		        ? SqlUtils::FullName(TEMP_CATALOG, DEFAULT_SCHEMA, "openivm_affected_" + NewCompilationId(view_name))
+		        : SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	}
 	auto output_columns = PartitionOutputColumns(partition_columns);
 
 	OPENIVM_DEBUG_PRINT(
@@ -1640,7 +1643,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
 		                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
-		                                  affected_temp_table);
+		                                  affected_temp_table, {}, "", nullptr, {}, SqlDialect::DUCKDB,
+		                                  !isolate_affected_table);
 	}
 
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
@@ -1648,7 +1652,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
 	string sql;
 	if (have_affected_keys) {
-		sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
+		sql = isolate_affected_table ? "CREATE TEMP TABLE " : "CREATE OR REPLACE TEMP TABLE ";
+		sql += affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
 	}
 	string filter = have_affected_keys ? BuildAffectedTableFilter(output_columns, "openivm_target", affected_temp_table)
 	                                   : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");

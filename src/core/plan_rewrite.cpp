@@ -56,13 +56,13 @@ static vector<unique_ptr<Expression>> OutputColumnRefs(LogicalOperator &op) {
 
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
 /// Returns whether a DISTINCT state aggregate replaced `node` itself.
-static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node) {
+static bool RewriteDistinct(Binder &binder, unique_ptr<LogicalOperator> &node, unique_ptr<LogicalOperator> &root) {
 	// A projection can drop DISTINCT keys or map them to duplicate output rows, so a child's count is
 	// internal state. DISTINCT ON picks winners by ORDER BY, not by full-row multiplicity.
 	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT ||
 	    node->Cast<LogicalDistinct>().distinct_type == DistinctType::DISTINCT_ON) {
 		for (auto &child : node->children) {
-			RewriteDistinct(context, binder, child);
+			RewriteDistinct(binder, child, root);
 		}
 		return false;
 	}
@@ -73,7 +73,7 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	if (ProducesAtMostOneRow(*node->children[0]) || IsRedundantDistinctOverGroupKeys(*node)) {
 		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over a single row or group keys\n");
 		node = std::move(node->children[0]);
-		RewriteDistinct(context, binder, node);
+		RewriteDistinct(binder, node, root);
 		return false;
 	}
 	auto &child = node->children[0];
@@ -90,8 +90,17 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	aggregates.push_back(MakeCountStar(openivm::DISTINCT_COUNT_COL));
 	auto agg_node = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(child));
 
+	// DISTINCT passed through its child's bindings. The aggregate exposes
+	// fresh group bindings, so rebind consumers without rewriting its inputs.
+	ColumnBindingReplacer replacer;
+	for (idx_t i = 0; i < agg_node->groups.size(); i++) {
+		auto binding = agg_node->groups[i]->Cast<BoundColumnRefExpression>().Binding();
+		replacer.replacement_bindings.emplace_back(binding, ColumnBinding(agg_node->group_index, ProjectionIndex(i)));
+	}
+	replacer.stop_operator = agg_node.get();
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
+	replacer.VisitOperator(*root);
 	return true;
 }
 
@@ -960,12 +969,13 @@ void VisitSpineAggregateInputs(const OutputSpine &spine, TableIndex aggregate_in
 	}
 }
 
-OutputSpine ViewOutputSpine(LogicalOperator *root) {
-	return FindOutputSpine(root, [](const LogicalOperator &op) {
+OutputSpine ViewOutputSpine(LogicalOperator *root, bool include_distinct) {
+	return FindOutputSpine(root, [include_distinct](const LogicalOperator &op) {
 		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
 		       op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE ||
 		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
-		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N ||
+		       (include_distinct && op.type == LogicalOperatorType::LOGICAL_DISTINCT);
 	});
 }
 
@@ -1268,6 +1278,15 @@ static bool IsPreservedKeyBinding(LogicalOperator &plan, const ColumnBinding &bi
 		auto &projection = plan.Cast<LogicalProjection>();
 		preserved =
 		    IsPreservedKeyExpression(*projection.children[0], *projection.expressions[binding.column_index], cache);
+	} else if (plan.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+	           binding.table_index == plan.Cast<LogicalAggregate>().group_index) {
+		auto &aggregate = plan.Cast<LogicalAggregate>();
+		// The counting rewrite for DISTINCT passes its keys through unchanged.
+		if (binding.column_index < aggregate.groups.size() && !aggregate.expressions.empty() &&
+		    aggregate.expressions[0]->GetAlias().GetIdentifierName() == openivm::DISTINCT_COUNT_COL) {
+			preserved =
+			    IsPreservedKeyExpression(*aggregate.children[0], *aggregate.groups[binding.column_index], cache);
+		}
 	} else if (plan.type == LogicalOperatorType::LOGICAL_GET) {
 		auto columns = plan.GetColumnBindings();
 		preserved = std::find(columns.begin(), columns.end(), binding) != columns.end();
@@ -1831,7 +1850,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	     &PlanRewriteNeeds::aggregate_filters},
 	    {"distinct",
 	     [](PlanRewriteContext &c) {
-		     if (RewriteDistinct(c.context, c.binder, c.plan)) {
+		     if (RewriteDistinct(c.binder, c.plan, c.plan)) {
 			     c.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 		     }
 		     InjectHiddenGroupKeys(c.plan);

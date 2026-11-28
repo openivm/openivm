@@ -744,6 +744,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	view_name = resolved.view_name;
 	// The fresh connection starts from defaults; calibration and pruning follow the caller's session.
 	PropagateRefreshPlanningSettings(context, *con.context);
+	SqlUtils::CopyDefaultCollation(context, *con.context);
 
 	RefreshMetadata metadata(con);
 	auto view_query = metadata.GetViewQuery(view_name);

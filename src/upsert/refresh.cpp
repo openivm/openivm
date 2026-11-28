@@ -262,6 +262,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
 	Connection exec_con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *exec_con.context, "TimeZone");
+	PropagateRefreshCollation(context, *exec_con.context, probe_meta, vn);
 	TransactionalMVLockState::ShareMutationOwner(context, *exec_con.context);
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;
@@ -1111,6 +1112,7 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
 	Connection con(*context.db.get());
 	SqlUtils::CopySessionSetting(context, *con.context, "TimeZone");
+	SqlUtils::CopyDefaultCollation(context, *con.context);
 	// Hooks run through this helper connection while the caller owns the
 	// database-wide mutation gate. Give tracked DML in the hook the same logical
 	// owner so delta capture re-enters the gate instead of waiting on its caller.
@@ -1185,7 +1187,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	RefreshMetadata metadata(metadata_con, &context);
 	auto sources = metadata.GetDeltaSources(view_name);
 	DeltaActivityResult conservative_activity;
-	conservative_activity.has_join = metadata.HasJoin(view_name) || sources.size() > 1;
+	conservative_activity.has_join = metadata.HasJoin(view_name);
 	conservative_activity.tables_with_changes = sources.size();
 	conservative_activity.any_has_deletes = true;
 	conservative_activity.all_ducklake = false;
@@ -1321,6 +1323,7 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		throw InvalidInputException("OpenIVM refresh received an unsupported argument list");
 	}
 	Connection metadata_con(*context.db);
+	SqlUtils::CopyDefaultCollation(context, *metadata_con.context);
 	RefreshMetadata::UseCatalog(
 	    context, metadata_con,
 	    !pipeline && parameters.values.size() >= 3

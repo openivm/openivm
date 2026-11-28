@@ -117,14 +117,15 @@ unique_ptr<Expression> MakeValueIdentityExpression(ClientContext &context, Optim
 	if (type.IsFloating()) {
 		return MakeNegativeZeroExpression(context, optimizer, std::move(value));
 	}
-	if (type.id() == LogicalTypeId::VARCHAR &&
-	    (!StringType::GetCollation(type).empty() || !Settings::Get<DefaultCollationSetting>(context).empty())) {
+	// Collated bytes and the serialized value key are native DuckDB SQL; other dialects keep SQL equality.
+	if (openivm::CompileFactsContextSlot::Get(context).target_dialect != SqlDialect::DUCKDB) {
+		return nullptr;
+	}
+	if (SqlUtils::IsCollatedString(type, Settings::Get<DefaultCollationSetting>(context))) {
 		return optimizer.BindScalarFunction(Identifier("unhex"),
 		                                    optimizer.BindScalarFunction(Identifier("hex"), std::move(value)));
 	}
-	// The serialized value key is a native DuckDB function; other dialects keep SQL equality.
-	if (SqlUtils::EqualityCanHideValueIdentity(type) &&
-	    openivm::CompileFactsContextSlot::Get(context).target_dialect == SqlDialect::DUCKDB) {
+	if (SqlUtils::EqualityCanHideValueIdentity(type)) {
 		return optimizer.BindScalarFunction(Identifier("openivm_internal_value_key"), std::move(value));
 	}
 	return nullptr;

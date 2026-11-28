@@ -169,3 +169,47 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# A pass-through child still needs both signed rows when the values compare equal.
+statement ok
+SET openivm_cascade_refresh = 'downstream';
+CREATE TABLE cw_identity_source (id INT, k INT, duration INTERVAL, reading DOUBLE);
+INSERT INTO cw_identity_source VALUES
+    (1,1,INTERVAL '1 month',1),(2,2,INTERVAL '1 day','-0.0'::DOUBLE),(3,3,INTERVAL '2 days',3);
+CREATE VIEW cw_identity_expected AS
+    SELECT id,k,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM cw_identity_source ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW cw_identity_parent AS
+    SELECT id,k,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM cw_identity_source ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW cw_identity_child AS
+    SELECT * FROM cw_identity_parent WHERE id > 0;
+
+statement ok
+DELETE FROM cw_identity_source WHERE id IN (1,2);
+INSERT INTO cw_identity_source VALUES
+    (1,1,INTERVAL '30 days',1),(2,2,INTERVAL '1 day','0.0'::DOUBLE),(4,3,INTERVAL '2 days',4);
+UPDATE cw_identity_source SET reading=5 WHERE id=4;
+DELETE FROM cw_identity_source WHERE id=4;
+
+statement ok
+PRAGMA refresh('cw_identity_parent');
+
+foreach mv cw_identity_parent cw_identity_child
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM {mv}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM cw_identity_expected)
+    UNION ALL
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM cw_identity_expected
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM {mv})
+);
+----
+0
+
+endloop

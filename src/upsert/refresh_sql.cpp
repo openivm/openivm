@@ -17,6 +17,7 @@
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/config.hpp"
@@ -248,6 +249,25 @@ void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
 	for (auto setting_name : PLANNING_SETTINGS) {
 		SqlUtils::CopySessionSetting(from, to, setting_name);
 	}
+}
+
+void PropagateRefreshCollation(ClientContext &from, ClientContext &to, RefreshMetadata &metadata,
+                               const string &view_name) {
+	// Window refreshes use the caller's collation to reconstruct changed partitions.
+	// Other refresh strategies still compile uncollated keys using the helper's default.
+	if (Settings::Get<DefaultCollationSetting>(from) == Settings::Get<DefaultCollationSetting>(to) ||
+	    metadata.GetViewType(view_name) != RefreshType::WINDOW_PARTITION) {
+		return;
+	}
+	optional<bool> requires_result_diff;
+	metadata.GetWindowPartitionColumns(view_name, &requires_result_diff);
+	if (!requires_result_diff) {
+		// Older stored window SQL was replayed with the helper's default.
+		// It may have omitted explicit binary collations during serialization.
+		OPENIVM_DEBUG_PRINT("[REFRESH] Keeping helper collation for legacy window view '%s'\n", view_name.c_str());
+		return;
+	}
+	SqlUtils::CopyDefaultCollation(from, to);
 }
 
 namespace {
@@ -566,6 +586,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		view_record = metadata.LoadView(view_name);
 	}
 	if (owned_connection) {
+		PropagateRefreshCollation(context, planning_context, metadata, view_name);
 		RefreshMetadata::RegisterPlanningView(planning_context, view_record);
 	}
 	auto delta_metadata_tables = active_facts.target_dialect == SqlDialect::DUCKDB
@@ -597,10 +618,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	const string cleanup_data_catalog = cross_system ? internal_catalog_name : string();
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
 	string data_table = internal_catalog_prefix + SqlUtils::QuoteIdentifier(data_table_bare);
+	RefreshType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Looking up delta view '%s' in catalog '%s.%s'\n",
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
 	optional_ptr<CatalogEntry> index_delta_view_catalog_entry;
+	case_insensitive_map_t<LogicalType> collated_data_types;
 	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || target_is_native) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
@@ -615,13 +638,27 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                                            error_context),
 		                            Identifier(internal_catalog_name), Identifier(internal_schema_name)),
 		    OnEntryNotFound::RETURN_NULL);
+		// Delta DDL round-trips types through DESCRIBE, which omits explicit collations.
+		// Window diffs and projection deletes compare the stored data columns.
+		if (target_is_native && active_facts.target_dialect == SqlDialect::DUCKDB &&
+		    (view_query_type == RefreshType::WINDOW_PARTITION ||
+		     (view_query_type == RefreshType::SIMPLE_PROJECTION &&
+		      Settings::Get<DefaultCollationSetting>(context).empty()))) {
+			const auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+			    planning_context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                                    Identifier(data_table_bare)));
+			for (const auto &column : entry.GetColumns().Logical()) {
+				if (SqlUtils::IsCollatedString(column.Type(), "")) {
+					collated_data_types.emplace(column.Name().GetIdentifierName(), column.Type());
+				}
+			}
+		}
 		con.Rollback();
 	}
 	auto view_query_sql = metadata.GetViewQuery(view_name);
 	if (view_query_sql.empty()) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
-	RefreshType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 	auto delta_sources = metadata.GetDeltaSources(view_name);
@@ -708,7 +745,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 		}
 		publication_sql = BuildPublishViewSQL(
-		    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
+		    context, view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
 		    target_is_ducklake, delta_metadata_table, {}, "", active_facts.target_dialect, "", "",
 		    delta_metadata_tables, publication_consumers_absent, direct_native_refresh);
 	}
@@ -985,7 +1022,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
-	auto group_cols = metadata.GetGroupColumns(view_name);
+	auto group_cols = dispatch_refresh_type == RefreshType::WINDOW_PARTITION
+	                      ? metadata.GetWindowPartitionColumns(view_name)
+	                      : metadata.GetGroupColumns(view_name);
 	RefreshPublicationScope retained_publication_scope;
 	auto publication_scope = !publication_query.empty() && !global_publication && target_is_ducklake &&
 	                                 active_facts.target_dialect == SqlDialect::DUCKDB
@@ -1038,6 +1077,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		column_names.erase(it);
 		if (offset < static_cast<decltype(offset)>(column_types.size())) {
 			column_types.erase(column_types.begin() + offset);
+		}
+	}
+	if (!collated_data_types.empty()) {
+		for (idx_t i = 0; i < column_names.size(); i++) {
+			auto match = collated_data_types.find(column_names[i]);
+			if (match != collated_data_types.end()) {
+				column_types[i] = match->second;
+			}
 		}
 	}
 	add_profile_step("generate_refresh_sql.column_metadata", column_metadata_start,
@@ -1361,15 +1408,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			refresh_plan.skip_projection_key_delta = true;
 		} else {
 			upsert_query = CompileProjectionRefresh(
-			    metadata, view_name, column_names, column_types, delta_table_names, data_table, view_query_sql,
-			    delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
-			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only, delete_retry_plan,
-			    &appended_projection_rows);
+			    context, metadata, active_facts.target_dialect, view_name, column_names, column_types,
+			    delta_table_names, data_table, view_query_sql, delta_ts_filter, internal_catalog_prefix, has_full_outer,
+			    has_left_join, skip_proj_delete, insert_only, fast_paths.active_delta_table_names,
+			    cross_system && !active_facts.compile_only, delete_retry_plan, &appended_projection_rows);
 			if (delete_retry_plan && delete_retry_plan->IsActive()) {
 				fallback_upsert_query = CompileProjectionRefresh(
-				    metadata, view_name, column_names, column_types, delta_table_names, data_table, view_query_sql,
-				    delta_ts_filter, internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete,
-				    insert_only, fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only);
+				    context, metadata, active_facts.target_dialect, view_name, column_names, column_types,
+				    delta_table_names, data_table, view_query_sql, delta_ts_filter, internal_catalog_prefix,
+				    has_full_outer, has_left_join, skip_proj_delete, insert_only, fast_paths.active_delta_table_names,
+				    cross_system && !active_facts.compile_only);
 			}
 		}
 		break;
@@ -1404,11 +1452,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		break;
 	}
 	case RefreshType::WINDOW_PARTITION: {
+		bool has_join = refresh_delta_activity ? refresh_delta_activity->has_join : metadata.HasJoin(view_name);
 		upsert_query = BuildWindowPartitionRefresh(
-		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
-		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental,
-		    &window_uses_suffix, publication_scope);
+		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, column_types, data_table,
+		    delta_ts_filter, internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
+		    attached_db_schema_name, cross_system, has_join,
+		    active_facts.compile_only ? nullptr : refresh_delta_activity, !context.transaction.IsAutoCommit(),
+		    emit_cascade_delta_for_recompute, running_window_incremental, &window_uses_suffix, publication_scope);
 		break;
 	}
 	case RefreshType::COUNT_DISTINCT_INCREMENTAL: {
@@ -1986,15 +2036,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto visible = publication_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name));
 			auto visible_delta = "(SELECT *, CAST(0 AS BIGINT) AS " + string(openivm::PUBLISHED_ORDINAL_COL) +
 			                     " FROM " + signed_publication_rows + ")";
-			publication_sql = CompileProjectionDelta(visible, visible_delta, publication_columns, publication_types,
-			                                         signed_publication_filter);
+			publication_sql = CompileProjectionDelta(context, active_facts.target_dialect, visible, visible_delta,
+			                                         publication_columns, publication_types, signed_publication_filter);
 			OPENIVM_DEBUG_PRINT("[PUBLISH] Applying exact signed row changes for %s\n", view_name.c_str());
 		} else {
 			publication_sql = BuildPublishViewSQL(
-			    view_name, publication_prefix, publication_source_query, publication_columns, publication_types,
-			    target_is_ducklake, delta_metadata_table, scope_columns, "", active_facts.target_dialect,
-			    appended_projection_rows, retained_publication_scope.rows, delta_metadata_tables,
-			    publication_consumers_absent, direct_native_refresh);
+			    context, view_name, publication_prefix, publication_source_query, publication_columns,
+			    publication_types, target_is_ducklake, delta_metadata_table, scope_columns, "",
+			    active_facts.target_dialect, appended_projection_rows, retained_publication_scope.rows,
+			    delta_metadata_tables, publication_consumers_absent, direct_native_refresh);
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}

@@ -107,6 +107,9 @@ struct CreateMVPlanFacts {
 	bool has_descendant_distinct = false;
 };
 
+void PreserveBinaryCollationsForSerialization(LogicalOperator &plan);
+string DuckLakeInitialLoadQuery(string query, const vector<string> &column_names,
+                                const vector<LogicalType> &column_types);
 void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
                                string &suffix, string &ordering);
 // Append every input column of a TOP_N, or of the ORDER BY under a LIMIT, as an ascending tie-breaker. Returns
@@ -154,24 +157,27 @@ void PopulateDistinctAggregateInputs(ClientContext &context, Binder &binder, con
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                                bool include_first_aggregate);
-void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
-                                       const vector<string> &output_names);
+void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
+                              const vector<string> &output_names, bool order);
 string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
-                                    const vector<string> &output_names,
-                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out,
+                                    const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
+vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const vector<string> &column_names);
+// Retain only keys common to all DISTINCT ON operators when a changed-key scope is proven.
+bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
+                                  const vector<string> &output_names,
+                                  const RefreshMetadata::WindowPartitionLineage &lineage);
 /// Scope a window-then-aggregate view whose ranking key is hidden to the visible
 /// GROUP BY key. Declines unless ties among ranked rows are provably immaterial.
 bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
-                                  vector<string> &partition_columns,
-                                  vector<RefreshMetadata::WindowPartitionLineageOp> &ops);
+                                  vector<string> &partition_columns, RefreshMetadata::WindowPartitionLineage &lineage);
 /// Scope a single ROW_NUMBER partition whose input is only projections, filters and UNION ALL over
 /// table scans, and whose visible key is the partition value itself. Emits one LINEAR op per source;
 /// refresh recomputes the view query over every source's delta rows to find the changed keys.
 bool BuildLinearWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                           const vector<string> &output_names,
-                                          vector<RefreshMetadata::WindowPartitionLineageOp> &out);
+                                          RefreshMetadata::WindowPartitionLineage &lineage);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
 /// A same-named source/output key for a single-source, key-local plan; empty if

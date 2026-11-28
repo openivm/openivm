@@ -34,6 +34,9 @@ public:
 	static string FloatingRepresentativeSQL(const string &value, const string &negative_count,
 	                                        const string &total_count);
 	static string ValueIdentitySQL(const string &value, const LogicalType &type, const string &default_collation = "");
+	static string ValueIdentitySQL(const string &value, const LogicalType &type, SqlDialect dialect,
+	                               const string &default_collation);
+	static bool IsCollatedString(const LogicalType &type, const string &default_collation);
 	static EntryLookupInfo QualifyLookup(const EntryLookupInfo &lookup, const Identifier &catalog,
 	                                     const Identifier &schema) {
 		return EntryLookupInfo(lookup, QualifiedName(catalog, schema, lookup.GetEntryIdentifier()));
@@ -102,6 +105,7 @@ public:
 	}
 	// Copy a registered extension setting to a helper connection without changing the database default.
 	static void CopySessionSetting(ClientContext &from, ClientContext &to, const string &name);
+	static void CopyDefaultCollation(ClientContext &from, ClientContext &to);
 	/// The connection's current_database(), or empty when it cannot be read.
 	static string CurrentDatabase(Connection &con);
 	/// The connection's current_database(), read without a statement; throws CatalogException(format, error)

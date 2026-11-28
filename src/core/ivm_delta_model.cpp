@@ -13,21 +13,17 @@ namespace duckdb {
 
 namespace {
 
-static string WindowPartitionOutputColumn(const string &partition_column) {
-	auto separator = partition_column.find('=');
-	return separator == string::npos ? partition_column : partition_column.substr(0, separator);
-}
-
 static vector<string> ProjectedWindowPartitionColumns(const vector<string> &partition_columns,
                                                       const vector<string> &output_names, bool has_top_projection) {
 	vector<string> projected;
 	for (auto &partition_column : partition_columns) {
 		// With a top projection, a key that never resolved to a raw output column is not visible under its own
 		// name: a same-named output is a transformed or re-aliased expression, not the key.
-		if (has_top_projection && partition_column.find('=') == string::npos) {
+		if (has_top_projection && partition_column.find('=') == string::npos &&
+		    !RefreshMetadata::IsTaggedWindowColumn(partition_column)) {
 			continue;
 		}
-		auto output_column = WindowPartitionOutputColumn(partition_column);
+		auto output_column = RefreshMetadata::ParseWindowColumn(partition_column).first;
 		if (!IncrementalTableNames::IsInternalColumn(output_column) && ContainsCI(output_names, output_column)) {
 			AddUniqueCI(projected, partition_column);
 		}
@@ -203,18 +199,19 @@ void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts,
 }
 
 void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
-                                   const vector<string> &output_names) {
+                                   const vector<string> &output_names, bool has_ducklake_source) {
 	const auto &analysis = facts.analysis;
 	if (model.type == RefreshType::WINDOW_PARTITION) {
 		const auto lineage_partition_columns = model.window_partition_columns;
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
 		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
-		                                                  model.window_lineage_ops, &direct_lineage_ops);
+		                                                  model.window_lineage, &direct_lineage_ops);
 		bool has_linear_lineage = false;
-		if (!has_lineage) {
+		if (!model.window_lineage.proven_columns || model.window_lineage.proven_columns->empty()) {
+			// A binding-proven linear scope replaces lineage that proves no key.
 			has_linear_lineage = BuildLinearWindowPartitionLineageOps(facts, lineage_partition_columns, output_names,
-			                                                          model.window_lineage_ops);
-			has_lineage = has_linear_lineage;
+			                                                          model.window_lineage);
+			has_lineage = has_lineage || has_linear_lineage;
 		}
 		// Linear lineage proves the visible binding even when the key is computed above a UNION ALL.
 		model.window_partition_columns = ProjectedWindowPartitionColumns(
@@ -223,17 +220,23 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 			// A visible output merely named like the partition key is not proof that it carries
 			// that key once the aggregate regroups by another column, so this builder wins.
 			vector<string> group_scope_columns;
-			vector<RefreshMetadata::WindowPartitionLineageOp> group_scope_ops;
-			if (BuildWindowGroupScopeLineage(facts, output_names, group_scope_columns, group_scope_ops)) {
+			RefreshMetadata::WindowPartitionLineage group_scope_lineage;
+			if (BuildWindowGroupScopeLineage(facts, output_names, group_scope_columns, group_scope_lineage)) {
 				model.window_partition_columns = std::move(group_scope_columns);
-				model.window_lineage_ops = std::move(group_scope_ops);
+				model.window_lineage = std::move(group_scope_lineage);
 			}
 		}
+		auto ducklake_scope = has_ducklake_source && model.window_partition_columns.size() > 1
+		                          ? DuckLakeWindowScope(model.window_partition_columns, output_names)
+		                          : vector<string>();
+		auto &refresh_scope = ducklake_scope.empty() ? model.window_partition_columns : ducklake_scope;
+		model.window_requires_result_diff =
+		    WindowPlanRequiresResultDiff(facts, refresh_scope, output_names, model.window_lineage);
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, facts) ||
-		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {
+		     !WindowLineageCoversAllSources(model.window_lineage.ops, facts))) {
 			model.type = RefreshType::FULL_REFRESH;
-			model.window_lineage_ops.clear();
+			model.window_lineage = RefreshMetadata::WindowPartitionLineage();
 		}
 		return;
 	}
@@ -250,8 +253,8 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 
 string BuildDeltaViewModelLineageJson(const DeltaViewModel &model, idx_t &entry_count) {
 	vector<string> entries;
-	if (!model.window_lineage_ops.empty()) {
-		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(model.window_lineage_ops));
+	if (!model.window_lineage.ops.empty() || model.window_lineage.proven_columns) {
+		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(model.window_lineage));
 	}
 	if (model.has_projection_lineage) {
 		entries.push_back(RefreshMetadata::ProjectionKeyLineageToJson(model.projection_lineage));

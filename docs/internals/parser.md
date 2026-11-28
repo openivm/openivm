@@ -140,8 +140,8 @@ Stores one row per materialized view.
 | `last_update` | `TIMESTAMP` | When the view was last created or replaced. |
 | `refresh_interval` | `BIGINT` | Automatic refresh interval in seconds. `NULL` = manual only. See [Automatic Refresh](../refresh/automatic-refresh.md). |
 | `refresh_in_progress` | `BOOLEAN` | Crash safety flag — `true` while a refresh is in flight. See [Automatic Refresh: Crash safety](../refresh/automatic-refresh.md#crash-safety). |
-| `group_columns` | `VARCHAR` | Comma-separated group keys, window partition keys, or source mappings used by refresh. |
-| `window_order_columns` | `VARCHAR` | Common window ORDER BY keys, when every window function shares them. |
+| `group_columns` | `VARCHAR` | GROUP BY keys, or window partition keys as `output=source` mappings. See [List encoding](#list-encoding). |
+| `window_order_columns` | `VARCHAR` | Common window ORDER BY keys as `output=source` mappings, when every window function shares them. |
 | `aggregate_types` | `VARCHAR` | Aggregate function names used by aggregate refresh compilation. |
 | `derived_aggregate_outputs_json` | `VARCHAR` | JSON metadata for outputs computed from aggregates. |
 | `group_recompute_affected_mode`, `group_recompute_source_occurrences_json` | `VARCHAR` | How `GROUP_RECOMPUTE` finds affected keys, and which source occurrences feed them. |
@@ -158,6 +158,20 @@ Stores one row per materialized view.
 | `published_query` | `VARCHAR` | Query that produces the visible rows published to `openivm_visible_<internal_key>`. |
 | `pending_after_hook` | `BOOLEAN` | Set while a committed refresh still has to deliver its `after` [refresh hook](../refresh_hooks.md). |
 | `signature_hash`, `canonical_plan_blob`, `output_columns_json`, `predicate_summary_json`, `fd_summary_json`, `nullified_columns_json` | Mixed | View-matching metadata. These stay NULL unless view matching is enabled. |
+
+#### List encoding
+
+`group_columns`, `window_order_columns` and `aggregate_types` keep the plain comma-separated form when no name needs escaping, for example `a,b` or `k=k`. A list that contains a name with a comma, or a name starting with `json:`, is stored as `json:` followed by a JSON array of strings, for example `json:["a,b","c"]`.
+
+A window key normally maps a stored output column to its window source column as `output=source`. When either name contains `=`, or the output name starts with `json:`, that key is stored as the tagged pair `json:["output","source"]`. A partition key that no stored output carries is dropped, because it cannot scope a refresh.
+
+New window views always store their partition list in an object form that also records whether the view needs a result diff:
+
+```
+json:{"window_columns":["k=k","json:[\"p=key\",\"key\"]"],"requires_result_diff":"false"}
+```
+
+Readers go through `RefreshMetadata`: `GetGroupColumns` (which returns nothing for a window list), `GetWindowPartitionColumns`, `GetWindowOrderColumns` and `ParseWindowColumn`. They also accept the older forms, in which a bare name `k` means `k=k`. Window lineage in `lineage_json` records the proven output keys in `proven_columns`. An empty list is still a proof: it tells refresh not to re-plan the view to look for one. Views created before that field existed are re-planned at each refresh.
 
 Example content:
 

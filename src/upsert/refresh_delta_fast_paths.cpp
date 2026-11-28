@@ -199,7 +199,7 @@ static bool IsInsertOnlyDeltaSummary(const DeltaActivityResult &summary, const v
 	if (summary.any_has_deletes) {
 		return false;
 	}
-	if (!summary.has_join) {
+	if (!summary.has_join && delta_table_names.size() <= 1) {
 		return true;
 	}
 	if (summary.all_ducklake) {
@@ -216,7 +216,7 @@ DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connecti
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name) {
 	DeltaActivityResult summary;
-	summary.has_join = metadata.HasJoin(view_name) || delta_table_names.size() > 1;
+	summary.has_join = metadata.HasJoin(view_name);
 	// Native deltas are counted together, in one statement; DuckLake sources are probed per snapshot range.
 	vector<DeltaActivityResult::Source> standard_sources;
 	vector<pair<string, string>> standard_deltas;

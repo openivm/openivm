@@ -155,6 +155,8 @@ struct ProjectionDeleteRetryPlan {
 
 // Mirrors the caller's session-scoped OpenIVM planning settings onto a fresh connection.
 void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to);
+void PropagateRefreshCollation(ClientContext &from, ClientContext &to, RefreshMetadata &metadata,
+                               const string &view_name);
 // Rewrites DuckDB-only casts, now() and IS NOT DISTINCT FROM into Spark-portable SQL.
 string SparkPortableRefreshSQL(string sql);
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
@@ -176,7 +178,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
                                   const string &recompute_temp_table = "",
                                   RefreshPublicationScope *publication_scope = nullptr,
-                                  const vector<string> &upsert_columns = {}, SqlDialect dialect = SqlDialect::DUCKDB);
+                                  const vector<string> &upsert_columns = {}, SqlDialect dialect = SqlDialect::DUCKDB,
+                                  bool replace_affected_table = true);
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
 // Insert column list plus the select lists that project a row as a retraction (-1) or an insertion (+1).
@@ -231,15 +234,14 @@ string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const strin
                                           const string &data_table, const string &view_query_sql,
                                           const string &delta_ts_filter, const string &catalog_prefix,
                                           const string &recompute_alias);
-string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                                const vector<LogicalType> &column_types, const vector<string> &delta_table_names,
-                                const string &data_table, const string &view_query_sql, const string &delta_ts_filter,
-                                const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete, bool insert_only = false,
-                                const vector<string> &active_delta_table_names = {},
-                                bool can_use_runtime_delta_shape = false,
-                                ProjectionDeleteRetryPlan *delete_retry_plan = nullptr,
-                                string *appended_rows = nullptr);
+string
+CompileProjectionRefresh(ClientContext &context, RefreshMetadata &metadata, SqlDialect dialect, const string &view_name,
+                         const vector<string> &column_names, const vector<LogicalType> &column_types,
+                         const vector<string> &delta_table_names, const string &data_table,
+                         const string &view_query_sql, const string &delta_ts_filter, const string &catalog_prefix,
+                         bool has_full_outer, bool has_left_join, bool skip_proj_delete, bool insert_only = false,
+                         const vector<string> &active_delta_table_names = {}, bool can_use_runtime_delta_shape = false,
+                         ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, string *appended_rows = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
@@ -303,12 +305,14 @@ DuckLakeTableActivity ProbeDuckLakeTableChanges(Connection &con, const DuckLakeS
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                    const string &view_query_sql, const vector<string> &delta_table_names,
-                                   const vector<string> &column_names, const string &data_table,
-                                   const string &delta_ts_filter, const string &internal_catalog_prefix,
-                                   const string &view_catalog_name, const string &view_schema_name,
-                                   const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system, bool emit_cascade_delta = false,
-                                   bool running_window_incremental = false, bool *uses_running_suffix = nullptr,
+                                   const vector<string> &column_names, const vector<LogicalType> &column_types,
+                                   const string &data_table, const string &delta_ts_filter,
+                                   const string &internal_catalog_prefix, const string &view_catalog_name,
+                                   const string &view_schema_name, const string &attached_db_catalog_name,
+                                   const string &attached_db_schema_name, bool cross_system, bool has_join,
+                                   optional_ptr<const DeltaActivityResult> activity, bool caller_transaction,
+                                   bool emit_cascade_delta = false, bool running_window_incremental = false,
+                                   bool *uses_running_suffix = nullptr,
                                    RefreshPublicationScope *publication_scope = nullptr);
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,

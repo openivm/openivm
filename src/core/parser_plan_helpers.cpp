@@ -58,10 +58,12 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/expression_nullability.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
@@ -322,6 +324,59 @@ void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement)
 	planner.CreatePlan(std::move(statement));
 }
 
+static bool IsExplicitBinaryCollation(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	const auto &collation = StringType::GetCollation(type);
+	return StringUtil::CIEquals(collation, "binary") || StringUtil::CIEquals(collation, "c") ||
+	       StringUtil::CIEquals(collation, "posix");
+}
+
+void PreserveBinaryCollationsForSerialization(LogicalOperator &plan) {
+	LogicalOperatorVisitor::EnumerateExpressions(plan, [](unique_ptr<Expression> *root) {
+		if (!root || !*root) {
+			return;
+		}
+		ExpressionIterator::VisitExpressionClassMutable(
+		    *root, ExpressionClass::BOUND_COLUMN_REF, [](unique_ptr<Expression> &expr) {
+			    if (!IsExplicitBinaryCollation(expr->GetReturnType())) {
+				    return;
+			    }
+			    // Binary collation binds without a comparison function. A
+			    // no-op VARCHAR cast gives LPTS an expression on which to emit
+			    // COLLATE, so rebinding cannot substitute the session default.
+			    auto type = expr->GetReturnType();
+			    auto alias = expr->GetAlias();
+			    expr = BoundCastExpression::CreateDefault(std::move(expr), type, DefaultCasts::NopCast);
+			    expr->SetAlias(std::move(alias));
+		    });
+	});
+	for (auto &child : plan.children) {
+		PreserveBinaryCollationsForSerialization(*child);
+	}
+}
+
+string DuckLakeInitialLoadQuery(string query, const vector<string> &column_names,
+                                const vector<LogicalType> &column_types) {
+	D_ASSERT(column_names.size() == column_types.size());
+	vector<string> replacements;
+	for (idx_t i = 0; i < column_names.size(); i++) {
+		const auto &type = column_types[i];
+		if (!TypeVisitor::Contains(type, IsExplicitBinaryCollation)) {
+			continue;
+		}
+		auto column = SqlUtils::QuoteIdentifier(column_names[i]);
+		// The SQL type spelling omits collations, including in nested types.
+		// cast_to_type preserves the requested type even for a no-op cast.
+		replacements.push_back("system.main.cast_to_type(" + column + ", NULL::" + type.ToString() + ") AS " + column);
+	}
+	if (replacements.empty()) {
+		return query;
+	}
+	return "SELECT * REPLACE (" + StringUtil::Join(replacements, ", ") + ") FROM (" + query + ") openivm_initial";
+}
+
 void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &output_names,
                                string &suffix, string &ordering) {
 	vector<LogicalProjection *> projections;
@@ -402,6 +457,10 @@ void StripPublicationModifiers(ClientContext &context, unique_ptr<LogicalOperato
 				PropagateHiddenBindingThroughProjectionPath(ancestors, binding, type, alias);
 				output_names.push_back(alias);
 				expression = SqlUtils::QuoteIdentifier(alias);
+			}
+			if (IsExplicitBinaryCollation(order.expression->GetReturnType())) {
+				expression = "(" + expression + ") COLLATE " +
+				             SqlUtils::QuoteIdentifier(StringType::GetCollation(order.expression->GetReturnType()));
 			}
 			order_sql.push_back(expression + " " + order.GetOrderModifier());
 		}
@@ -1461,7 +1520,7 @@ LogicalAggregate *FindViewOutputAggregate(LogicalOperator *root) {
 static string ProjectionOutputName(const LogicalProjection &projection, idx_t expr_index,
                                    const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                    const BoundColumnRefExpression &bcr) {
-	auto spine = ViewOutputSpine(facts.root);
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
 	// Stored names belong to the view's output projection, after sanitization and
 	// deduplication. A CTE body visited first can have a different output order.
 	if (!spine.projections.empty() && spine.projections.front() == &projection && expr_index < output_names.size() &&
@@ -2003,22 +2062,12 @@ static bool GetLogicalGetColumnName(LogicalGet &get, ProjectionIndex column_inde
 }
 
 static bool GetLogicalGetColumnType(LogicalGet &get, ProjectionIndex column_index, LogicalType &type) {
-	if (column_index < get.returned_types.size()) {
-		type = get.returned_types[column_index];
-		return true;
+	const auto &columns = get.GetColumnIds();
+	if (column_index >= columns.size()) {
+		return false;
 	}
-	if (get.GetTable().get()) {
-		auto &ids = get.GetColumnIds();
-		if (column_index < ids.size()) {
-			auto base_idx = ids[column_index].GetPrimaryIndex();
-			auto &cols = get.GetTable().get()->GetColumns();
-			if (base_idx < cols.LogicalColumnCount()) {
-				type = cols.GetColumn(LogicalIndex(base_idx)).Type();
-				return true;
-			}
-		}
-	}
-	return false;
+	type = get.GetColumnType(columns[column_index]);
+	return true;
 }
 
 static bool HasKeyBinding(const vector<ColumnBinding> &keys, const ColumnBinding &binding) {
@@ -2657,6 +2706,7 @@ struct WindowLineageOp {
 };
 
 struct WindowLookupEdge {
+	idx_t join_id;
 	OccurrenceColumnRef lookup_join;
 	string lookup_cast;
 	OccurrenceColumnRef changed_join;
@@ -2664,14 +2714,10 @@ struct WindowLookupEdge {
 };
 
 struct WindowEquivalenceEdge {
+	idx_t join_id;
 	OccurrenceColumnRef first;
-	string first_cast;
 	OccurrenceColumnRef second;
-	string second_cast;
-
-	bool HasCast() const {
-		return !first_cast.empty() || !second_cast.empty();
-	}
+	bool widened;
 };
 
 static void CollectLeafColumnBindings(Expression *expr, vector<ColumnBinding> &bindings) {
@@ -2686,10 +2732,14 @@ static void CollectLeafColumnBindings(Expression *expr, vector<ColumnBinding> &b
 	                                      [&](Expression &child) { CollectLeafColumnBindings(&child, bindings); });
 }
 
+static bool SameRef(const OccurrenceColumnRef &a, const OccurrenceColumnRef &b) {
+	return StringUtil::CIEquals(a.table, b.table) && a.occurrence == b.occurrence &&
+	       StringUtil::CIEquals(a.column, b.column);
+}
+
 static void AddUniqueOccurrenceRef(vector<OccurrenceColumnRef> &refs, const OccurrenceColumnRef &ref) {
 	for (auto &existing : refs) {
-		if (StringUtil::CIEquals(existing.table, ref.table) && existing.occurrence == ref.occurrence &&
-		    StringUtil::CIEquals(existing.column, ref.column)) {
+		if (SameRef(existing, ref)) {
 			return;
 		}
 	}
@@ -2697,14 +2747,36 @@ static void AddUniqueOccurrenceRef(vector<OccurrenceColumnRef> &refs, const Occu
 }
 
 static bool ResolveBindingToOccurrenceRefsInternal(ColumnBinding binding, const CreateMVPlanFacts &facts,
-                                                   vector<OccurrenceColumnRef> &out, int depth) {
+                                                   vector<OccurrenceColumnRef> &out, int depth,
+                                                   bool direct_only = false) {
 	if (depth >= 16) {
 		return false;
 	}
 	OccurrenceColumnRef direct_ref;
-	if (ResolveBindingToOccurrenceRef(binding, facts, direct_ref)) {
+	LogicalGet *get = nullptr;
+	string cast_type;
+	if (ResolveBindingToGetColumn(binding, facts, get, direct_ref.column, nullptr,
+	                              direct_only ? &cast_type : nullptr) &&
+	    cast_type.empty() && SetOccurrenceRef(*get, facts, direct_ref)) {
 		AddUniqueOccurrenceRef(out, direct_ref);
 		return true;
+	}
+	auto setop = facts.setops_by_index.find(binding.table_index);
+	if (setop != facts.setops_by_index.end()) {
+		// A set output represents different rows in each arm. Only use source
+		// deltas directly when every arm passes through the partition key.
+		vector<OccurrenceColumnRef> arms;
+		for (auto &child : setop->second->children) {
+			auto bindings = child->GetColumnBindings();
+			if (binding.column_index >= bindings.size() ||
+			    !ResolveBindingToOccurrenceRefsInternal(bindings[binding.column_index], facts, arms, depth + 1, true)) {
+				return false;
+			}
+		}
+		for (auto &arm : arms) {
+			AddUniqueOccurrenceRef(out, arm);
+		}
+		return !arms.empty();
 	}
 	auto proj_it = facts.projections_by_index.find(binding.table_index);
 	if (proj_it == facts.projections_by_index.end()) {
@@ -2714,8 +2786,14 @@ static bool ResolveBindingToOccurrenceRefsInternal(ColumnBinding binding, const 
 	if (binding.column_index >= proj->expressions.size()) {
 		return false;
 	}
+	auto &expression = *proj->expressions[binding.column_index];
+	if (direct_only) {
+		return expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+		       ResolveBindingToOccurrenceRefsInternal(expression.Cast<BoundColumnRefExpression>().Binding(), facts, out,
+		                                              depth + 1, true);
+	}
 	vector<ColumnBinding> child_bindings;
-	CollectLeafColumnBindings(proj->expressions[binding.column_index].get(), child_bindings);
+	CollectLeafColumnBindings(&expression, child_bindings);
 	bool found = false;
 	for (auto &child_binding : child_bindings) {
 		if (child_binding.table_index == binding.table_index && child_binding.column_index == binding.column_index) {
@@ -2732,23 +2810,36 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 	return ResolveBindingToOccurrenceRefsInternal(binding, facts, out, 0);
 }
 
+static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool integral_only = false);
+
+static bool IsLosslessIntegerJoinKey(const Expression &key, const CreateMVPlanFacts &facts) {
+	// Both raw operands must fit in the exact signed/unsigned common type used at refresh.
+	return key.GetReturnType().id() != LogicalTypeId::UHUGEINT && IsDirectWindowKey(key, facts, true);
+}
+
 static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
+                                   const unordered_set<string> &null_extended_sources,
                                    vector<WindowEquivalenceEdge> &equivalence_edges,
                                    vector<WindowLookupEdge> &lookup_edges, bool allow_seed_normalization) {
 	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
 	    join.type != LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		return;
 	}
+	auto join_id = facts.plan_node_ids.at(&join);
 	auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, string lookup_cast, OccurrenceColumnRef changed_ref,
 	                           string changed_cast) {
 		lookup_edges.push_back(
-		    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
+		    {join_id, std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
 	};
 	for (auto &condition : join.conditions) {
 		if (!condition.IsComparison()) {
 			continue;
 		}
-		if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+		auto comparison = condition.GetComparisonType();
+		bool null_safe_inner = join.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+		                       join.join_type == JoinType::INNER &&
+		                       comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+		if (comparison != ExpressionType::COMPARE_EQUAL && !null_safe_inner) {
 			continue;
 		}
 		string left_cast;
@@ -2766,28 +2857,223 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		                                           allow_seed_normalization && join.join_type == JoinType::LEFT)) {
 			continue;
 		}
-		switch (join.join_type) {
-		case JoinType::INNER:
-		case JoinType::LEFT:
-			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
-			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
-			break;
-		case JoinType::RIGHT:
-			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
-			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
-			break;
-		default:
-			break;
+		if (null_safe_inner) {
+			// An outer join can add or remove a padded NULL without a source
+			// delta for that key. Null-safe equalities only transfer direct keys.
+			if (null_extended_sources.count(OccurrenceKey(left_ref)) ||
+			    null_extended_sources.count(OccurrenceKey(right_ref))) {
+				continue;
+			}
+		} else {
+			switch (join.join_type) {
+			case JoinType::INNER:
+			case JoinType::LEFT:
+				add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+				add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+				break;
+			case JoinType::RIGHT:
+				add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+				add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+				break;
+			default:
+				break;
+			}
 		}
 		if (join.join_type == JoinType::INNER) {
-			equivalence_edges.push_back(
-			    {std::move(left_ref), std::move(left_cast), std::move(right_ref), std::move(right_cast)});
+			bool widened = !left_cast.empty() || !right_cast.empty();
+			if (!widened || (join.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+			                 IsLosslessIntegerJoinKey(*condition.LeftReference(), facts) &&
+			                 IsLosslessIntegerJoinKey(*condition.RightReference(), facts))) {
+				equivalence_edges.push_back({join_id, std::move(left_ref), std::move(right_ref), widened});
+			}
 		}
 	}
 }
 
+static const Expression &WindowKeyExpression(const Expression &expr, const CreateMVPlanFacts &facts) {
+	auto *current = &expr;
+	for (idx_t depth = 0; depth < 16 && current->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF; depth++) {
+		auto binding = current->Cast<BoundColumnRefExpression>().Binding();
+		auto projection = facts.projections_by_index.find(binding.table_index);
+		if (projection == facts.projections_by_index.end() ||
+		    binding.column_index >= projection->second->expressions.size()) {
+			break;
+		}
+		current = projection->second->expressions[binding.column_index].get();
+	}
+	return *current;
+}
+
+// A cast to VARCHAR that keeps distinct values distinct and equal values equal, so its result identifies exactly
+// the partitions of its input. Floating zeros and time zone renderings are excluded.
+static bool IsInjectiveTextCast(const LogicalType &from, const LogicalType &to) {
+	if (to.id() != LogicalTypeId::VARCHAR || !StringType::GetCollation(to).empty() || from.HasAlias()) {
+		return false;
+	}
+	switch (from.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::UUID:
+		return true;
+	default:
+		return from.IsIntegral();
+	}
+}
+
+// The window key under an injective text cast of a stored output, or nullptr.
+static const Expression *InjectiveTextCastChild(const Expression &key, const CreateMVPlanFacts &facts) {
+	if (!BoundCastExpression::IsCast(key)) {
+		return nullptr;
+	}
+	const auto &child = BoundCastExpression::Child(key.Cast<BoundFunctionExpression>());
+	return IsInjectiveTextCast(child.GetReturnType(), key.GetReturnType()) ? &WindowKeyExpression(child, facts)
+	                                                                       : nullptr;
+}
+
+static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool integral_only) {
+	const auto &expression = WindowKeyExpression(key, facts);
+	const auto &type = expression.GetReturnType();
+	if (integral_only && (!type.IsIntegral() || type.HasAlias())) {
+		return false;
+	}
+	if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+		if (!integral_only) {
+			return true;
+		}
+		auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
+		auto source = facts.gets_by_index.find(binding.table_index);
+		LogicalType source_type;
+		return source != facts.gets_by_index.end() &&
+		       GetLogicalGetColumnType(*source->second, binding.column_index, source_type) && source_type == type;
+	}
+	if (!BoundCastExpression::IsCast(expression)) {
+		return false;
+	}
+	const auto &child = BoundCastExpression::Child(expression.Cast<BoundFunctionExpression>());
+	const auto &from = child.GetReturnType();
+	const auto &to = expression.GetReturnType();
+	if (!integral_only && IsInjectiveTextCast(from, to)) {
+		return IsDirectWindowKey(child, facts, false);
+	}
+	return from.IsIntegral() && to.IsIntegral() && !from.HasAlias() && !to.HasAlias() &&
+	       BoundCastExpression::CastIsInvertible(from, to) && IsDirectWindowKey(child, facts, integral_only);
+}
+
+static const OccurrenceColumnRef *OtherWindowKey(const WindowEquivalenceEdge &edge, const OccurrenceColumnRef &key) {
+	if (SameRef(edge.first, key)) {
+		return &edge.second;
+	}
+	return SameRef(edge.second, key) ? &edge.first : nullptr;
+}
+
+struct WindowInputRange {
+	idx_t first;
+	idx_t end;
+
+	bool Contains(idx_t node_id) const {
+		return node_id >= first && node_id < end;
+	}
+};
+
+static WindowInputRange GetWindowInputRange(const CreateMVPlanFacts &facts, const LogicalWindow &window) {
+	// Post-order node IDs form contiguous subtree ranges.
+	auto end = facts.plan_node_ids.at(&window);
+	auto first = end;
+	while (!facts.plan_nodes_post_order[first].child_ids.empty()) {
+		first = facts.plan_nodes_post_order[first].child_ids.front();
+	}
+	return {first, end};
+}
+
+static bool IsEarlyWindowEvidence(const unordered_map<string, idx_t> &first_windows, const OccurrenceColumnRef &ref,
+                                  idx_t node_id) {
+	auto first = first_windows.find(OccurrenceKey(ref));
+	return first == first_windows.end() || node_id <= first->second;
+}
+
+struct WindowKeyEquality {
+	const CreateMVPlanFacts &facts;
+	const vector<WindowEquivalenceEdge> &edges;
+	const unordered_set<string> &nullable_sources;
+
+	bool operator()(const Expression &left, const Expression &right, const WindowInputRange &input) const {
+		if (Expression::Equals(left, right)) {
+			return true;
+		}
+		if (edges.empty() || left.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
+		    right.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		OccurrenceColumnRef first, last;
+		string left_cast, right_cast;
+		if (!ResolveBindingToOccurrenceRefWithCast(left.Cast<BoundColumnRefExpression>().Binding(), facts, first,
+		                                           left_cast, left.GetReturnType()) ||
+		    !ResolveBindingToOccurrenceRefWithCast(right.Cast<BoundColumnRefExpression>().Binding(), facts, last,
+		                                           right_cast, right.GetReturnType()) ||
+		    !left_cast.empty() || !right_cast.empty() || nullable_sources.count(OccurrenceKey(first))) {
+			return false;
+		}
+		// Use only key equalities established in this window's input.
+		vector<OccurrenceColumnRef> equivalents {std::move(first)};
+		for (idx_t i = 0; i < equivalents.size(); i++) {
+			for (const auto &edge : edges) {
+				if (!input.Contains(edge.join_id)) {
+					continue;
+				}
+				auto *other = OtherWindowKey(edge, equivalents[i]);
+				if (!other || nullable_sources.count(OccurrenceKey(*other))) {
+					continue;
+				}
+				if (SameRef(*other, last)) {
+					return true;
+				}
+				AddUniqueOccurrenceRef(equivalents, *other);
+			}
+		}
+		return false;
+	}
+};
+
+static bool IsCommonWindowKey(const CreateMVPlanFacts &facts, const Expression &key,
+                              const WindowKeyEquality &equal_keys) {
+	for (const auto *window : facts.windows) {
+		auto input = GetWindowInputRange(facts, *window);
+		for (const auto &expression : window->expressions) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+				continue;
+			}
+			const auto &partitions = expression->Cast<BoundWindowExpression>().Partitions();
+			if (std::none_of(partitions.begin(), partitions.end(), [&](const unique_ptr<Expression> &partition) {
+				    return equal_keys(WindowKeyExpression(*partition, facts), key, input);
+			    })) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static bool HasPlainCoalescePartition(const Expression &key, const CreateMVPlanFacts &facts,
+                                      const vector<OccurrenceColumnRef> &refs, const string &source_name) {
+	if (key.GetExpressionType() != ExpressionType::OPERATOR_COALESCE) {
+		return false;
+	}
+	auto &children = key.Cast<BoundOperatorExpression>().GetChildren();
+	return refs.size() == children.size() &&
+	       std::all_of(refs.begin(), refs.end(),
+	                   [&](const OccurrenceColumnRef &ref) { return StringUtil::CIEquals(ref.column, source_name); }) &&
+	       std::all_of(children.begin(), children.end(), [&](const unique_ptr<Expression> &child) {
+		       return WindowKeyExpression(*child, facts).GetExpressionType() == ExpressionType::BOUND_COLUMN_REF;
+	       });
+}
+
 static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlanFacts &facts,
-                                       const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
+                                       const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops,
+                                       unordered_map<string, const Expression *> &window_keys,
+                                       unordered_set<string> &coalesce_candidates, const WindowKeyEquality &equal_keys,
+                                       const unordered_map<string, idx_t> &first_windows) {
+	auto input = GetWindowInputRange(facts, window);
 	for (auto &expression : window.expressions) {
 		if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
 			continue;
@@ -2799,17 +3085,42 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 			if (!column_ref) {
 				continue;
 			}
+			const auto &key = WindowKeyExpression(*partition, facts);
 			vector<OccurrenceColumnRef> refs;
-			if (!ResolveBindingToOccurrenceRefs(column_ref->Binding(), facts, refs)) {
+			if (BoundCastExpression::IsCast(key) && IsDirectWindowKey(key, facts)) {
+				OccurrenceColumnRef direct;
+				auto source_cast = partition_cast;
+				if (ResolveBindingToOccurrenceRefWithCast(column_ref->Binding(), facts, direct, source_cast,
+				                                          column_ref->GetReturnType())) {
+					partition_cast = std::move(source_cast);
+					refs.push_back(std::move(direct));
+				}
+			}
+			if (refs.empty() && !ResolveBindingToOccurrenceRefs(column_ref->Binding(), facts, refs)) {
 				continue;
 			}
 			for (auto &ref : refs) {
 				for (auto &stored : partition_columns) {
-					auto pos = stored.find('=');
-					string output_col = pos == string::npos ? stored : stored.substr(0, pos);
-					string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
+					auto spec = RefreshMetadata::ParseWindowColumn(stored);
+					auto &output_col = spec.first;
+					auto &source_col = spec.second;
 					if (!StringUtil::CIEquals(source_col, ref.column)) {
 						continue;
+					}
+					auto output = StringUtil::Lower(output_col);
+					auto entry = window_keys.find(output);
+					if (entry != window_keys.end() && entry->second && !equal_keys(*entry->second, key, input)) {
+						// A text form of the key still identifies the same partitions.
+						auto *window_key = InjectiveTextCastChild(*entry->second, facts);
+						if (!window_key || !equal_keys(*window_key, key, input)) {
+							entry->second = nullptr;
+						}
+					}
+					if (!IsEarlyWindowEvidence(first_windows, ref, input.end)) {
+						continue;
+					}
+					if (HasPlainCoalescePartition(key, facts, refs, source_col)) {
+						coalesce_candidates.insert(std::move(output));
 					}
 					WindowLineageOp op;
 					op.kind = WindowLineageKind::DIRECT;
@@ -2823,11 +3134,6 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 			}
 		}
 	}
-}
-
-static bool SameRef(const OccurrenceColumnRef &a, const OccurrenceColumnRef &b) {
-	return StringUtil::CIEquals(a.table, b.table) && a.occurrence == b.occurrence &&
-	       StringUtil::CIEquals(a.column, b.column);
 }
 
 static bool SameOp(const WindowLineageOp &a, const WindowLineageOp &b) {
@@ -2874,6 +3180,181 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 	metadata_op.lookup_out = op.lookup_output_col;
 	metadata_op.lookup_out_cast = op.lookup_output_cast;
 	return metadata_op;
+}
+
+static bool RejectsNullPadding(const Expression &filter, const vector<ColumnBinding> &bindings) {
+	auto type = filter.GetExpressionType();
+	if (type == ExpressionType::CONJUNCTION_AND || type == ExpressionType::CONJUNCTION_OR) {
+		const auto &children = filter.Cast<BoundConjunctionExpression>().GetChildren();
+		auto rejects = [&](const unique_ptr<Expression> &child) {
+			return RejectsNullPadding(*child, bindings);
+		};
+		return type == ExpressionType::CONJUNCTION_AND ? std::any_of(children.begin(), children.end(), rejects)
+		                                               : std::all_of(children.begin(), children.end(), rejects);
+	}
+
+	// An operand proved non-NULL by the filter cannot come from padding if
+	// it would become NULL when this join side's columns are all NULL.
+	bool rejects_padding = false;
+	ExpressionIterator::EnumerateChildren(filter, [&](const Expression &operand) {
+		if (!rejects_padding && FilterRejectsNull(filter, operand)) {
+			rejects_padding = ExpressionBecomesNull(operand, [&](const BoundColumnRefExpression &column) {
+				return column.Depth() == 0 &&
+				       std::find(bindings.begin(), bindings.end(), column.Binding()) != bindings.end();
+			});
+		}
+	});
+	return rejects_padding;
+}
+
+static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &facts) {
+	unordered_set<string> sources;
+	if (facts.outer_joins.empty()) {
+		return sources;
+	}
+	unordered_map<const LogicalOperator *, const LogicalOperator *> filters;
+	for (auto &node : facts.plan_nodes_post_order) {
+		auto &op = *node.plan_node;
+		if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+			filters.emplace(op.children[0].get(), &op);
+		}
+	}
+	for (auto *join : facts.outer_joins) {
+		auto filter = filters.find(join);
+		for (idx_t child = 0; child < 2; child++) {
+			if ((join->join_type == JoinType::LEFT && child == 0) ||
+			    (join->join_type == JoinType::RIGHT && child == 1)) {
+				continue;
+			}
+			// Only a filter directly above this join excludes padding before
+			// any window or other operator can observe it.
+			if (filter != filters.end()) {
+				auto bindings = join->children[child]->GetColumnBindings();
+				const auto &predicates = filter->second->expressions;
+				if (std::any_of(predicates.begin(), predicates.end(), [&](const unique_ptr<Expression> &predicate) {
+					    return RejectsNullPadding(*predicate, bindings);
+				    })) {
+					continue;
+				}
+			}
+			auto *subtree = GetPlanNodeFacts(facts, join->children[child].get());
+			D_ASSERT(subtree);
+			for (auto index : subtree->subtree_table_indices) {
+				auto source = facts.occurrence_by_index.find(index);
+				if (source != facts.occurrence_by_index.end()) {
+					sources.insert(OccurrenceKey(source->second.table, source->second.occurrence));
+				}
+			}
+		}
+	}
+	return sources;
+}
+
+vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const vector<string> &column_names) {
+	optional<vector<string>> sanitized_names;
+	// The key under its stored column name. DuckLake can store the original spelling of a
+	// name that metadata records in its prepared form, at the same output position. Only a
+	// single key is mapped: a composite scope keeps its existing choice of one exact key.
+	auto physical_key = [&](const string &spec) {
+		auto parsed = RefreshMetadata::ParseWindowColumn(spec);
+		if (std::find(column_names.begin(), column_names.end(), parsed.first) != column_names.end()) {
+			return spec;
+		}
+		if (!sanitized_names) {
+			sanitized_names = PrepareOutputNames(nullptr, column_names);
+		}
+		auto match = std::find_if(sanitized_names->begin(), sanitized_names->end(),
+		                          [&](const string &name) { return StringUtil::CIEquals(name, parsed.first); });
+		return match == sanitized_names->end() ? string()
+		                                       : RefreshMetadata::SerializeWindowColumn(
+		                                             column_names[match - sanitized_names->begin()], parsed.second);
+	};
+	if (partition_cols.size() == 1) {
+		auto key = physical_key(partition_cols[0]);
+		return key.empty() ? vector<string>() : vector<string> {std::move(key)};
+	}
+	// Preserve the existing single-key change-feed path when a quoted
+	// identifier adds a second common key. Filtering by the previously
+	// usable key covers every affected partition without filtering by a tuple.
+	string plain_key;
+	idx_t plain_count = 0;
+	for (auto &pc : partition_cols) {
+		auto parsed = RefreshMetadata::ParseWindowColumn(pc);
+		if (parsed.first.find('=') != string::npos || parsed.second.find('=') != string::npos ||
+		    RefreshMetadata::IsTaggedWindowColumn(pc)) {
+			continue;
+		}
+		if (std::find(column_names.begin(), column_names.end(), parsed.first) != column_names.end()) {
+			plain_key = pc;
+			plain_count++;
+		}
+	}
+	return plain_count == 1 ? vector<string> {std::move(plain_key)} : vector<string>();
+}
+
+bool WindowPlanRequiresResultDiff(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
+                                  const vector<string> &output_names,
+                                  const RefreshMetadata::WindowPartitionLineage &lineage) {
+	if (!facts.setops_by_index.empty() &&
+	    std::none_of(partition_columns.begin(), partition_columns.end(), [&](const string &partition) {
+		    return lineage.IsProven(RefreshMetadata::ParseWindowColumn(partition).first);
+	    })) {
+		return true;
+	}
+	vector<const LogicalDistinct *> distinct_ops;
+	for (const auto &node : facts.plan_nodes_post_order) {
+		auto type = node.plan_node->type;
+		if (type == LogicalOperatorType::LOGICAL_LIMIT || type == LogicalOperatorType::LOGICAL_TOP_N) {
+			return true;
+		}
+		if (type == LogicalOperatorType::LOGICAL_DISTINCT) {
+			auto &distinct = node.plan_node->Cast<LogicalDistinct>();
+			if (distinct.distinct_type == DistinctType::DISTINCT_ON) {
+				distinct_ops.push_back(&distinct);
+			}
+		}
+	}
+	if (distinct_ops.empty()) {
+		return false;
+	}
+
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
+	if (spine.projections.empty()) {
+		return true;
+	}
+	const auto &projection = *spine.projections.front();
+	vector<string> scoped_columns;
+	for (const auto &partition : partition_columns) {
+		auto output = RefreshMetadata::ParseWindowColumn(partition).first;
+		if (!lineage.IsProven(output)) {
+			continue;
+		}
+		auto position = std::find_if(output_names.begin(), output_names.end(),
+		                             [&](const string &name) { return StringUtil::CIEquals(output, name); });
+		auto index = static_cast<idx_t>(position - output_names.begin());
+		if (position == output_names.end() || index >= projection.expressions.size()) {
+			continue;
+		}
+		const auto &key = WindowKeyExpression(*projection.expressions[index], facts);
+		// A key common to every window and DISTINCT ON keeps both row
+		// contributions and winner replacements within the refresh scope.
+		if (std::all_of(distinct_ops.begin(), distinct_ops.end(), [&](const LogicalDistinct *distinct) {
+			    return std::any_of(distinct->distinct_targets.begin(), distinct->distinct_targets.end(),
+			                       [&](const unique_ptr<Expression> &target) {
+				                       return Expression::Equals(WindowKeyExpression(*target, facts), key);
+			                       });
+		    })) {
+			scoped_columns.push_back(partition);
+		}
+	}
+	if (scoped_columns.empty()) {
+		return true;
+	}
+	if (scoped_columns.size() != partition_columns.size()) {
+		OPENIVM_DEBUG_PRINT("[WINDOW] Narrowing DISTINCT ON refresh to %zu shared keys\n", scoped_columns.size());
+		partition_columns = std::move(scoped_columns);
+	}
+	return false;
 }
 
 static bool IsRawWindowKey(const Expression &expr, const CreateMVPlanFacts &facts, const WindowLineageOp &key) {
@@ -3134,10 +3615,11 @@ static bool BuildWindowOrderTrim(const CreateMVPlanFacts &facts, const vector<st
 }
 
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
-                                    const vector<string> &output_names,
-                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out,
+                                    const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
-	out.clear();
+	out = RefreshMetadata::WindowPartitionLineage();
+	// An empty proof is still a proof: refresh must not plan the view again to look for one.
+	out.proven_columns.emplace();
 	if (direct_out) {
 		direct_out->clear();
 	}
@@ -3148,9 +3630,41 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		return false;
 	}
 
-	vector<WindowLineageOp> direct_ops;
+	unordered_map<string, idx_t> first_windows;
 	for (auto *window : facts.windows) {
-		CollectWindowPartitionRefs(*window, facts, partition_columns, direct_ops);
+		auto window_id = facts.plan_node_ids.at(window);
+		for (auto index : facts.plan_nodes_post_order[window_id].subtree_table_indices) {
+			auto source = facts.occurrence_by_index.find(index);
+			if (source != facts.occurrence_by_index.end()) {
+				auto &occurrence = source->second;
+				auto entry = first_windows.emplace(OccurrenceKey(occurrence.table, occurrence.occurrence), window_id);
+				entry.first->second = MinValue(entry.first->second, window_id);
+			}
+		}
+	}
+
+	auto nullable_sources = NullExtendedWindowSources(facts);
+	vector<WindowEquivalenceEdge> edges;
+	vector<WindowLookupEdge> lookup_edges;
+	for (auto *join : facts.comparison_joins) {
+		CollectWindowJoinEdges(*join, facts, nullable_sources, edges, lookup_edges, false);
+	}
+
+	const WindowKeyEquality equal_keys {facts, edges, nullable_sources};
+	vector<WindowLineageOp> direct_ops;
+	unordered_map<string, const Expression *> window_keys;
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
+	if (!spine.projections.empty()) {
+		const auto &projection = *spine.projections.front();
+		for (idx_t i = 0; i < projection.expressions.size() && i < output_names.size(); i++) {
+			window_keys.emplace(StringUtil::Lower(output_names[i]),
+			                    &WindowKeyExpression(*projection.expressions[i], facts));
+		}
+	}
+	unordered_set<string> coalesce_candidates;
+	for (auto *window : facts.windows) {
+		CollectWindowPartitionRefs(*window, facts, partition_columns, direct_ops, window_keys, coalesce_candidates,
+		                           equal_keys, first_windows);
 	}
 	if (direct_ops.empty()) {
 		return false;
@@ -3161,12 +3675,16 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 	}
 
-	vector<WindowEquivalenceEdge> edges;
-	vector<WindowLookupEdge> lookup_edges;
+	// A normalized seed lookup can follow NULLIF(TRIM(...)) on the LEFT JOIN lookup side. Only lookup edges
+	// change: equivalence edges come from INNER joins.
 	const bool normalized_seed =
 	    partition_columns.size() == 1 && IsNormalizedSeedLookup(facts, output_names, direct_ops);
-	for (auto *join : facts.comparison_joins) {
-		CollectWindowJoinEdges(*join, facts, edges, lookup_edges, normalized_seed);
+	if (normalized_seed) {
+		vector<WindowEquivalenceEdge> seed_edges;
+		lookup_edges.clear();
+		for (auto *join : facts.comparison_joins) {
+			CollectWindowJoinEdges(*join, facts, nullable_sources, seed_edges, lookup_edges, true);
+		}
 	}
 
 	vector<WindowLineageOp> partition_ops;
@@ -3179,33 +3697,38 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		changed = false;
 		vector<WindowLineageOp> next_ops = partition_ops;
 		for (auto &edge : edges) {
-			if (edge.HasCast()) {
-				continue;
-			}
 			for (auto &direct : partition_ops) {
 				OccurrenceColumnRef direct_ref;
 				direct_ref.table = direct.source_table;
 				direct_ref.occurrence = direct.source_occurrence;
 				direct_ref.column = direct.source_col;
-				OccurrenceColumnRef other;
-				bool found = false;
-				if (SameRef(edge.first, direct_ref)) {
-					other = edge.second;
-					found = true;
-				} else if (SameRef(edge.second, direct_ref)) {
-					other = edge.first;
-					found = true;
-				}
-				if (!found || HasEquivalentPartitionRef(next_ops, other, direct.output_col)) {
+				auto *other = OtherWindowKey(edge, direct_ref);
+				// An equality must precede the first window that reads the new source.
+				if (!other || !IsEarlyWindowEvidence(first_windows, *other, edge.join_id) ||
+				    HasEquivalentPartitionRef(next_ops, *other, direct.output_col)) {
 					continue;
 				}
 				WindowLineageOp equivalent;
 				equivalent.kind = WindowLineageKind::DIRECT;
 				equivalent.output_col = direct.output_col;
-				equivalent.source_table = other.table;
-				equivalent.source_occurrence = other.occurrence;
-				equivalent.source_col = other.column;
-				equivalent.source_cast = direct.source_cast;
+				equivalent.source_table = other->table;
+				equivalent.source_occurrence = other->occurrence;
+				equivalent.source_col = other->column;
+				// A wider source can contain unmatched values outside the
+				// projection's type. Let the key comparison widen as needed.
+				if (edge.widened) {
+					auto key = window_keys.find(StringUtil::Lower(direct.output_col));
+					if (key == window_keys.end() || !key->second) {
+						continue;
+					}
+					const auto &type = key->second->GetReturnType();
+					// UHUGEINT has no lossless common type with signed keys.
+					if (!type.IsIntegral() || type.HasAlias() || type.id() == LogicalTypeId::UHUGEINT) {
+						continue;
+					}
+				} else {
+					equivalent.source_cast = direct.source_cast;
+				}
 				AddUniqueLineageOp(next_ops, std::move(equivalent));
 				changed = true;
 			}
@@ -3219,6 +3742,11 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	}
 
 	for (auto &edge : lookup_edges) {
+		// A later join can narrow the output without narrowing the input of
+		// an earlier window that reads this source.
+		if (!IsEarlyWindowEvidence(first_windows, edge.changed_join, edge.join_id)) {
+			continue;
+		}
 		for (auto &direct : partition_ops) {
 			if (!StringUtil::CIEquals(edge.lookup_join.table, direct.source_table) ||
 			    edge.lookup_join.occurrence != direct.source_occurrence) {
@@ -3246,25 +3774,124 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 	}
 
+	// A lookup only sees matching base rows. It cannot report a NULL partition
+	// introduced on the nullable side. Each occurrence also needs coverage, even
+	// when several aliases share a single recorded delta table.
+	unordered_map<string, unordered_set<string>> covered;
+	for (auto &op : ops) {
+		covered[StringUtil::Lower(op.output_col)].insert(OccurrenceKey(op.source_table, op.source_occurrence));
+	}
+	string preserved_source;
+	if (facts.source_occurrences.size() == nullable_sources.size() + 1) {
+		for (const auto &source : facts.source_occurrences) {
+			if (!nullable_sources.count(OccurrenceKey(source.table, source.occurrence))) {
+				preserved_source = source.table;
+				break;
+			}
+		}
+		// A change to a physical source shared by an optional alias can also
+		// change that alias's match, even when it is the preserved input.
+		for (const auto &source : facts.source_occurrences) {
+			if (StringUtil::CIEquals(source.table, preserved_source) &&
+			    nullable_sources.count(OccurrenceKey(source.table, source.occurrence))) {
+				preserved_source.clear();
+				break;
+			}
+		}
+	}
+	unordered_map<string, string> output_casts;
+	for (const auto &entry : covered) {
+		if (entry.second.size() != facts.source_occurrences.size()) {
+			continue;
+		}
+		auto found = window_keys.find(entry.first);
+		if (found == window_keys.end() || !found->second) {
+			continue;
+		}
+		const auto *key = found->second;
+		// A computed namesake may have produced no lineage. Check the projected
+		// key against every window, using the equalities at that window's input.
+		string output_cast;
+		if (!IsCommonWindowKey(facts, *key, equal_keys)) {
+			auto *window_key = InjectiveTextCastChild(*key, facts);
+			if (!window_key || !IsCommonWindowKey(facts, *window_key, equal_keys)) {
+				continue;
+			}
+			// The output stores a text form of the window key, so changed keys are reported in that form.
+			output_cast = key->GetReturnType().ToString();
+			key = window_key;
+		}
+		const auto nullable_operand = [&](const WindowLineageOp &op) {
+			return StringUtil::CIEquals(op.output_col, entry.first) &&
+			       nullable_sources.count(OccurrenceKey(op.source_table, op.source_occurrence));
+		};
+		if (IsDirectWindowKey(*key, facts) && std::none_of(direct_ops.begin(), direct_ops.end(), nullable_operand)) {
+			out.proven_columns->push_back(entry.first);
+			if (!output_cast.empty()) {
+				output_casts.emplace(entry.first, std::move(output_cast));
+			}
+			continue;
+		}
+		if (!output_cast.empty() || !coalesce_candidates.count(entry.first) || preserved_source.empty()) {
+			continue;
+		}
+		// For one preserved input, every alternative must be discoverable
+		// through a lookup from that input. The stored output must be the
+		// same COALESCE expression over those nullable columns.
+		bool covers_alternatives = std::all_of(direct_ops.begin(), direct_ops.end(), [&](const WindowLineageOp &op) {
+			if (!StringUtil::CIEquals(op.output_col, entry.first)) {
+				return true;
+			}
+			return nullable_operand(op) && std::any_of(ops.begin(), ops.end(), [&](const WindowLineageOp &lookup) {
+				       return lookup.kind == WindowLineageKind::LOOKUP &&
+				              StringUtil::CIEquals(lookup.output_col, op.output_col) &&
+				              StringUtil::CIEquals(lookup.lookup_table, op.source_table) &&
+				              lookup.lookup_occurrence == op.source_occurrence &&
+				              StringUtil::CIEquals(lookup.lookup_output_col, op.source_col) &&
+				              !nullable_sources.count(OccurrenceKey(lookup.source_table, lookup.source_occurrence));
+			       });
+		});
+		if (covers_alternatives) {
+			out.coalesce_columns.push_back(entry.first);
+			out.coalesce_preserved_source = preserved_source;
+		}
+	}
+	std::sort(out.proven_columns->begin(), out.proven_columns->end());
+	std::sort(out.coalesce_columns.begin(), out.coalesce_columns.end());
 	bool has_lookup = false;
 	for (auto &op : ops) {
 		has_lookup = has_lookup || op.kind == WindowLineageKind::LOOKUP;
 	}
+	auto &seed = direct_ops.front();
 	string order_col, order_out;
-	const bool order_trim = normalized_seed && has_lookup &&
-	                        BuildWindowOrderTrim(facts, output_names, direct_ops.front(), order_col, order_out);
+	const bool order_trim =
+	    normalized_seed && has_lookup && BuildWindowOrderTrim(facts, output_names, seed, order_col, order_out);
 	for (auto &op : ops) {
+		// A direct arm for the same occurrence already supplies this key.
+		if (op.kind == WindowLineageKind::LOOKUP && out.IsProven(op.output_col) &&
+		    std::any_of(partition_ops.begin(), partition_ops.end(), [&](const WindowLineageOp &direct) {
+			    return direct.source_occurrence == op.source_occurrence &&
+			           StringUtil::CIEquals(direct.source_table, op.source_table) &&
+			           StringUtil::CIEquals(direct.output_col, op.output_col);
+		    })) {
+			continue;
+		}
 		auto metadata_op = ToMetadataWindowLineageOp(op);
-		if (order_trim && op.kind == WindowLineageKind::DIRECT && op.source_table == direct_ops.front().source_table &&
-		    op.source_occurrence == direct_ops.front().source_occurrence &&
-		    StringUtil::CIEquals(op.source_col, direct_ops.front().source_col) &&
-		    StringUtil::CIEquals(op.output_col, direct_ops.front().output_col)) {
+		auto output_cast = output_casts.find(StringUtil::Lower(op.output_col));
+		if (output_cast != output_casts.end()) {
+			auto &cast = op.kind == WindowLineageKind::DIRECT ? metadata_op.source_cast : metadata_op.lookup_out_cast;
+			cast = SqlUtils::ComposeCastSpecs(output_cast->second, cast);
+		}
+		if (order_trim && op.kind == WindowLineageKind::DIRECT && op.source_table == seed.source_table &&
+		    op.source_occurrence == seed.source_occurrence && StringUtil::CIEquals(op.source_col, seed.source_col) &&
+		    StringUtil::CIEquals(op.output_col, seed.output_col)) {
 			metadata_op.order_col = order_col;
 			metadata_op.order_out = order_out;
 		}
-		out.push_back(std::move(metadata_op));
+		out.ops.push_back(std::move(metadata_op));
 	}
-	return !out.empty();
+	// Ops without a proven key still identify every source a partition reads.
+	return !out.ops.empty();
 }
 
 static bool IsGroupScopeTieSafeType(const LogicalType &type) {
@@ -3318,10 +3945,10 @@ static bool CollectGroupScopeColumnRefs(Expression &expr, vector<BoundColumnRefE
 }
 
 bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
-                                  vector<string> &partition_columns,
-                                  vector<RefreshMetadata::WindowPartitionLineageOp> &ops) {
+                                  vector<string> &partition_columns, RefreshMetadata::WindowPartitionLineage &lineage) {
 	partition_columns.clear();
-	ops.clear();
+	lineage = RefreshMetadata::WindowPartitionLineage();
+	auto &ops = lineage.ops;
 	auto decline = [](const char *reason) {
 		OPENIVM_DEBUG_PRINT("[WINDOW GROUP SCOPE] declined: %s\n", reason);
 		return false;
@@ -3567,7 +4194,9 @@ bool BuildWindowGroupScopeLineage(const CreateMVPlanFacts &facts, const vector<s
 	lookup.lookup_out = group_name;
 	lookup.null_safe = true;
 	ops.push_back(lookup);
-	partition_columns.push_back(output_name + "=" + group_name);
+	// The visible GROUP BY key is the refresh scope.
+	lineage.proven_columns = vector<string> {output_name};
+	partition_columns.push_back(RefreshMetadata::SerializeWindowColumn(output_name, group_name));
 	return true;
 }
 
@@ -3726,12 +4355,12 @@ static bool IsLinearWindowInput(LogicalOperator &node, const CreateMVPlanFacts &
 
 bool BuildLinearWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                           const vector<string> &output_names,
-                                          vector<RefreshMetadata::WindowPartitionLineageOp> &out) {
+                                          RefreshMetadata::WindowPartitionLineage &lineage) {
 	auto decline = [](const char *reason) {
 		OPENIVM_DEBUG_PRINT("[LINEAR WINDOW] lineage declined: %s\n", reason);
 		return false;
 	};
-	out.clear();
+	vector<RefreshMetadata::WindowPartitionLineageOp> out;
 	if (!facts.root || !facts.first_projection || partition_columns.size() != 1 || facts.windows.size() != 1 ||
 	    facts.source_occurrences.empty() || !facts.comparison_joins.empty() || !facts.outer_joins.empty() ||
 	    !facts.aggregates.empty()) {
@@ -3758,9 +4387,7 @@ bool BuildLinearWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const 
 		return decline("cannot resolve partition binding");
 	}
 
-	auto &spec = partition_columns[0];
-	auto pos = spec.find('=');
-	string output_col = pos == string::npos ? spec : spec.substr(0, pos);
+	auto output_col = RefreshMetadata::ParseWindowColumn(partition_columns[0]).first;
 	if (output_col.empty() || IncrementalTableNames::IsInternalColumn(output_col)) {
 		return decline("partition key is not visible");
 	}
@@ -3839,23 +4466,125 @@ bool BuildLinearWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const 
 		op.source = occurrence.table;
 		out.push_back(std::move(op));
 	}
-	return !out.empty();
+	if (out.empty()) {
+		return false;
+	}
+	// The visible key is the partition binding itself, so it is proven at the only window.
+	lineage = RefreshMetadata::WindowPartitionLineage();
+	lineage.ops = std::move(out);
+	lineage.proven_columns = vector<string> {output_col};
+	return true;
 }
 
-void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
-                                       const vector<string> &output_names) {
+// Scope refresh only when the stored output passes through the same source
+// value as the window key. A cast or a like-named join column can miss rows.
+static string FindQuotedWindowOutput(const CreateMVPlanFacts &facts, const LogicalProjection &projection,
+                                     const vector<string> &output_names, const string &name, bool order,
+                                     string &source_column) {
+	LogicalGet *source = nullptr;
+	ProjectionIndex source_index;
+	auto record_key = [&](const Expression &expr) {
+		if (!StringUtil::CIEquals(expr.GetName().GetIdentifierName(), name)) {
+			return true;
+		}
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		LogicalGet *get = nullptr;
+		ProjectionIndex index;
+		string column, cast;
+		if (!ResolveBindingToGetColumn(expr.Cast<BoundColumnRefExpression>().Binding(), facts, get, column, &index,
+		                               &cast) ||
+		    !cast.empty() || (source && (source != get || source_index != index))) {
+			return false;
+		}
+		source = get;
+		source_index = index;
+		source_column = std::move(column);
+		return true;
+	};
+	for (auto *window : facts.windows) {
+		for (auto &expression : window->expressions) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+				continue;
+			}
+			auto &bound = expression->Cast<BoundWindowExpression>();
+			if (order) {
+				for (auto &entry : bound.OrderBy()) {
+					if (!record_key(*entry.expression)) {
+						return "";
+					}
+				}
+			} else {
+				for (auto &entry : bound.Partitions()) {
+					if (!record_key(*entry)) {
+						return "";
+					}
+				}
+			}
+		}
+	}
+	for (idx_t i = 0; source && i < projection.expressions.size(); i++) {
+		auto &expr = *projection.expressions[i];
+		if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
+		LogicalGet *get = nullptr;
+		ProjectionIndex index;
+		string column, cast;
+		if (ResolveBindingToGetColumn(column_ref.Binding(), facts, get, column, &index, &cast) && get == source &&
+		    index == source_index && cast.empty()) {
+			auto output = ProjectionOutputName(projection, i, facts, output_names, column_ref);
+			if (!output.empty() && !IncrementalTableNames::IsInternalColumn(output)) {
+				return output;
+			}
+		}
+	}
+	return "";
+}
+
+void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
+                              const vector<string> &output_names, bool order) {
 	if (partition_columns.empty()) {
 		return;
 	}
 	auto *top_projection = facts.first_projection;
 	if (!top_projection) {
+		// Every key is read back under its own name; encode one that looks like an encoded mapping.
+		for (auto &column : partition_columns) {
+			if (RefreshMetadata::IsTaggedWindowColumn(column)) {
+				column = RefreshMetadata::SerializeWindowColumn(column, column);
+			}
+		}
 		return;
 	}
 
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
+	vector<string> resolved;
 	for (auto &partition_column : partition_columns) {
 		if (partition_column.find('=') != string::npos) {
+			string source;
+			auto output = spine.projections.empty()
+			                  ? string()
+			                  : FindQuotedWindowOutput(facts, *spine.projections.front(), output_names,
+			                                           partition_column, order, source);
+			if (!output.empty()) {
+				// Preserve that this key needed quoted-name resolution even
+				// if the underlying physical column has an ordinary name.
+				resolved.push_back(
+				    RefreshMetadata::SerializeWindowColumn(output, source, source.find('=') == string::npos));
+			} else if (order) {
+				partition_columns.clear();
+				return;
+			} else {
+				// Refreshing by the remaining keys still covers every partition of this one.
+				OPENIVM_DEBUG_PRINT("[WINDOW] Partition key '%s' has no stored output; scoping without it\n",
+				                    partition_column.c_str());
+			}
 			continue;
 		}
+		string output_column;
 		for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
 			auto &expr = top_projection->expressions[expr_i];
 			auto *bcr = GetColumnRefThroughCasts(expr.get());
@@ -3873,11 +4602,25 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 			}
 			string output_col = ProjectionOutputName(*top_projection, expr_i, facts, output_names, *bcr);
 			if (!output_col.empty() && !IncrementalTableNames::IsInternalColumn(output_col)) {
-				partition_column = output_col + "=" + partition_column;
+				output_column = std::move(output_col);
 			}
 			break;
 		}
+		if (!output_column.empty()) {
+			resolved.push_back(RefreshMetadata::SerializeWindowColumn(output_column, partition_column));
+		} else if (!RefreshMetadata::IsTaggedWindowColumn(partition_column)) {
+			// An unresolved key keeps its bare name: a same-named output may be a transformed expression.
+			resolved.push_back(partition_column);
+		} else if (order) {
+			// A bare name with the encoding prefix would read back as a mapping. Order keys keep their name.
+			resolved.push_back(RefreshMetadata::SerializeWindowColumn(partition_column, partition_column));
+		} else {
+			// No raw output carries this partition key, so it cannot scope the refresh.
+			OPENIVM_DEBUG_PRINT("[WINDOW] Partition key '%s' has no stored output; scoping without it\n",
+			                    partition_column.c_str());
+		}
 	}
+	partition_columns = std::move(resolved);
 }
 
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
@@ -4308,7 +5051,9 @@ vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<str
 	for (auto &name : output_names) {
 		name = SanitizeOutputName(name);
 	}
-	AppendHiddenOutputNames(select_plan, output_names);
+	if (select_plan) {
+		AppendHiddenOutputNames(select_plan, output_names);
+	}
 	DeduplicateOutputNames(output_names);
 	return output_names;
 }

@@ -88,10 +88,11 @@ struct DeltaViewModel {
 	vector<string> group_columns;
 	vector<string> window_partition_columns;
 	vector<string> window_order_columns;
+	bool window_requires_result_diff = false;
 	vector<string> aggregate_types;
 	vector<DeltaModelNode> nodes;
 	DeltaModelProfileCounts profile_counts;
-	vector<RefreshMetadata::WindowPartitionLineageOp> window_lineage_ops;
+	RefreshMetadata::WindowPartitionLineage window_lineage;
 	RefreshMetadata::ProjectionKeyLineage projection_lineage;
 	RefreshMetadata::LeftJoinKeySource left_join_key_source;
 	vector<RefreshMetadata::FullOuterScope> full_outer_scopes;

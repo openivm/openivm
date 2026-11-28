@@ -44,7 +44,7 @@ WHERE H_AMOUNT > 0;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f686973746f72795f77696e646f77_';
 ----
-H_W_ID=H_W_ID
+json:{"window_columns":["H_W_ID=H_W_ID"],"requires_result_diff":"false"}
 
 query I
 SELECT (lineage_json LIKE '{"v":1,"items":[{"k":"window_partition"%')::INT FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f686973746f72795f77696e646f77_';
@@ -118,7 +118,7 @@ query I
 SELECT group_columns FROM openivm_views
 WHERE view_sql_name = 'mv_window_multi_scope' AND view_catalog = 'dl';
 ----
-w=w
+json:{"window_columns":["w=w"],"requires_result_diff":"false"}
 
 # Batch conflicting operations before a single refresh. The inserted GC row is
 # updated before refresh, while another GC row is updated and then deleted.
@@ -216,7 +216,7 @@ LEFT JOIN dl.window_join_codes c
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f77696e646f775f6a6f696e_';
 ----
-acct_id=acct_id
+json:{"window_columns":["acct_id=acct_id"],"requires_result_diff":"false"}
 
 statement ok
 SET openivm_files_path='__TEST_DIR__';
@@ -513,7 +513,7 @@ FROM dl.window_composite_src;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_';
 ----
-w_id=w_id,d_id=d_id
+json:{"window_columns":["w_id=w_id","d_id=d_id"],"requires_result_diff":"false"}
 
 statement ok
 INSERT INTO dl.window_composite_src VALUES
@@ -1039,7 +1039,7 @@ WHERE c.ca_id IS NOT NULL;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6163636f756e74735f6c696b65_';
 ----
-account_id=ca_id
+json:{"window_columns":["account_id=ca_id"],"requires_result_diff":"false"}
 
 statement ok
 INSERT INTO dl.accounts_tax_src VALUES
@@ -1402,7 +1402,7 @@ FROM dl.window_upstream_base;
 query I
 SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f77696e646f775f757073747265616d_';
 ----
-acct_id=acct_id
+json:{"window_columns":["acct_id=acct_id"],"requires_result_diff":"false"}
 
 statement ok
 INSERT INTO dl.window_upstream_src VALUES
@@ -1502,3 +1502,820 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Older versions stored an unprojected order column as a bare name in the list.
+statement ok
+CREATE TABLE dl.legacy_window_order (k INT, v INT, "json:sort" INT);
+INSERT INTO dl.legacy_window_order VALUES (1,10,1),(1,20,2),(2,30,3);
+CREATE VIEW legacy_window_expected AS
+    SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY "json:sort") AS rn
+    FROM dl.legacy_window_order;
+CREATE MATERIALIZED VIEW dl.legacy_window_mv AS
+    SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY "json:sort") AS rn
+    FROM dl.legacy_window_order;
+UPDATE openivm_views SET window_order_columns = 'json:["json:sort"]'
+WHERE view_sql_name = 'legacy_window_mv';
+
+statement ok
+INSERT INTO dl.legacy_window_order VALUES (1,5,0),(2,40,4);
+UPDATE dl.legacy_window_order SET v=25 WHERE v=20;
+DELETE FROM dl.legacy_window_order WHERE v IN (10,40);
+
+statement ok
+PRAGMA refresh('dl.legacy_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.legacy_window_mv EXCEPT ALL FROM legacy_window_expected)
+    UNION ALL
+    (FROM legacy_window_expected EXCEPT ALL FROM dl.legacy_window_mv)
+);
+----
+0
+
+# A parent update in a self-join affects the child partitions even though the
+# lake tracks one physical source and the parent's own partition is unrelated.
+statement ok
+CREATE TABLE dl.quoted_window_hierarchy (id INT, parent INT, "p=key" INT, v INT);
+INSERT INTO dl.quoted_window_hierarchy VALUES (1,100,1,10),(2,100,1,20),(3,100,2,30),
+    (4,200,3,40),(100,NULL,999,99),(200,NULL,998,199);
+CREATE VIEW quoted_window_self_expected AS
+    SELECT a."p=key" AS pk, a.id, b.v,
+           row_number() OVER (PARTITION BY a."p=key" ORDER BY a.id) AS rn
+    FROM dl.quoted_window_hierarchy a JOIN dl.quoted_window_hierarchy b ON a.parent = b.id;
+CREATE MATERIALIZED VIEW dl.quoted_window_self_mv AS
+    SELECT a."p=key" AS pk, a.id, b.v,
+           row_number() OVER (PARTITION BY a."p=key" ORDER BY a.id) AS rn
+    FROM dl.quoted_window_hierarchy a JOIN dl.quoted_window_hierarchy b ON a.parent = b.id;
+
+statement ok
+INSERT INTO dl.quoted_window_hierarchy VALUES (101,NULL,997,100),(102,NULL,996,101);
+UPDATE dl.quoted_window_hierarchy SET v=105 WHERE id=100;
+DELETE FROM dl.quoted_window_hierarchy WHERE id=102;
+
+statement ok
+PRAGMA refresh('dl.quoted_window_self_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_window_self_mv EXCEPT ALL FROM quoted_window_self_expected)
+    UNION ALL
+    (FROM quoted_window_self_expected EXCEPT ALL FROM dl.quoted_window_self_mv)
+);
+----
+0
+
+# Equality on the partition key proves that changes through either alias can
+# only affect that key. The change feed suffices without a full result diff.
+statement ok
+SET openivm_archive_compiled_sql = true;
+CREATE TABLE dl.same_key_window_source (id INT, k INT, v INT);
+INSERT INTO dl.same_key_window_source VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,3,50);
+CREATE VIEW same_key_window_expected AS
+    SELECT a.k, a.id AS aid, b.id AS bid, b.v,
+           row_number() OVER (PARTITION BY a.k ORDER BY a.id,b.id) AS rn
+    FROM dl.same_key_window_source a JOIN dl.same_key_window_source b ON a.k=b.k;
+CREATE MATERIALIZED VIEW dl.same_key_window_mv AS
+    SELECT a.k, a.id AS aid, b.id AS bid, b.v,
+           row_number() OVER (PARTITION BY a.k ORDER BY a.id,b.id) AS rn
+    FROM dl.same_key_window_source a JOIN dl.same_key_window_source b ON a.k=b.k;
+
+statement ok
+INSERT INTO dl.same_key_window_source VALUES (6,1,60),(7,1,70);
+UPDATE dl.same_key_window_source SET v=11 WHERE id=1;
+DELETE FROM dl.same_key_window_source WHERE id=7;
+
+statement ok
+PRAGMA refresh('dl.same_key_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.same_key_window_mv EXCEPT ALL FROM same_key_window_expected)
+    UNION ALL
+    (FROM same_key_window_expected EXCEPT ALL FROM dl.same_key_window_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'same_key_window_mv');
+----
+true
+
+# Simulate a definition created before the persisted key proof was added.
+statement ok
+UPDATE openivm_views SET lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'same_key_window_mv';
+INSERT INTO dl.same_key_window_source VALUES (8,2,80),(9,2,90);
+UPDATE dl.same_key_window_source SET v=31 WHERE id=3;
+DELETE FROM dl.same_key_window_source WHERE id=9;
+
+statement ok
+PRAGMA refresh('dl.same_key_window_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.same_key_window_mv EXCEPT ALL FROM same_key_window_expected)
+    UNION ALL
+    (FROM same_key_window_expected EXCEPT ALL FROM dl.same_key_window_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) >= 2
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'same_key_window_mv');
+----
+true
+
+# Learning a second, quoted key must not lose the single-key change-feed path.
+statement ok
+CREATE TABLE dl.quoted_composite_source (id INT, k INT, "q=1" INT, v INT);
+INSERT INTO dl.quoted_composite_source VALUES (1,1,10,10),(2,1,10,20),(3,1,11,30),(4,2,20,40);
+CREATE VIEW quoted_composite_expected AS
+    SELECT id,k,"q=1" AS q2,v,row_number() OVER (PARTITION BY k,"q=1" ORDER BY id) AS rn
+    FROM dl.quoted_composite_source;
+CREATE MATERIALIZED VIEW dl.quoted_composite_mv AS
+    SELECT id,k,"q=1" AS q2,v,row_number() OVER (PARTITION BY k,"q=1" ORDER BY id) AS rn
+    FROM dl.quoted_composite_source;
+
+statement ok
+INSERT INTO dl.quoted_composite_source VALUES (5,1,10,50),(6,1,10,60);
+UPDATE dl.quoted_composite_source SET v=55 WHERE id=5;
+DELETE FROM dl.quoted_composite_source WHERE id=6;
+
+statement ok
+PRAGMA refresh('dl.quoted_composite_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_composite_mv EXCEPT ALL FROM quoted_composite_expected)
+    UNION ALL
+    (FROM quoted_composite_expected EXCEPT ALL FROM dl.quoted_composite_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_composite_mv');
+----
+true
+
+# The second key can also acquire its spelling through a projected alias.
+statement ok
+CREATE VIEW quoted_alias_expected AS
+    SELECT id,k,"v=alias" AS vkey,row_number() OVER (PARTITION BY k,"v=alias" ORDER BY id) AS rn
+    FROM (SELECT id,k,v AS "v=alias" FROM dl.same_key_window_source) input;
+CREATE MATERIALIZED VIEW dl.quoted_alias_mv AS
+    SELECT id,k,"v=alias" AS vkey,row_number() OVER (PARTITION BY k,"v=alias" ORDER BY id) AS rn
+    FROM (SELECT id,k,v AS "v=alias" FROM dl.same_key_window_source) input;
+
+statement ok
+INSERT INTO dl.same_key_window_source VALUES (60,2,31),(61,2,33);
+UPDATE dl.same_key_window_source SET v=80 WHERE id=60;
+DELETE FROM dl.same_key_window_source WHERE id=61;
+
+statement ok
+PRAGMA refresh('dl.quoted_alias_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_alias_mv EXCEPT ALL FROM quoted_alias_expected)
+    UNION ALL
+    (FROM quoted_alias_expected EXCEPT ALL FROM dl.quoted_alias_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_alias_mv');
+----
+true
+
+# A visible namesake with a different value cannot scope a composite window.
+statement ok
+CREATE TABLE dl.window_scope_namesake (id INT, k INT, "json:q" INT, v INT);
+INSERT INTO dl.window_scope_namesake VALUES (10,2,8,100),(20,2,8,200),(30,3,8,300),(40,4,9,400);
+CREATE VIEW window_scope_namesake_expected AS
+    SELECT k::BOOLEAN AS k, "json:q", id, v,
+           row_number() OVER (PARTITION BY k,"json:q" ORDER BY id) AS rn
+    FROM dl.window_scope_namesake;
+CREATE MATERIALIZED VIEW dl.window_scope_namesake_mv AS
+    SELECT k::BOOLEAN AS k, "json:q", id, v,
+           row_number() OVER (PARTITION BY k,"json:q" ORDER BY id) AS rn
+    FROM dl.window_scope_namesake;
+INSERT INTO dl.window_scope_namesake VALUES (5,2,8,50),(6,2,8,60);
+UPDATE dl.window_scope_namesake SET v=215 WHERE id=20;
+DELETE FROM dl.window_scope_namesake WHERE id=6;
+
+statement ok
+PRAGMA refresh('dl.window_scope_namesake_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.window_scope_namesake_mv EXCEPT ALL FROM window_scope_namesake_expected)
+    UNION ALL
+    (FROM window_scope_namesake_expected EXCEPT ALL FROM dl.window_scope_namesake_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) = 0
+       AND count(*) FILTER (WHERE contains(sql, 'row_number()')) = 1
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_scope_namesake_mv');
+----
+true
+
+# The original DuckLake SQL keeps quoted names that LPTS sanitizes.
+statement ok
+CREATE VIEW quoted_limit_single_expected AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY "json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+CREATE MATERIALIZED VIEW dl.quoted_limit_single_mv AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY "json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+CREATE VIEW quoted_limit_composite_expected AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY k,"json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+CREATE MATERIALIZED VIEW dl.quoted_limit_composite_mv AS
+    SELECT k,"json:q",id,v,
+           row_number() OVER (PARTITION BY k,"json:q" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_scope_namesake ORDER BY id LIMIT 3) limited;
+
+foreach version fresh legacy
+
+statement ok
+UPDATE openivm_views
+SET group_columns = CASE view_sql_name
+    WHEN 'quoted_limit_single_mv' THEN 'json_q=json:q' ELSE 'k=k,json_q=json:q' END
+WHERE '{version}' = 'legacy'
+  AND view_sql_name IN ('quoted_limit_single_mv','quoted_limit_composite_mv');
+INSERT INTO dl.window_scope_namesake VALUES
+    (CASE WHEN '{version}' = 'fresh' THEN 1 ELSE 0 END, 9, 90, 100),(90,91,92,93);
+UPDATE dl.window_scope_namesake SET v=v+1 WHERE id=90;
+DELETE FROM dl.window_scope_namesake WHERE id=90;
+
+foreach scope single composite
+
+statement ok
+PRAGMA refresh('dl.quoted_limit_{scope}_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_limit_{scope}_mv EXCEPT ALL FROM quoted_limit_{scope}_expected)
+    UNION ALL
+    (FROM quoted_limit_{scope}_expected EXCEPT ALL FROM dl.quoted_limit_{scope}_mv)
+);
+----
+0
+
+query I
+SELECT bool_or(contains(sql, 'openivm_window_current') AND contains(sql, '"json:q"'))
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_limit_{scope}_mv')
+GROUP BY version ORDER BY version DESC LIMIT 1;
+----
+true
+
+endloop
+
+endloop
+
+# The change feed contains the challenger, but the unchanged old winner
+# can occupy a different window partition.
+statement ok
+CREATE TABLE dl.window_winner_scores (id INT, bucket INT, "p=key" INT, score INT);
+INSERT INTO dl.window_winner_scores VALUES (1,1,1,100),(2,2,2,90),(3,1,3,80);
+CREATE VIEW lake_window_winner_expected AS
+    SELECT id, "p=key" AS pk, score, row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (bucket) * FROM dl.window_winner_scores ORDER BY bucket, score DESC, id) winners;
+CREATE MATERIALIZED VIEW dl.window_winner_mv AS
+    SELECT id, "p=key" AS pk, score, row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (bucket) * FROM dl.window_winner_scores ORDER BY bucket, score DESC, id) winners;
+
+statement ok
+INSERT INTO dl.window_winner_scores VALUES (4,1,3,110),(5,3,4,1);
+UPDATE dl.window_winner_scores SET score=120 WHERE id=4;
+DELETE FROM dl.window_winner_scores WHERE id=5;
+
+statement ok
+PRAGMA refresh('dl.window_winner_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.window_winner_mv EXCEPT ALL FROM lake_window_winner_expected)
+    UNION ALL
+    (FROM lake_window_winner_expected EXCEPT ALL FROM dl.window_winner_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_winner_mv');
+----
+true
+
+# A saved pre-upgrade LIMIT can evict a partition absent from the change feed.
+statement ok
+CREATE TABLE dl.window_legacy_limit (id INT, k INT, v INT);
+INSERT INTO dl.window_legacy_limit VALUES (10,1,100),(20,2,200),(30,3,300),(40,4,400);
+CREATE VIEW lake_legacy_limit_expected AS
+    SELECT k,id,v,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_legacy_limit ORDER BY id LIMIT 3) limited;
+CREATE MATERIALIZED VIEW dl.lake_legacy_limit_mv AS
+    SELECT k,id,v,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_legacy_limit ORDER BY id LIMIT 3) limited;
+UPDATE openivm_views SET group_columns = 'k=k',
+    lineage_json = regexp_replace(lineage_json, ',"proven_columns":\[[^]]*\]', '')
+WHERE view_sql_name = 'lake_legacy_limit_mv';
+INSERT INTO dl.window_legacy_limit VALUES (5,9,500),(31,8,310);
+UPDATE dl.window_legacy_limit SET v=550 WHERE id=5;
+DELETE FROM dl.window_legacy_limit WHERE id=31;
+
+statement ok
+PRAGMA refresh('dl.lake_legacy_limit_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.lake_legacy_limit_mv EXCEPT ALL FROM lake_legacy_limit_expected)
+    UNION ALL
+    (FROM lake_legacy_limit_expected EXCEPT ALL FROM dl.lake_legacy_limit_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'lake_legacy_limit_mv');
+----
+true
+
+# DISTINCT ON by the window key can only replace a winner in the same partition.
+statement ok
+CREATE TABLE dl.partition_winner_scores (id INT, k INT, "q=key" INT, score INT);
+INSERT INTO dl.partition_winner_scores VALUES (1,1,10,100),(2,2,20,90),(3,1,11,80),(4,3,30,70);
+CREATE VIEW partition_winner_expected AS
+    SELECT id,k,score,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
+CREATE MATERIALIZED VIEW dl.partition_winner_mv AS
+    SELECT id,k,score,row_number() OVER (PARTITION BY k ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
+
+# The selected DuckLake key k covers all of its narrower (k, "q=key") partitions.
+statement ok
+CREATE VIEW composite_winner_expected AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
+CREATE MATERIALIZED VIEW dl.composite_winner_mv AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON (k) * FROM dl.partition_winner_scores ORDER BY k,score DESC,id) winners;
+
+# A distinct key that preserves only the secondary partition column is insufficient.
+statement ok
+CREATE VIEW secondary_winner_expected AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON ("q=key") * FROM dl.partition_winner_scores ORDER BY "q=key",score DESC,id) winners;
+CREATE MATERIALIZED VIEW dl.secondary_winner_mv AS
+    SELECT id,k,"q=key" AS q2,score,row_number() OVER (PARTITION BY k,"q=key" ORDER BY id) AS rn
+    FROM (SELECT DISTINCT ON ("q=key") * FROM dl.partition_winner_scores ORDER BY "q=key",score DESC,id) winners;
+
+statement ok
+INSERT INTO dl.partition_winner_scores VALUES (5,1,20,110),(6,3,31,1);
+UPDATE dl.partition_winner_scores SET score=120 WHERE id=5;
+DELETE FROM dl.partition_winner_scores WHERE id=6;
+
+statement ok
+PRAGMA refresh('dl.partition_winner_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.partition_winner_mv EXCEPT ALL FROM partition_winner_expected)
+    UNION ALL
+    (FROM partition_winner_expected EXCEPT ALL FROM dl.partition_winner_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'partition_winner_mv');
+----
+true
+
+statement ok
+PRAGMA refresh('dl.composite_winner_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.composite_winner_mv EXCEPT ALL FROM composite_winner_expected)
+    UNION ALL
+    (FROM composite_winner_expected EXCEPT ALL FROM dl.composite_winner_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'composite_winner_mv');
+----
+true
+
+statement ok
+PRAGMA refresh('dl.secondary_winner_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.secondary_winner_mv EXCEPT ALL FROM secondary_winner_expected)
+    UNION ALL
+    (FROM secondary_winner_expected EXCEPT ALL FROM dl.secondary_winner_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'secondary_winner_mv');
+----
+true
+
+# User rowids can repeat across partitions and must not be used for physical deletes.
+statement ok
+CREATE TABLE dl.quoted_window_rowids (id INT, "p=key" INT, "RoWiD" INT, score INT);
+INSERT INTO dl.quoted_window_rowids VALUES (1,1,7,100),(2,2,7,90),(3,1,8,80),(4,3,8,70);
+CREATE VIEW quoted_rowid_expected AS
+    SELECT id,"p=key" AS pk,"RoWiD",score,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.quoted_window_rowids;
+CREATE MATERIALIZED VIEW dl.quoted_rowid_mv AS
+    SELECT id,"p=key" AS pk,"RoWiD",score,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.quoted_window_rowids;
+
+statement ok
+INSERT INTO dl.quoted_window_rowids VALUES (5,1,9,110),(6,1,10,1);
+UPDATE dl.quoted_window_rowids SET score=120 WHERE id=1;
+DELETE FROM dl.quoted_window_rowids WHERE id=6;
+
+statement ok
+PRAGMA refresh('dl.quoted_rowid_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_rowid_mv EXCEPT ALL FROM quoted_rowid_expected)
+    UNION ALL
+    (FROM quoted_rowid_expected EXCEPT ALL FROM dl.quoted_rowid_mv)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions')) > 0
+       AND count(*) FILTER (WHERE contains(sql, 'openivm_window_changed')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_rowid_mv');
+----
+true
+
+# A sign-only update still replaces the projected zero in both diff paths.
+statement ok
+CREATE TABLE dl.window_zero_source (id INT, "p=key" INT, score DOUBLE);
+INSERT INTO dl.window_zero_source VALUES (1,1,0.0),(2,2,90),(3,1,80),(4,3,70);
+CREATE VIEW window_zero_expected AS
+    SELECT id,"p=key" AS pk,score,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_zero_source;
+CREATE MATERIALIZED VIEW dl.window_zero_row_mv AS
+    SELECT id,"p=key" AS pk,score,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_zero_source;
+CREATE MATERIALIZED VIEW dl.window_zero_diff_mv AS
+    SELECT id,"p=key" AS pk,score,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_zero_source ORDER BY id LIMIT 10) input;
+
+statement ok
+INSERT INTO dl.window_zero_source VALUES (5,3,1);
+UPDATE dl.window_zero_source SET score='-0.0'::DOUBLE WHERE id=1;
+DELETE FROM dl.window_zero_source WHERE id=5;
+
+statement ok
+PRAGMA refresh('dl.window_zero_row_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,signbit(score) FROM dl.window_zero_row_mv EXCEPT ALL SELECT *,signbit(score) FROM window_zero_expected)
+    UNION ALL
+    (SELECT *,signbit(score) FROM window_zero_expected EXCEPT ALL SELECT *,signbit(score) FROM dl.window_zero_row_mv)
+);
+----
+0
+
+statement ok
+PRAGMA refresh('dl.window_zero_diff_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,signbit(score) FROM dl.window_zero_diff_mv EXCEPT ALL SELECT *,signbit(score) FROM window_zero_expected)
+    UNION ALL
+    (SELECT *,signbit(score) FROM window_zero_expected EXCEPT ALL SELECT *,signbit(score) FROM dl.window_zero_diff_mv)
+);
+----
+0
+
+query TI
+SELECT view_sql_name,
+       count(*) FILTER (WHERE contains(sql, CASE view_sql_name
+               WHEN 'window_zero_row_mv' THEN 'openivm_window_changed' ELSE 'openivm_window_current' END)) > 0
+FROM openivm_views v JOIN openivm_compiled_statements s USING (view_name)
+WHERE operation = 'refresh' AND view_sql_name IN ('window_zero_row_mv', 'window_zero_diff_mv')
+GROUP BY view_sql_name ORDER BY view_sql_name;
+----
+window_zero_diff_mv	true
+window_zero_row_mv	true
+
+# Both window diff paths retain representations that SQL equality merges.
+foreach snapshot true false
+
+statement ok
+SET openivm_snapshot_publication = {snapshot};
+CREATE TABLE dl.window_identity_{snapshot} (id INT, "p=key" INT, duration INTERVAL, reading DOUBLE);
+INSERT INTO dl.window_identity_{snapshot} VALUES
+    (1,1,INTERVAL '1 month',1),(2,2,INTERVAL '1 day','-0.0'::DOUBLE),(3,3,INTERVAL '2 days',3);
+CREATE VIEW window_identity_expected_{snapshot} AS
+    SELECT id,"p=key" AS pk,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_identity_{snapshot};
+CREATE MATERIALIZED VIEW dl.window_identity_compact_{snapshot} AS
+    SELECT id,"p=key" AS pk,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_identity_{snapshot};
+CREATE MATERIALIZED VIEW dl.window_identity_result_{snapshot} AS
+    SELECT id,"p=key" AS pk,duration,list_value(reading) AS readings,
+           row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_identity_{snapshot} ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW dl.window_identity_compact_child_{snapshot} AS
+    SELECT * FROM dl.window_identity_compact_{snapshot} WHERE id > 0;
+CREATE MATERIALIZED VIEW dl.window_identity_result_child_{snapshot} AS
+    SELECT * FROM dl.window_identity_result_{snapshot} WHERE id > 0;
+
+statement ok
+DELETE FROM dl.window_identity_{snapshot} WHERE id IN (1,2);
+INSERT INTO dl.window_identity_{snapshot} VALUES
+    (1,1,INTERVAL '30 days',1),(2,2,INTERVAL '1 day','0.0'::DOUBLE),(4,3,INTERVAL '2 days',4);
+UPDATE dl.window_identity_{snapshot} SET reading=5 WHERE id=4;
+DELETE FROM dl.window_identity_{snapshot} WHERE id=4;
+
+foreach path compact result
+
+statement ok
+PRAGMA refresh('dl.window_identity_{path}_{snapshot}');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot})
+    UNION ALL
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_{snapshot})
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_child_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot})
+    UNION ALL
+    (SELECT *,date_part('month',duration),signbit(readings[1]) FROM window_identity_expected_{snapshot}
+     EXCEPT ALL
+     SELECT *,date_part('month',duration),signbit(readings[1]) FROM dl.window_identity_{path}_child_{snapshot})
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql,'openivm_internal_value_key') AND contains(sql,
+    CASE '{path}' WHEN 'compact' THEN 'openivm_window_changed' ELSE 'openivm_window_current' END)) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_identity_{path}_{snapshot}');
+----
+true
+
+endloop
+
+endloop
+
+# Session collation applies on the helper connections as well as the caller.
+statement ok
+SET SESSION default_collation = 'nocase';
+SET openivm_snapshot_publication = true;
+CREATE TABLE dl.window_collated_source (id INT, "p=key" INT, label VARCHAR);
+INSERT INTO dl.window_collated_source VALUES (1,1,'A'),(2,2,'B'),(3,3,'C');
+CREATE VIEW window_collated_expected AS
+    SELECT id,"p=key" AS pk,label,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_collated_source;
+CREATE MATERIALIZED VIEW dl.window_collated_compact AS
+    SELECT id,"p=key" AS pk,label,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM dl.window_collated_source;
+CREATE MATERIALIZED VIEW dl.window_collated_result AS
+    SELECT id,"p=key" AS pk,label,row_number() OVER (PARTITION BY "p=key" ORDER BY id) AS rn
+    FROM (SELECT * FROM dl.window_collated_source ORDER BY id LIMIT 10) input;
+CREATE MATERIALIZED VIEW dl.window_collated_compact_child AS
+    SELECT * FROM dl.window_collated_compact WHERE id > 0;
+CREATE MATERIALIZED VIEW dl.window_collated_result_child AS
+    SELECT * FROM dl.window_collated_result WHERE id > 0;
+
+statement ok
+DELETE FROM dl.window_collated_source WHERE id=1;
+INSERT INTO dl.window_collated_source VALUES (1,1,'a'),(4,3,'D');
+UPDATE dl.window_collated_source SET label='E' WHERE id=4;
+DELETE FROM dl.window_collated_source WHERE id=4;
+
+foreach path compact result
+
+statement ok
+PRAGMA refresh('dl.window_collated_{path}');
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(label) FROM dl.window_collated_{path} EXCEPT ALL SELECT *,hex(label) FROM window_collated_expected)
+    UNION ALL
+    (SELECT *,hex(label) FROM window_collated_expected EXCEPT ALL SELECT *,hex(label) FROM dl.window_collated_{path})
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT *,hex(label) FROM dl.window_collated_{path}_child EXCEPT ALL SELECT *,hex(label) FROM window_collated_expected)
+    UNION ALL
+    (SELECT *,hex(label) FROM window_collated_expected EXCEPT ALL SELECT *,hex(label) FROM dl.window_collated_{path}_child)
+);
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(sql, 'unhex(hex(') AND contains(sql,
+    CASE '{path}' WHEN 'compact' THEN 'openivm_window_changed' ELSE 'openivm_window_current' END)) > 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_collated_{path}');
+----
+true
+
+endloop
+
+statement ok
+SET SESSION default_collation = '';
+SET openivm_snapshot_publication = false;
+
+# A forced view-delta cascade must receive the signed old/new rows of every affected
+# partition from each DuckLake window path: the single-source change feed, the joined
+# lineage change feed and the result diff a nested LIMIT requires.
+statement ok
+CREATE TABLE dl.cwd_src (id INT, grp VARCHAR, val INT);
+CREATE TABLE dl.cwd_dim (grp VARCHAR, w INT);
+INSERT INTO dl.cwd_src VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',15),(5,'c',1);
+INSERT INTO dl.cwd_dim VALUES ('a',1),('b',2),('c',3);
+CREATE VIEW cwd_single_expected AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM dl.cwd_src;
+CREATE VIEW cwd_join_expected AS
+    SELECT s.id, s.grp, s.val, d.w, ROW_NUMBER() OVER (PARTITION BY s.grp ORDER BY s.val, s.id) AS rn
+    FROM dl.cwd_src s JOIN dl.cwd_dim d ON s.grp = d.grp;
+CREATE VIEW cwd_limit_expected AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM (SELECT * FROM dl.cwd_src ORDER BY id LIMIT 4) t;
+CREATE MATERIALIZED VIEW dl.cwd_single AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM dl.cwd_src;
+CREATE MATERIALIZED VIEW dl.cwd_join AS
+    SELECT s.id, s.grp, s.val, d.w, ROW_NUMBER() OVER (PARTITION BY s.grp ORDER BY s.val, s.id) AS rn
+    FROM dl.cwd_src s JOIN dl.cwd_dim d ON s.grp = d.grp;
+CREATE MATERIALIZED VIEW dl.cwd_limit AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM (SELECT * FROM dl.cwd_src ORDER BY id LIMIT 4) t;
+
+statement ok
+INSERT INTO dl.cwd_src VALUES (6,'a',5),(7,'c',9),(8,'d',2);
+UPDATE dl.cwd_src SET val = 30 WHERE id = 1;
+DELETE FROM dl.cwd_src WHERE id IN (3, 8);
+UPDATE dl.cwd_src SET grp = 'c' WHERE id = 4;
+UPDATE dl.cwd_dim SET w = 7 WHERE grp = 'a';
+
+query III
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions(''dl'', ''main'', ''cwd_src''')) > 0,
+       count(*) FILTER (WHERE sql LIKE 'INSERT INTO dl.main.openivm_delta___openivm_mv_%'
+                          AND sql LIKE '%CAST(-1 AS INTEGER)%' AND sql LIKE '%CAST(1 AS INTEGER)%'),
+       count(*) FILTER (WHERE contains(sql, 'openivm_window_changed_'))
+FROM openivm_compile_with_facts('cwd_single', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind = 'data';
+----
+true	1	0
+
+query III
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions(''dl'', ''main'', ''cwd_dim''')) > 0,
+       count(*) FILTER (WHERE sql LIKE 'INSERT INTO dl.main.openivm_delta___openivm_mv_%'
+                          AND sql LIKE '%CAST(-1 AS INTEGER)%' AND sql LIKE '%CAST(1 AS INTEGER)%'),
+       count(*) FILTER (WHERE contains(sql, 'openivm_window_changed_'))
+FROM openivm_compile_with_facts('cwd_join', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind = 'data';
+----
+true	1	0
+
+query III
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current_')) > 0,
+       count(*) FILTER (WHERE sql LIKE 'INSERT INTO dl.main.openivm_delta___openivm_mv_%'
+                          AND sql LIKE '%CAST(-1 AS INTEGER)%' AND sql LIKE '%CAST(1 AS INTEGER)%'),
+       count(*) FILTER (WHERE contains(sql, 'openivm_window_changed_'))
+FROM openivm_compile_with_facts('cwd_limit', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind = 'data';
+----
+true	1	0
+
+statement ok
+PRAGMA refresh('cwd_single');
+PRAGMA refresh('cwd_join');
+PRAGMA refresh('cwd_limit');
+
+foreach mv cwd_single cwd_join cwd_limit
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.{mv} EXCEPT ALL FROM {mv}_expected)
+    UNION ALL
+    (FROM {mv}_expected EXCEPT ALL FROM dl.{mv})
+);
+----
+0
+
+endloop
+
+# DuckLake stores the original spelling of a partition key that metadata records in its
+# prepared form. The change feed still scopes refresh by that key.
+statement ok
+SET openivm_archive_compiled_sql = true;
+CREATE TABLE dl.quoted_scope_src (id INT, "g,1" VARCHAR, val INT);
+INSERT INTO dl.quoted_scope_src SELECT i, chr((97 + i % 4)::INT), (i * 7) % 13 FROM range(30) t(i);
+CREATE VIEW quoted_scope_expected AS
+    SELECT id, "g,1", val, row_number() OVER (PARTITION BY "g,1" ORDER BY val, id) AS rn FROM dl.quoted_scope_src;
+CREATE MATERIALIZED VIEW dl.quoted_scope_mv AS
+    SELECT id, "g,1", val, row_number() OVER (PARTITION BY "g,1" ORDER BY val, id) AS rn FROM dl.quoted_scope_src;
+
+statement ok
+INSERT INTO dl.quoted_scope_src VALUES (100, 'b', 1), (101, 'e', 2);
+UPDATE dl.quoted_scope_src SET val = 99 WHERE id = 1;
+UPDATE dl.quoted_scope_src SET "g,1" = 'a' WHERE id = 2;
+DELETE FROM dl.quoted_scope_src WHERE id IN (3, 101);
+
+statement ok
+PRAGMA refresh('dl.quoted_scope_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.quoted_scope_mv EXCEPT ALL FROM quoted_scope_expected)
+    UNION ALL
+    (FROM quoted_scope_expected EXCEPT ALL FROM dl.quoted_scope_mv)
+);
+----
+0
+
+query I
+SELECT bool_or(contains(sql, 'ducklake_table_insertions')) AND NOT bool_or(contains(sql, 'openivm_window_current'))
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'quoted_scope_mv');
+----
+true

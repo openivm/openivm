@@ -535,6 +535,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 		auto lpts_start = create_profile_now();
 		auto serialize_plan = [&](unique_ptr<LogicalOperator> &candidate) {
+			PreserveBinaryCollationsForSerialization(*candidate);
 			// CREATE MATERIALIZED VIEW always stores the view body in DuckDB's own dialect.
 			// Refresh-time target dialects are selected per CompileFacts.
 			SqlDialect dialect = SqlDialect::DUCKDB;
@@ -970,7 +971,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 	}
 	auto lineage_start = create_profile_now();
-	PopulateDeltaViewModelLineage(view_model, facts, output_names);
+	PopulateDeltaViewModelLineage(view_model, facts, output_names, model_input.has_ducklake_source);
 	idx_t lineage_entry_count = 0;
 	string lineage_json = BuildDeltaViewModelLineageJson(view_model, lineage_entry_count);
 	int64_t lineage_duration_ms =
@@ -1229,8 +1230,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
-	string group_cols_val = ViewListSqlLiteralOrNull(cols_to_store);
-	string window_order_cols_val = ViewListSqlLiteralOrNull(window_order_columns);
+	optional<bool> window_requires_result_diff;
+	if (refresh_type == RefreshType::WINDOW_PARTITION) {
+		window_requires_result_diff = view_model.window_requires_result_diff;
+	}
+	string group_cols_val = ViewListSqlLiteralOrNull(cols_to_store, analysis.found_window, window_requires_result_diff);
+	string window_order_cols_val = ViewListSqlLiteralOrNull(window_order_columns, true);
 	string agg_types_val = ViewListSqlLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)
 	                        ? "null"
@@ -1570,6 +1575,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			initial_query = SqlUtils::ReplaceTableReferences(meta.selected_view_sql, "openivm_distinct_selected",
 			                                                 get_aux_state_target(meta.SelectionTable()));
 		}
+		if (target_is_ducklake && !lpts_fallback) {
+			initial_query = DuckLakeInitialLoadQuery(std::move(initial_query), output_names, output_types);
+		}
 		ddl.push_back("create table " + initial_load_target + " as " + initial_query);
 	}
 	if (staged_cross_catalog_replace) {
@@ -1704,9 +1712,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		if (parse_data_ref.is_replace) {
 			ddl.push_back(BuildPublishViewSQL(
-			    view_name, internal_catalog_prefix, published_query, visible_columns, visible_types, target_is_ducklake,
-			    SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {}, creation_timestamp,
-			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)));
+			    context, view_name, internal_catalog_prefix, published_query, visible_columns, visible_types,
+			    target_is_ducklake, SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {},
+			    creation_timestamp, SqlDialect::DUCKDB, "", "",
+			    RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE)));
 		}
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("published_query", published_query, view_name));
 		ddl.push_back(string(staged_cross_catalog_replace ? "CREATE OR REPLACE VIEW " : "CREATE VIEW ") + qvn +

@@ -10,6 +10,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -58,11 +59,30 @@ string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, 
 	if (type.IsFloating()) {
 		return NegativeZeroSQL(value);
 	}
-	if (type.id() == LogicalTypeId::VARCHAR &&
-	    (!StringType::GetCollation(type).empty() || !default_collation.empty())) {
+	if (IsCollatedString(type, default_collation)) {
 		return "unhex(hex(" + value + "))";
 	}
 	return EqualityCanHideValueIdentity(type) ? "openivm_internal_value_key(" + value + ")" : "";
+}
+
+string SqlUtils::ValueIdentitySQL(const string &value, const LogicalType &type, SqlDialect dialect,
+                                  const string &default_collation) {
+	if (type.IsFloating()) {
+		return NegativeZeroSQL(value, dialect);
+	}
+	return dialect == SqlDialect::DUCKDB ? ValueIdentitySQL(value, type, default_collation) : "";
+}
+
+bool SqlUtils::IsCollatedString(const LogicalType &type, const string &default_collation) {
+	return type.id() == LogicalTypeId::VARCHAR &&
+	       (!StringType::GetCollation(type).empty() || !default_collation.empty());
+}
+
+void SqlUtils::CopyDefaultCollation(ClientContext &from, ClientContext &to) {
+	auto collation = Settings::Get<DefaultCollationSetting>(from);
+	if (collation != Settings::Get<DefaultCollationSetting>(to)) {
+		Settings::Set<DefaultCollationSetting>(to, SetScope::SESSION, Value(std::move(collation)));
+	}
 }
 
 bool SqlUtils::EqualityCanHideValueIdentity(const LogicalType &type) {
