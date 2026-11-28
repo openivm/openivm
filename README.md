@@ -165,7 +165,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `PRAGMA refresh_status('view_name')` | Show refresh interval, last/next refresh, daemon status, and refresh strategy | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `PRAGMA refresh_cost('view_name')` | Show incremental refresh vs full recompute cost estimate (static + calibrated) | [Cost model](docs/internals/cost_model.md) |
 | `PRAGMA refresh_history('view_name')` | Show refresh execution history (for learned cost model) | [Refresh strategies](docs/refresh/refresh-strategies.md) |
-| `PRAGMA refresh_start_daemon` | (Re)start the background refresh daemon; not allowed inside a transaction | — |
+| `PRAGMA refresh_start_daemon` | (Re)start the current database's background refresh daemon; not allowed inside a transaction | — |
 | `PRAGMA openivm_files('view_name')` | Show paths and status of the compiled SQL reference files | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
 | `PRAGMA openivm_declare_rely_fk(child_table, child_columns, parent_table, parent_columns)` | Declare a trusted (RELY) foreign key used by FK-aware join pruning | — |
 | `openivm_compile_with_facts(view_name, facts_json)` | Table function: compile a refresh program as rows without executing it | [Build: compiled SQL](docs/build/building.md#inspect-or-save-compiled-sql-without-files) |

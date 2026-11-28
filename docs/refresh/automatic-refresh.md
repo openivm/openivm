@@ -29,7 +29,7 @@ Manual `PRAGMA refresh()` still works on views with `REFRESH EVERY` — the two 
 
 ## How it works
 
-The refresh daemon is a background `std::thread` started at extension load. It:
+Each database that loads OpenIVM gets its own refresh daemon, a background `std::thread` started at extension load and owned by that database. Several databases in one process each keep their own schedule. Closing a database stops its daemon; if a scheduling cycle is running at that moment, its refreshes finish first and the daemon then closes the database. The daemon:
 
 1. Wakes every 30 seconds
 2. Queries `openivm_views` in every attached catalog that has OpenIVM metadata for views with `refresh_interval IS NOT NULL`
@@ -40,7 +40,7 @@ Views refreshed through a cascade earlier in the same cycle are not refreshed ag
 
 The daemon reads settings through its own connection, so it sees global values only. Use `SET GLOBAL` for settings that should affect scheduled refreshes, for example `SET GLOBAL openivm_cascade_refresh = 'both'`.
 
-`PRAGMA refresh_start_daemon` stops any running daemon, starts a new one on the caller's database, and wakes it immediately. It returns `started = true` and cannot run inside a transaction.
+`PRAGMA refresh_start_daemon` stops the caller's database's daemon if it runs, starts a new one for that database, and wakes it immediately. Daemons of other databases are not affected. It returns `started = true` and cannot run inside a transaction.
 
 ## Checking refresh status
 

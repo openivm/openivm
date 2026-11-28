@@ -73,6 +73,19 @@ it does not assume the daemon finishes within a fixed sleep. Every refreshed MV
 is checked against its base query with `EXCEPT ALL` in both directions. The Python
 runner imposes a process timeout so a deadlock fails the test instead of hanging CI.
 
+## Refresh daemon lifetime
+
+```sh
+make test_daemon_lifetime
+```
+
+`test/integration/daemon_lifetime_test.cpp` checks that each database has its own
+daemon ([#34](https://github.com/openivm/openivm/issues/34)): two databases in one
+process both get scheduled refreshes, closing one leaves the other's daemon running,
+an idle daemon is joined as soon as its database closes, and a database closed while
+its daemon refreshes is closed by the daemon after that refresh commits. It waits for
+real daemon wake-ups, so it takes about a minute; the Python runner bounds hangs.
+
 ## Remote metadata integration test
 
 `test/integration/test_remote_metadata.py` stores OpenIVM metadata in PostgreSQL and runs

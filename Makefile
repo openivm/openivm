@@ -55,3 +55,11 @@ test_release_internal: test_concurrency
 test_concurrency:
 	cmake --build build/release --target concurrency_test
 	python3 test/integration/test_concurrency.py ./build/release/extension/openivm/concurrency_test
+
+.PHONY: test_daemon_lifetime
+
+test_release_internal: test_daemon_lifetime
+
+test_daemon_lifetime:
+	cmake --build build/release --target daemon_lifetime_test
+	python3 test/integration/test_daemon_lifetime.py ./build/release/extension/openivm/daemon_lifetime_test

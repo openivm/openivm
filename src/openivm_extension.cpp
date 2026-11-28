@@ -33,10 +33,6 @@
 
 namespace duckdb {
 
-// Global daemon instance — started unconditionally at extension load.
-// The daemon sleeps and periodically checks for scheduled views; no work if none exist.
-static shared_ptr<RefreshDaemon> global_daemon;
-
 static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context, TableFunctionBindInput &input,
                                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
@@ -399,11 +395,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    // Check daemon status
 		    string status = "'idle'";
 		    string effective_interval = interval_str;
-		    if (global_daemon) {
-			    if (global_daemon->IsRefreshing(view_key)) {
+		    auto daemon = RefreshDaemon::Get(*context.db);
+		    if (daemon) {
+			    if (daemon->IsRefreshing(view_key)) {
 				    status = "'refreshing'";
 			    }
-			    auto eff = global_daemon->GetEffectiveInterval(view_key);
+			    auto eff = daemon->GetEffectiveInterval(view_key);
 			    if (eff > 0) {
 				    effective_interval = to_string(eff);
 			    }
@@ -430,20 +427,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    if (!context.transaction.IsAutoCommit()) {
 			    throw TransactionException("The OpenIVM refresh daemon cannot be restarted inside a transaction");
 		    }
-		    if (global_daemon) {
-			    global_daemon->Stop();
-		    }
-		    global_daemon = make_shared_ptr<RefreshDaemon>();
-		    global_daemon->Start(*context.db);
-		    global_daemon->Wake();
+		    RefreshDaemon::Start(*context.db, true, true);
 		    return "SELECT true AS started;";
 	    },
 	    {}));
 
-	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).
+	// Start this database's refresh daemon unless disabled (e.g. shadow/compile-only DBs).
+	// The database owns it, so other databases in the process keep their own daemons.
 	if (!SqlUtils::GetBoolSetting(*con.context, "openivm_disable_daemon", false)) {
-		global_daemon = make_shared_ptr<RefreshDaemon>();
-		global_daemon->Start(instance);
+		RefreshDaemon::Start(instance);
 	}
 }
 

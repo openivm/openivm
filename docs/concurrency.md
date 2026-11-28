@@ -79,9 +79,10 @@ DuckDB allows one read-write process per database file, so this is also the only
 scheduled refresh, keep one long-lived process (a service, or a job runner that holds the connection) with the
 database open. While it holds the file, other processes can't open it at all, not even with `-readonly`.
 
-Only one refresh daemon exists per process. Opening a second database with OpenIVM in the same process moves the
-daemon to it, and scheduled refresh stops on the first ([#34](https://github.com/ila/openivm/issues/34)). Run one
-database per process if you rely on `REFRESH EVERY`.
+Each database that loads OpenIVM has its own refresh daemon, so a process can keep several databases open and
+all of them get their scheduled refreshes. Closing a database stops its daemon. If the database is closed during a
+scheduling cycle, the refreshes of that cycle finish first: the daemon then closes the database, and the file
+stays open until it does.
 
 The daemon reads settings through its own connection, so use `SET GLOBAL` for settings it should see. See
 [automatic refresh](refresh/automatic-refresh.md).
