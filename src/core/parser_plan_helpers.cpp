@@ -2904,6 +2904,33 @@ static const Expression &WindowKeyExpression(const Expression &expr, const Creat
 	return *current;
 }
 
+// A cast to VARCHAR that keeps distinct values distinct and equal values equal, so its result identifies exactly
+// the partitions of its input. Floating zeros and time zone renderings are excluded.
+static bool IsInjectiveTextCast(const LogicalType &from, const LogicalType &to) {
+	if (to.id() != LogicalTypeId::VARCHAR || !StringType::GetCollation(to).empty() || from.HasAlias()) {
+		return false;
+	}
+	switch (from.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::UUID:
+		return true;
+	default:
+		return from.IsIntegral();
+	}
+}
+
+// The window key under an injective text cast of a stored output, or nullptr.
+static const Expression *InjectiveTextCastChild(const Expression &key, const CreateMVPlanFacts &facts) {
+	if (!BoundCastExpression::IsCast(key)) {
+		return nullptr;
+	}
+	const auto &child = BoundCastExpression::Child(key.Cast<BoundFunctionExpression>());
+	return IsInjectiveTextCast(child.GetReturnType(), key.GetReturnType()) ? &WindowKeyExpression(child, facts)
+	                                                                       : nullptr;
+}
+
 static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &facts, bool integral_only) {
 	const auto &expression = WindowKeyExpression(key, facts);
 	const auto &type = expression.GetReturnType();
@@ -2926,6 +2953,9 @@ static bool IsDirectWindowKey(const Expression &key, const CreateMVPlanFacts &fa
 	const auto &child = BoundCastExpression::Child(expression.Cast<BoundFunctionExpression>());
 	const auto &from = child.GetReturnType();
 	const auto &to = expression.GetReturnType();
+	if (!integral_only && IsInjectiveTextCast(from, to)) {
+		return IsDirectWindowKey(child, facts, false);
+	}
 	return from.IsIntegral() && to.IsIntegral() && !from.HasAlias() && !to.HasAlias() &&
 	       BoundCastExpression::CastIsInvertible(from, to) && IsDirectWindowKey(child, facts, integral_only);
 }
@@ -3080,7 +3110,11 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 					auto output = StringUtil::Lower(output_col);
 					auto entry = window_keys.find(output);
 					if (entry != window_keys.end() && entry->second && !equal_keys(*entry->second, key, input)) {
-						entry->second = nullptr;
+						// A text form of the key still identifies the same partitions.
+						auto *window_key = InjectiveTextCastChild(*entry->second, facts);
+						if (!window_key || !equal_keys(*window_key, key, input)) {
+							entry->second = nullptr;
+						}
 					}
 					if (!IsEarlyWindowEvidence(first_windows, ref, input.end)) {
 						continue;
@@ -3217,15 +3251,27 @@ static unordered_set<string> NullExtendedWindowSources(const CreateMVPlanFacts &
 }
 
 vector<string> DuckLakeWindowScope(const vector<string> &partition_cols, const vector<string> &column_names) {
-	if (partition_cols.empty()) {
-		return {};
-	}
-	if (partition_cols.size() == 1) {
-		auto key = RefreshMetadata::ParseWindowColumn(partition_cols[0]).first;
-		if (std::find(column_names.begin(), column_names.end(), key) != column_names.end()) {
-			return partition_cols;
+	optional<vector<string>> sanitized_names;
+	// The key under its stored column name. DuckLake can store the original spelling of a
+	// name that metadata records in its prepared form, at the same output position. Only a
+	// single key is mapped: a composite scope keeps its existing choice of one exact key.
+	auto physical_key = [&](const string &spec) {
+		auto parsed = RefreshMetadata::ParseWindowColumn(spec);
+		if (std::find(column_names.begin(), column_names.end(), parsed.first) != column_names.end()) {
+			return spec;
 		}
-		return {};
+		if (!sanitized_names) {
+			sanitized_names = PrepareOutputNames(nullptr, column_names);
+		}
+		auto match = std::find_if(sanitized_names->begin(), sanitized_names->end(),
+		                          [&](const string &name) { return StringUtil::CIEquals(name, parsed.first); });
+		return match == sanitized_names->end() ? string()
+		                                       : RefreshMetadata::SerializeWindowColumn(
+		                                             column_names[match - sanitized_names->begin()], parsed.second);
+	};
+	if (partition_cols.size() == 1) {
+		auto key = physical_key(partition_cols[0]);
+		return key.empty() ? vector<string>() : vector<string> {std::move(key)};
 	}
 	// Preserve the existing single-key change-feed path when a quoted
 	// identifier adds a second common key. Filtering by the previously
@@ -3753,6 +3799,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			}
 		}
 	}
+	unordered_map<string, string> output_casts;
 	for (const auto &entry : covered) {
 		if (entry.second.size() != facts.source_occurrences.size()) {
 			continue;
@@ -3764,8 +3811,15 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		const auto *key = found->second;
 		// A computed namesake may have produced no lineage. Check the projected
 		// key against every window, using the equalities at that window's input.
+		string output_cast;
 		if (!IsCommonWindowKey(facts, *key, equal_keys)) {
-			continue;
+			auto *window_key = InjectiveTextCastChild(*key, facts);
+			if (!window_key || !IsCommonWindowKey(facts, *window_key, equal_keys)) {
+				continue;
+			}
+			// The output stores a text form of the window key, so changed keys are reported in that form.
+			output_cast = key->GetReturnType().ToString();
+			key = window_key;
 		}
 		const auto nullable_operand = [&](const WindowLineageOp &op) {
 			return StringUtil::CIEquals(op.output_col, entry.first) &&
@@ -3773,9 +3827,12 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		};
 		if (IsDirectWindowKey(*key, facts) && std::none_of(direct_ops.begin(), direct_ops.end(), nullable_operand)) {
 			out.proven_columns->push_back(entry.first);
+			if (!output_cast.empty()) {
+				output_casts.emplace(entry.first, std::move(output_cast));
+			}
 			continue;
 		}
-		if (!coalesce_candidates.count(entry.first) || preserved_source.empty()) {
+		if (!output_cast.empty() || !coalesce_candidates.count(entry.first) || preserved_source.empty()) {
 			continue;
 		}
 		// For one preserved input, every alternative must be discoverable
@@ -3820,6 +3877,11 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			continue;
 		}
 		auto metadata_op = ToMetadataWindowLineageOp(op);
+		auto output_cast = output_casts.find(StringUtil::Lower(op.output_col));
+		if (output_cast != output_casts.end()) {
+			auto &cast = op.kind == WindowLineageKind::DIRECT ? metadata_op.source_cast : metadata_op.lookup_out_cast;
+			cast = SqlUtils::ComposeCastSpecs(output_cast->second, cast);
+		}
 		if (order_trim && op.kind == WindowLineageKind::DIRECT && op.source_table == seed.source_table &&
 		    op.source_occurrence == seed.source_occurrence && StringUtil::CIEquals(op.source_col, seed.source_col) &&
 		    StringUtil::CIEquals(op.output_col, seed.output_col)) {
@@ -4489,14 +4551,20 @@ void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &pa
 	}
 	auto *top_projection = facts.first_projection;
 	if (!top_projection) {
+		// Every key is read back under its own name; encode one that looks like an encoded mapping.
+		for (auto &column : partition_columns) {
+			if (RefreshMetadata::IsTaggedWindowColumn(column)) {
+				column = RefreshMetadata::SerializeWindowColumn(column, column);
+			}
+		}
 		return;
 	}
 
+	auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
 	vector<string> resolved;
 	for (auto &partition_column : partition_columns) {
 		if (partition_column.find('=') != string::npos) {
 			string source;
-			auto spine = ViewOutputSpine(facts.root, /*include_distinct=*/true);
 			auto output = spine.projections.empty()
 			                  ? string()
 			                  : FindQuotedWindowOutput(facts, *spine.projections.front(), output_names,
@@ -4538,10 +4606,19 @@ void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &pa
 			}
 			break;
 		}
-		// An unresolved key keeps its bare name: a same-named output may be a transformed expression.
-		resolved.push_back(output_column.empty()
-		                       ? partition_column
-		                       : RefreshMetadata::SerializeWindowColumn(output_column, partition_column));
+		if (!output_column.empty()) {
+			resolved.push_back(RefreshMetadata::SerializeWindowColumn(output_column, partition_column));
+		} else if (!RefreshMetadata::IsTaggedWindowColumn(partition_column)) {
+			// An unresolved key keeps its bare name: a same-named output may be a transformed expression.
+			resolved.push_back(partition_column);
+		} else if (order) {
+			// A bare name with the encoding prefix would read back as a mapping. Order keys keep their name.
+			resolved.push_back(RefreshMetadata::SerializeWindowColumn(partition_column, partition_column));
+		} else {
+			// No raw output carries this partition key, so it cannot scope the refresh.
+			OPENIVM_DEBUG_PRINT("[WINDOW] Partition key '%s' has no stored output; scoping without it\n",
+			                    partition_column.c_str());
+		}
 	}
 	partition_columns = std::move(resolved);
 }

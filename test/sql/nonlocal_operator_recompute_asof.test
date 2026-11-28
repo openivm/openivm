@@ -703,8 +703,9 @@ WHERE operation = 'refresh'
 ----
 true
 
-# A key whose lineage covers every source but is not a proven direct key (a VARCHAR
-# cast is not invertible) keeps the ASOF window incremental through a result diff.
+# A key whose lineage covers every source but is not a proven direct key (a DOUBLE
+# cast does not identify partitions exactly) keeps the ASOF window incremental through
+# a result diff.
 statement ok
 CREATE TABLE asof_cast_trades (id INT, k INT, ts INT);
 CREATE TABLE asof_cast_prices (k INT, ts INT, price INT);
@@ -712,12 +713,12 @@ INSERT INTO asof_cast_trades VALUES (1,1,10),(2,1,20),(3,2,30);
 INSERT INTO asof_cast_prices VALUES (1,1,120),(1,15,150),(2,20,200);
 CREATE VIEW asof_cast_expected AS
     SELECT t.id,t.k,t.ts,p.price,row_number() OVER (PARTITION BY t.k ORDER BY t.id) AS rn
-    FROM (SELECT id,k::VARCHAR AS k,ts FROM asof_cast_trades) t
-    ASOF JOIN (SELECT k::VARCHAR AS k,ts,price FROM asof_cast_prices) p ON t.k=p.k AND t.ts>=p.ts;
+    FROM (SELECT id,k::DOUBLE AS k,ts FROM asof_cast_trades) t
+    ASOF JOIN (SELECT k::DOUBLE AS k,ts,price FROM asof_cast_prices) p ON t.k=p.k AND t.ts>=p.ts;
 CREATE MATERIALIZED VIEW asof_cast_mv AS
     SELECT t.id,t.k,t.ts,p.price,row_number() OVER (PARTITION BY t.k ORDER BY t.id) AS rn
-    FROM (SELECT id,k::VARCHAR AS k,ts FROM asof_cast_trades) t
-    ASOF JOIN (SELECT k::VARCHAR AS k,ts,price FROM asof_cast_prices) p ON t.k=p.k AND t.ts>=p.ts;
+    FROM (SELECT id,k::DOUBLE AS k,ts FROM asof_cast_trades) t
+    ASOF JOIN (SELECT k::DOUBLE AS k,ts,price FROM asof_cast_prices) p ON t.k=p.k AND t.ts>=p.ts;
 
 query II
 SELECT type, lineage_json LIKE '%"proven_columns":[]%' FROM openivm_views WHERE view_sql_name = 'asof_cast_mv';
@@ -751,3 +752,53 @@ WHERE operation = 'refresh'
   AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'asof_cast_mv');
 ----
 true
+
+# A VARCHAR cast of an integer key identifies the same partitions, so the ASOF window
+# is scoped through its lineage instead of a result diff.
+statement ok
+CREATE TABLE asof_text_trades (id INT, k INT, ts INT);
+CREATE TABLE asof_text_prices (k INT, ts INT, price INT);
+INSERT INTO asof_text_trades VALUES (1,1,10),(2,1,20),(3,2,30);
+INSERT INTO asof_text_prices VALUES (1,1,120),(1,15,150),(2,20,200);
+CREATE VIEW asof_text_expected AS
+    SELECT t.id,t.k,t.ts,p.price,row_number() OVER (PARTITION BY t.k ORDER BY t.id) AS rn
+    FROM (SELECT id,k::VARCHAR AS k,ts FROM asof_text_trades) t
+    ASOF JOIN (SELECT k::VARCHAR AS k,ts,price FROM asof_text_prices) p ON t.k=p.k AND t.ts>=p.ts;
+CREATE MATERIALIZED VIEW asof_text_mv AS
+    SELECT t.id,t.k,t.ts,p.price,row_number() OVER (PARTITION BY t.k ORDER BY t.id) AS rn
+    FROM (SELECT id,k::VARCHAR AS k,ts FROM asof_text_trades) t
+    ASOF JOIN (SELECT k::VARCHAR AS k,ts,price FROM asof_text_prices) p ON t.k=p.k AND t.ts>=p.ts;
+
+query II
+SELECT type, lineage_json LIKE '%"proven_columns":["k"]%' FROM openivm_views WHERE view_sql_name = 'asof_text_mv';
+----
+5	true
+
+statement ok
+INSERT INTO asof_text_trades VALUES (4,1,13),(5,2,35),(6,3,40);
+INSERT INTO asof_text_prices VALUES (3,30,300);
+UPDATE asof_text_prices SET price=160 WHERE k=1 AND ts=15;
+UPDATE asof_text_trades SET ts=16 WHERE id=4;
+DELETE FROM asof_text_trades WHERE id IN (1,5);
+DELETE FROM asof_text_prices WHERE k=2;
+
+statement ok
+PRAGMA refresh('asof_text_mv');
+
+query I
+SELECT count(*) FROM (
+    (FROM asof_text_mv EXCEPT ALL FROM asof_text_expected)
+    UNION ALL
+    (FROM asof_text_expected EXCEPT ALL FROM asof_text_mv)
+);
+----
+0
+
+query II
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_changed_partitions')) > 0,
+       count(*) FILTER (WHERE contains(sql, 'openivm_window_current')) = 0
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'asof_text_mv');
+----
+true	true

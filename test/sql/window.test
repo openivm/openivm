@@ -2050,3 +2050,101 @@ true
 
 statement ok
 SET SESSION default_collation = '';
+
+# A partition key whose name starts with the metadata encoding prefix is never read
+# back as an encoded mapping, whether or not the view outputs it.
+statement ok
+CREATE TABLE window_prefix_src (id INT, a INT, b INT, "json:[""a"",""b""]" INT);
+INSERT INTO window_prefix_src VALUES (1,10,100,1),(2,20,200,1),(3,30,300,2),(4,40,400,2);
+CREATE VIEW window_prefix_hidden_expected AS
+    SELECT id, a, row_number() OVER (PARTITION BY "json:[""a"",""b""]" ORDER BY id) AS rn FROM window_prefix_src;
+CREATE VIEW window_prefix_visible_expected AS
+    SELECT id, a, "json:[""a"",""b""]", row_number() OVER (PARTITION BY "json:[""a"",""b""]" ORDER BY id) AS rn
+    FROM window_prefix_src;
+CREATE MATERIALIZED VIEW window_prefix_hidden AS
+    SELECT id, a, row_number() OVER (PARTITION BY "json:[""a"",""b""]" ORDER BY id) AS rn FROM window_prefix_src;
+CREATE MATERIALIZED VIEW window_prefix_visible AS
+    SELECT id, a, "json:[""a"",""b""]", row_number() OVER (PARTITION BY "json:[""a"",""b""]" ORDER BY id) AS rn
+    FROM window_prefix_src;
+
+query T
+SELECT group_columns FROM openivm_views WHERE view_sql_name = 'window_prefix_hidden';
+----
+json:{"window_columns":[],"requires_result_diff":"false"}
+
+statement ok
+INSERT INTO window_prefix_src VALUES (5,50,500,1),(6,60,600,3);
+UPDATE window_prefix_src SET "json:[""a"",""b""]" = 2 WHERE id = 1;
+UPDATE window_prefix_src SET a = 21 WHERE id = 2;
+DELETE FROM window_prefix_src WHERE id IN (4, 6);
+
+statement ok
+PRAGMA refresh('window_prefix_hidden');
+PRAGMA refresh('window_prefix_visible');
+
+foreach mv window_prefix_hidden window_prefix_visible
+
+query I
+SELECT count(*) FROM (
+    (FROM {mv} EXCEPT ALL FROM {mv}_expected)
+    UNION ALL
+    (FROM {mv}_expected EXCEPT ALL FROM {mv})
+);
+----
+0
+
+endloop
+
+# A stored output that is an injective text cast of the window key (integer, DATE or
+# UUID to VARCHAR) still identifies the affected partitions through lineage.
+foreach keytype INT DATE UUID
+
+statement ok
+CREATE TABLE window_text_key_s_{keytype} (id INT, k {keytype}, v INT);
+CREATE TABLE window_text_key_d_{keytype} (k {keytype}, w INT);
+CREATE MACRO window_text_key_{keytype}(i) AS CASE '{keytype}'
+    WHEN 'INT' THEN i::VARCHAR WHEN 'DATE' THEN (DATE '2026-01-01' + i::INT)::VARCHAR
+    ELSE printf('00000000-0000-0000-0000-%012d', i) END;
+INSERT INTO window_text_key_s_{keytype} SELECT i, window_text_key_{keytype}(i % 5)::{keytype}, i % 7 FROM range(40) t(i);
+INSERT INTO window_text_key_d_{keytype} SELECT window_text_key_{keytype}(i)::{keytype}, i % 3 FROM range(5) t(i);
+CREATE VIEW window_text_key_expected_{keytype} AS
+    SELECT s.id, s.k::VARCHAR AS k, d.w, row_number() OVER (PARTITION BY s.k ORDER BY s.id) AS rn
+    FROM window_text_key_s_{keytype} s JOIN window_text_key_d_{keytype} d ON s.k = d.k;
+CREATE MATERIALIZED VIEW window_text_key_mv_{keytype} AS
+    SELECT s.id, s.k::VARCHAR AS k, d.w, row_number() OVER (PARTITION BY s.k ORDER BY s.id) AS rn
+    FROM window_text_key_s_{keytype} s JOIN window_text_key_d_{keytype} d ON s.k = d.k;
+
+query II
+SELECT type, lineage_json LIKE '%"proven_columns":["k"]%' FROM openivm_views
+WHERE view_sql_name = 'window_text_key_mv_{keytype}';
+----
+5	true
+
+statement ok
+INSERT INTO window_text_key_s_{keytype} VALUES (100, window_text_key_{keytype}(1)::{keytype}, 1), (101, window_text_key_{keytype}(2)::{keytype}, 2);
+DELETE FROM window_text_key_s_{keytype} WHERE id IN (6, 101);
+UPDATE window_text_key_s_{keytype} SET k = window_text_key_{keytype}(4)::{keytype} WHERE id = 7;
+UPDATE window_text_key_d_{keytype} SET w = 9 WHERE k = window_text_key_{keytype}(3)::{keytype};
+DELETE FROM window_text_key_d_{keytype} WHERE k = window_text_key_{keytype}(0)::{keytype};
+
+statement ok
+PRAGMA refresh('window_text_key_mv_{keytype}');
+
+query I
+SELECT count(*) FROM (
+    (FROM window_text_key_mv_{keytype} EXCEPT ALL FROM window_text_key_expected_{keytype})
+    UNION ALL
+    (FROM window_text_key_expected_{keytype} EXCEPT ALL FROM window_text_key_mv_{keytype})
+);
+----
+0
+
+query I
+SELECT bool_or(contains(sql, 'openivm_changed_partitions')) AND NOT bool_or(contains(sql, 'openivm_window_current'))
+FROM openivm_compiled_statements
+WHERE operation = 'refresh'
+  AND view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'window_text_key_mv_{keytype}');
+----
+true
+
+endloop
