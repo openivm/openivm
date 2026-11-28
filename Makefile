@@ -15,6 +15,14 @@ test_release_internal: test_regular_nterm_compiled
 test_regular_nterm_compiled:
 	python3 test/integration/test_regular_nterm_compiled.py ./build/release/duckdb
 
+.PHONY: test_window_cascade_compiled
+
+# Skipped when the build has no DuckLake extension (it is built only with vcpkg).
+test_release_internal: test_window_cascade_compiled
+
+test_window_cascade_compiled:
+	python3 test/integration/test_window_cascade_compiled.py ./build/release/duckdb
+
 .PHONY: test_scheduler_catalog
 
 test_release_internal: test_scheduler_catalog
