@@ -3572,6 +3572,8 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
                                     const vector<string> &output_names, RefreshMetadata::WindowPartitionLineage &out,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
 	out = RefreshMetadata::WindowPartitionLineage();
+	// An empty proof is still a proof: refresh must not plan the view again to look for one.
+	out.proven_columns.emplace();
 	if (direct_out) {
 		direct_out->clear();
 	}
@@ -3751,7 +3753,6 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			}
 		}
 	}
-	out.proven_columns.emplace();
 	for (const auto &entry : covered) {
 		if (entry.second.size() != facts.source_occurrences.size()) {
 			continue;
@@ -4508,6 +4509,10 @@ void ResolveWindowOutputNames(const CreateMVPlanFacts &facts, vector<string> &pa
 			} else if (order) {
 				partition_columns.clear();
 				return;
+			} else {
+				// Refreshing by the remaining keys still covers every partition of this one.
+				OPENIVM_DEBUG_PRINT("[WINDOW] Partition key '%s' has no stored output; scoping without it\n",
+				                    partition_column.c_str());
 			}
 			continue;
 		}

@@ -253,7 +253,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 
 string BuildDeltaViewModelLineageJson(const DeltaViewModel &model, idx_t &entry_count) {
 	vector<string> entries;
-	if (!model.window_lineage.ops.empty()) {
+	if (!model.window_lineage.ops.empty() || model.window_lineage.proven_columns) {
 		entries.push_back(RefreshMetadata::WindowPartitionLineageToJson(model.window_lineage));
 	}
 	if (model.has_projection_lineage) {

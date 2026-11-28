@@ -255,8 +255,7 @@ void PropagateRefreshCollation(ClientContext &from, ClientContext &to, RefreshMe
                                const string &view_name) {
 	// Window refreshes use the caller's collation to reconstruct changed partitions.
 	// Other refresh strategies still compile uncollated keys using the helper's default.
-	auto collation = Settings::Get<DefaultCollationSetting>(from);
-	if (collation == Settings::Get<DefaultCollationSetting>(to) ||
+	if (Settings::Get<DefaultCollationSetting>(from) == Settings::Get<DefaultCollationSetting>(to) ||
 	    metadata.GetViewType(view_name) != RefreshType::WINDOW_PARTITION) {
 		return;
 	}
@@ -268,7 +267,7 @@ void PropagateRefreshCollation(ClientContext &from, ClientContext &to, RefreshMe
 		OPENIVM_DEBUG_PRINT("[REFRESH] Keeping helper collation for legacy window view '%s'\n", view_name.c_str());
 		return;
 	}
-	Settings::Set<DefaultCollationSetting>(to, SetScope::SESSION, Value(std::move(collation)));
+	SqlUtils::CopyDefaultCollation(from, to);
 }
 
 namespace {

@@ -1876,7 +1876,9 @@ vector<string> RefreshMetadata::ReadViewList(const string &view_name, const stri
 }
 
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
-	return ReadViewList(view_name, "group_columns");
+	auto text = ReadViewString(view_name, "group_columns");
+	// A window view stores partition mappings here, which are not GROUP BY keys.
+	return StringUtil::StartsWith(text, WINDOW_COLUMN_LIST_PREFIX) ? vector<string>() : DecodeViewList(text);
 }
 
 string RefreshMetadata::SerializeWindowColumn(const string &output, const string &source, bool tagged) {

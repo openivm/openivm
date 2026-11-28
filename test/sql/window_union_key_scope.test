@@ -283,6 +283,14 @@ WITH pooled AS (
 )
 SELECT entity, origin, ts, val FROM ranked WHERE rn = 1 AND val > 0;
 
+# A view whose lineage proves no key stores that empty proof, so refresh does not plan the
+# view again to look for one.
+query I
+SELECT bool_and(lineage_json LIKE '%"k":"window_partition"%"proven_columns":[]%')
+FROM openivm_views WHERE view_sql_name IN ('uks_neg_distinct', 'uks_neg_filter');
+----
+true
+
 # None of them may scope through source deltas. A visible partition key falls back to a
 # diff of the recomputed result; without one the whole view is recomputed.
 

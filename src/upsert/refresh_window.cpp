@@ -707,6 +707,9 @@ static ReboundWindowPartition RebindWindowPartitionLineage(Connection &con, cons
 			auto facts =
 			    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(*con.context).catalog);
 			BuildWindowPartitionLineageOps(facts, partitions, column_names, rebound.lineage);
+			if (!rebound.lineage.proven_columns || rebound.lineage.proven_columns->empty()) {
+				BuildLinearWindowPartitionLineageOps(facts, partitions, column_names, rebound.lineage);
+			}
 			rebound.requires_result_diff =
 			    WindowPlanRequiresResultDiff(facts, partitions, column_names, rebound.lineage);
 		});
@@ -905,6 +908,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	auto read_lineage = [&](bool require_proof) {
 		RefreshMetadata::WindowPartitionLineage lineage;
 		metadata.GetWindowPartitionLineage(view_name, lineage);
+		// Current views store their proof, even an empty one. Only legacy views are planned again to recover it.
 		if (require_proof && !lineage.proven_columns) {
 			auto &bound = get_rebound();
 			lineage = bound.requires_result_diff ? RefreshMetadata::WindowPartitionLineage() : std::move(bound.lineage);
