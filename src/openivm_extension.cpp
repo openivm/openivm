@@ -33,10 +33,6 @@
 
 namespace duckdb {
 
-// Global daemon instance — started unconditionally at extension load.
-// The daemon sleeps and periodically checks for scheduled views; no work if none exist.
-static shared_ptr<RefreshDaemon> global_daemon;
-
 static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context, TableFunctionBindInput &input,
                                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
@@ -99,8 +95,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	     Value("downstream")},
 	    {"openivm_adaptive_backoff", "auto-increase refresh interval when refresh takes longer than the interval",
 	     LogicalType::BOOLEAN, on},
-	    {"openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)", LogicalType::BOOLEAN,
-	     off},
 	    {openivm::METADATA_LEASE_SETTING,
 	     "seconds a client of a remote metadata catalog owns a view's refresh before another client may take it over "
 	     "(renewed while the refresh runs)",
@@ -195,6 +189,33 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    }
 		    parameter = Value(mode);
 	    });
+
+	// The daemon belongs to the database, so its settings are database-wide: plain SET applies globally,
+	// and the daemon's own connection sees it. The daemon reads openivm_disable_daemon on every cycle.
+	db_config.AddExtensionOption("openivm_disable_daemon",
+	                             "disable this database's refresh daemon (for shadow/compile-only DBs); "
+	                             "PRAGMA refresh_start_daemon starts one anyway",
+	                             LogicalType::BOOLEAN, off, nullptr, SetScope::GLOBAL);
+	db_config.AddExtensionOption(
+	    RefreshDaemon::WAKE_SECONDS_SETTING, "seconds between the refresh daemon's checks for due views",
+	    LogicalType::BIGINT, Value::BIGINT(RefreshDaemon::DEFAULT_WAKE_SECONDS),
+	    [](ClientContext &context, SetScope scope, Value &parameter) {
+		    if (scope == SetScope::SESSION) {
+			    throw InvalidInputException("%s is database-wide; use SET or SET GLOBAL, not SET SESSION",
+			                                RefreshDaemon::WAKE_SECONDS_SETTING);
+		    }
+		    auto seconds = parameter.IsNull() ? RefreshDaemon::DEFAULT_WAKE_SECONDS : parameter.GetValue<int64_t>();
+		    if (seconds < 1 || seconds > RefreshDaemon::MAX_WAKE_SECONDS) {
+			    throw InvalidInputException("%s must be between 1 and %lld", RefreshDaemon::WAKE_SECONDS_SETTING,
+			                                static_cast<long long>(RefreshDaemon::MAX_WAKE_SECONDS));
+		    }
+		    parameter = Value::BIGINT(seconds);
+		    auto daemon = RefreshDaemon::Get(*context.db);
+		    if (daemon) {
+			    daemon->SetWakeSeconds(seconds);
+		    }
+	    },
+	    SetScope::GLOBAL);
 
 	// Metadata placement is a property of the database, not of one session: two sessions
 	// using different locations would split one database's materialized views. Plain SET
@@ -399,11 +420,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    // Check daemon status
 		    string status = "'idle'";
 		    string effective_interval = interval_str;
-		    if (global_daemon) {
-			    if (global_daemon->IsRefreshing(view_key)) {
+		    auto daemon = RefreshDaemon::Get(*context.db);
+		    if (daemon) {
+			    if (daemon->IsRefreshing(view_key)) {
 				    status = "'refreshing'";
 			    }
-			    auto eff = global_daemon->GetEffectiveInterval(view_key);
+			    auto eff = daemon->GetEffectiveInterval(view_key);
 			    if (eff > 0) {
 				    effective_interval = to_string(eff);
 			    }
@@ -430,20 +452,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    if (!context.transaction.IsAutoCommit()) {
 			    throw TransactionException("The OpenIVM refresh daemon cannot be restarted inside a transaction");
 		    }
-		    if (global_daemon) {
-			    global_daemon->Stop();
-		    }
-		    global_daemon = make_shared_ptr<RefreshDaemon>();
-		    global_daemon->Start(*context.db);
-		    global_daemon->Wake();
+		    RefreshDaemon::Start(*context.db, true);
 		    return "SELECT true AS started;";
 	    },
 	    {}));
 
-	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).
+	// Start this database's refresh daemon unless disabled (e.g. shadow/compile-only DBs).
+	// The database owns it, so other databases in the process keep their own daemons.
 	if (!SqlUtils::GetBoolSetting(*con.context, "openivm_disable_daemon", false)) {
-		global_daemon = make_shared_ptr<RefreshDaemon>();
-		global_daemon->Start(instance);
+		RefreshDaemon::Start(instance);
 	}
 }
 

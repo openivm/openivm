@@ -116,7 +116,8 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_adaptive_refresh` | BOOLEAN | `false` | Experimental: pick incremental or full refresh per run with the learned cost model | [Refresh strategies](docs/refresh/refresh-strategies.md) |
 | `openivm_cost_decay` | DOUBLE | `0.9` | Decay factor (0.0–1.0) for the learned cost model; higher adapts more slowly | [Cost model](docs/internals/cost_model.md) |
 | `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than interval | [Automatic refresh](docs/refresh/automatic-refresh.md) |
-| `openivm_disable_daemon` | BOOLEAN | `false` | Do not start the background refresh daemon at extension load | [Automatic refresh](docs/refresh/automatic-refresh.md) |
+| `openivm_disable_daemon` | BOOLEAN | `false` | Do not start the background refresh daemon at extension load; set later, the daemon skips its cycles | [Automatic refresh](docs/refresh/automatic-refresh.md) |
+| `openivm_daemon_wake_seconds` | BIGINT | `30` | Seconds between the refresh daemon's checks for due views | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_profile_retention_days` | BIGINT | `31` | Delete profile rows older than this many days when profiling writes new rows | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_metadata_schema` | VARCHAR | empty | Schema for OpenIVM control metadata in each native catalog. Empty keeps existing metadata where it is (`main` for new metadata); a schema name moves existing metadata there on the next `CREATE MATERIALIZED VIEW` or refresh | [Metadata placement](docs/internals/metadata-placement.md) |
@@ -165,7 +166,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `PRAGMA refresh_status('view_name')` | Show refresh interval, last/next refresh, daemon status, and refresh strategy | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `PRAGMA refresh_cost('view_name')` | Show incremental refresh vs full recompute cost estimate (static + calibrated) | [Cost model](docs/internals/cost_model.md) |
 | `PRAGMA refresh_history('view_name')` | Show refresh execution history (for learned cost model) | [Refresh strategies](docs/refresh/refresh-strategies.md) |
-| `PRAGMA refresh_start_daemon` | (Re)start the background refresh daemon; not allowed inside a transaction | — |
+| `PRAGMA refresh_start_daemon` | (Re)start the current database's background refresh daemon; not allowed inside a transaction | — |
 | `PRAGMA openivm_files('view_name')` | Show paths and status of the compiled SQL reference files | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
 | `PRAGMA openivm_declare_rely_fk(child_table, child_columns, parent_table, parent_columns)` | Declare a trusted (RELY) foreign key used by FK-aware join pruning | — |
 | `openivm_compile_with_facts(view_name, facts_json)` | Table function: compile a refresh program as rows without executing it | [Build: compiled SQL](docs/build/building.md#inspect-or-save-compiled-sql-without-files) |

@@ -1,6 +1,6 @@
 # Automatic Refresh
 
-OpenIVM can automatically refresh materialized views on a schedule using `REFRESH EVERY`. A background daemon thread checks for due views every 30 seconds and refreshes them using the same `PRAGMA refresh()` pipeline.
+OpenIVM can automatically refresh materialized views on a schedule using `REFRESH EVERY`. A background daemon thread checks for due views every 30 seconds (`openivm_daemon_wake_seconds`) and refreshes them using the same `PRAGMA refresh()` pipeline.
 
 ## Syntax
 
@@ -29,9 +29,9 @@ Manual `PRAGMA refresh()` still works on views with `REFRESH EVERY` — the two 
 
 ## How it works
 
-The refresh daemon is a background `std::thread` started at extension load. It:
+Each database that loads OpenIVM gets its own refresh daemon, a background `std::thread` started at extension load and owned by that database. Several databases in one process each keep their own schedule. Closing a database stops its daemon; if a scheduling cycle is running at that moment, its refreshes finish first (as long as the process keeps running) and the daemon then closes the database. Nothing waits for a daemon at process exit: exiting during a cycle can crash the process, and the unfinished refresh's deltas stay pending for the next refresh. The daemon:
 
-1. Wakes every 30 seconds
+1. Wakes every `openivm_daemon_wake_seconds` seconds (default 30)
 2. Queries `openivm_views` in every attached catalog that has OpenIVM metadata for views with `refresh_interval IS NOT NULL`
 3. For each view where `now() - MIN(last_update)` over its sources is at least the (possibly backed-off) interval, or that has no source watermark: calls `PRAGMA refresh_options('<catalog>', '<schema>', '<view>')`
 4. Waits for any active OpenIVM mutation, then refreshes the due view
@@ -40,7 +40,7 @@ Views refreshed through a cascade earlier in the same cycle are not refreshed ag
 
 The daemon reads settings through its own connection, so it sees global values only. Use `SET GLOBAL` for settings that should affect scheduled refreshes, for example `SET GLOBAL openivm_cascade_refresh = 'both'`.
 
-`PRAGMA refresh_start_daemon` stops any running daemon, starts a new one on the caller's database, and wakes it immediately. It returns `started = true` and cannot run inside a transaction.
+`PRAGMA refresh_start_daemon` stops the caller's database's daemon if it runs, starts a new one for that database, and wakes it immediately. Daemons of other databases are not affected. A daemon started this way runs even when `openivm_disable_daemon` is set. It returns `started = true` and cannot run inside a transaction.
 
 ## Checking refresh status
 
@@ -104,7 +104,8 @@ Automatic refresh uses the same database-wide mutation gate as manual `PRAGMA re
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than the interval (daemon reads the global value) |
-| `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon at extension load |
+| `openivm_disable_daemon` | BOOLEAN | `false` | Database-wide. Set at extension load, no daemon is started; set later, the daemon skips its cycles until it is cleared. Does not affect a daemon started by `PRAGMA refresh_start_daemon` |
+| `openivm_daemon_wake_seconds` | BIGINT | `30` | Database-wide; seconds between the daemon's checks for due views (1 to 86400). Takes effect immediately |
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` |
 | `openivm_profile_retention_days` | BIGINT | `31` | Delete profile rows older than this many days when profiling writes new rows |
 

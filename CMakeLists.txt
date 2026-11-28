@@ -158,6 +158,9 @@ if(NOT EMSCRIPTEN)
 
   add_executable(concurrency_test test/integration/concurrency_test.cpp)
   target_link_libraries(concurrency_test ${OPENIVM_LINK_LIBS})
+
+  add_executable(daemon_lifetime_test test/integration/daemon_lifetime_test.cpp)
+  target_link_libraries(daemon_lifetime_test ${OPENIVM_LINK_LIBS})
 endif()
 
 # Benchmark tools are currently supported on Unix native platforms.
@@ -208,6 +211,7 @@ foreach(
   benchmark_metadata_test
   source_delta_publication_test
   concurrency_test
+  daemon_lifetime_test
   tpcc_setup
   rewriter_benchmark
   daemon_benchmark
