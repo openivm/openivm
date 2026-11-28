@@ -2202,3 +2202,83 @@ endloop
 statement ok
 SET SESSION default_collation = '';
 SET openivm_snapshot_publication = false;
+
+# A forced view-delta cascade must receive the signed old/new rows of every affected
+# partition from each DuckLake window path: the single-source change feed, the joined
+# lineage change feed and the result diff a nested LIMIT requires.
+statement ok
+CREATE TABLE dl.cwd_src (id INT, grp VARCHAR, val INT);
+CREATE TABLE dl.cwd_dim (grp VARCHAR, w INT);
+INSERT INTO dl.cwd_src VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',15),(5,'c',1);
+INSERT INTO dl.cwd_dim VALUES ('a',1),('b',2),('c',3);
+CREATE VIEW cwd_single_expected AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM dl.cwd_src;
+CREATE VIEW cwd_join_expected AS
+    SELECT s.id, s.grp, s.val, d.w, ROW_NUMBER() OVER (PARTITION BY s.grp ORDER BY s.val, s.id) AS rn
+    FROM dl.cwd_src s JOIN dl.cwd_dim d ON s.grp = d.grp;
+CREATE VIEW cwd_limit_expected AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM (SELECT * FROM dl.cwd_src ORDER BY id LIMIT 4) t;
+CREATE MATERIALIZED VIEW dl.cwd_single AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM dl.cwd_src;
+CREATE MATERIALIZED VIEW dl.cwd_join AS
+    SELECT s.id, s.grp, s.val, d.w, ROW_NUMBER() OVER (PARTITION BY s.grp ORDER BY s.val, s.id) AS rn
+    FROM dl.cwd_src s JOIN dl.cwd_dim d ON s.grp = d.grp;
+CREATE MATERIALIZED VIEW dl.cwd_limit AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM (SELECT * FROM dl.cwd_src ORDER BY id LIMIT 4) t;
+
+statement ok
+INSERT INTO dl.cwd_src VALUES (6,'a',5),(7,'c',9),(8,'d',2);
+UPDATE dl.cwd_src SET val = 30 WHERE id = 1;
+DELETE FROM dl.cwd_src WHERE id IN (3, 8);
+UPDATE dl.cwd_src SET grp = 'c' WHERE id = 4;
+UPDATE dl.cwd_dim SET w = 7 WHERE grp = 'a';
+
+query III
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions(''dl'', ''main'', ''cwd_src''')) > 0,
+       count(*) FILTER (WHERE sql LIKE 'INSERT INTO dl.main.openivm_delta___openivm_mv_%'
+                          AND sql LIKE '%CAST(-1 AS INTEGER)%' AND sql LIKE '%CAST(1 AS INTEGER)%'),
+       count(*) FILTER (WHERE contains(sql, 'openivm_window_changed_'))
+FROM openivm_compile_with_facts('cwd_single', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind = 'data';
+----
+true	1	0
+
+query III
+SELECT count(*) FILTER (WHERE contains(sql, 'ducklake_table_insertions(''dl'', ''main'', ''cwd_dim''')) > 0,
+       count(*) FILTER (WHERE sql LIKE 'INSERT INTO dl.main.openivm_delta___openivm_mv_%'
+                          AND sql LIKE '%CAST(-1 AS INTEGER)%' AND sql LIKE '%CAST(1 AS INTEGER)%'),
+       count(*) FILTER (WHERE contains(sql, 'openivm_window_changed_'))
+FROM openivm_compile_with_facts('cwd_join', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind = 'data';
+----
+true	1	0
+
+query III
+SELECT count(*) FILTER (WHERE contains(sql, 'openivm_window_current_')) > 0,
+       count(*) FILTER (WHERE sql LIKE 'INSERT INTO dl.main.openivm_delta___openivm_mv_%'
+                          AND sql LIKE '%CAST(-1 AS INTEGER)%' AND sql LIKE '%CAST(1 AS INTEGER)%'),
+       count(*) FILTER (WHERE contains(sql, 'openivm_window_changed_'))
+FROM openivm_compile_with_facts('cwd_limit', '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}')
+WHERE stmt_kind = 'data';
+----
+true	1	0
+
+statement ok
+PRAGMA refresh('cwd_single');
+PRAGMA refresh('cwd_join');
+PRAGMA refresh('cwd_limit');
+
+foreach mv cwd_single cwd_join cwd_limit
+
+query I
+SELECT count(*) FROM (
+    (FROM dl.{mv} EXCEPT ALL FROM {mv}_expected)
+    UNION ALL
+    (FROM {mv}_expected EXCEPT ALL FROM dl.{mv})
+);
+----
+0
+
+endloop

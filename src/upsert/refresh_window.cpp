@@ -425,15 +425,36 @@ static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeSourceSpec &source
 	return "(" + current_lookup + " UNION ALL " + old_lookup + ")";
 }
 
-static string BuildAffectedPartitionRefreshSQL(const string &data_table, const string &view_query_sql,
-                                               const string &affected_keys_sql, const string &affected_temp_table,
+// cascade_delta names the view's own delta table when a downstream MV needs this refresh's signed row changes.
+static string BuildAffectedPartitionRefreshSQL(const string &view_name, const string &data_table,
+                                               const string &view_query_sql, const string &affected_keys_sql,
                                                const vector<string> &partition_cols,
-                                               RefreshPublicationScope *publication_scope) {
+                                               RefreshPublicationScope *publication_scope,
+                                               const string &cascade_delta) {
+	auto affected_temp_table = AffectedPartitionsTempTable(view_name);
 	auto output_columns = PartitionOutputColumns(partition_cols);
 	string target_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_target");
 	string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
 	if (publication_scope) {
 		publication_scope->columns = output_columns;
+	}
+	if (!cascade_delta.empty()) {
+		// Snapshot the affected partitions before and after so their signed difference feeds the view delta.
+		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION emits its affected-partition delta for '%s'\n",
+		                    view_name.c_str());
+		string sql = "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
+		sql += BuildSnapshotDeltaRefreshSQL(
+		    data_table, view_query_sql, cascade_delta,
+		    SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name),
+		    SqlUtils::QuoteIdentifier("openivm_new_" + view_name),
+		    "EXISTS (SELECT 1 FROM " + affected_temp_table + " openivm_aff WHERE " + target_match + ")", false);
+		auto cleanup = "DROP TABLE IF EXISTS " + affected_temp_table + ";\n";
+		if (!publication_scope) {
+			return sql + cleanup;
+		}
+		publication_scope->rows = affected_temp_table;
+		publication_scope->cleanup_sql = cleanup;
+		return sql;
 	}
 	return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
 	                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
@@ -459,6 +480,8 @@ struct WindowOutput {
 	const vector<LogicalType> &column_types;
 	SqlDialect dialect;
 	string default_collation;
+	// The view's own delta table when this refresh must emit its signed row changes, else empty.
+	string cascade_delta;
 
 	string KeyCollation(const string &column) const {
 		D_ASSERT(column_names.size() == column_types.size());
@@ -713,19 +736,19 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 		auto parsed = RefreshMetadata::ParseWindowColumn(spec);
 		return SqlUtils::QuoteIdentifier(parsed.second) + " AS " + SqlUtils::QuoteIdentifier(parsed.first);
 	});
-	string qtemp_affected = AffectedPartitionsTempTable(view_name);
 	auto changes = SqlUtils::DuckLakeChangesSQL(affected_select, loc.catalog_name, loc.schema_name, loc.table_name,
 	                                            old_snap, current_snap);
 	string affected_keys = ChangedPartitionKeysSQL(affected_cols, {"(" + changes + ")"});
-	if (!order_cols.empty()) {
+	// The compact row diff applies changes without a view delta, so cascading uses the partition snapshot.
+	if (!order_cols.empty() && output.cascade_delta.empty()) {
 		auto compact_diff = BuildDuckLakeWindowRowDiffRefreshSQL(view_name, data_table, view_query_sql, affected_keys,
 		                                                         partition_cols, order_cols, output, publication_scope);
 		if (!compact_diff.empty()) {
 			return compact_diff;
 		}
 	}
-	string upsert_query = BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, affected_keys, qtemp_affected,
-	                                                       partition_cols, publication_scope);
+	string upsert_query = BuildAffectedPartitionRefreshSQL(view_name, data_table, view_query_sql, affected_keys,
+	                                                       partition_cols, publication_scope, output.cascade_delta);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake change-feed, %zu "
 	                    "partition cols, old_snap=%ld, current_snap=%ld)\n",
 	                    partition_cols.size(), (long)old_snap, (long)current_snap);
@@ -813,8 +836,8 @@ static string BuildResultDiffPartitionRefreshSQL(const string &view_name, const 
                                                  RefreshPublicationScope *publication_scope) {
 	auto diff = BuildWindowResultDiff(view_name, data_table, view_query_sql, partition_cols, output);
 	return diff.setup +
-	       BuildAffectedPartitionRefreshSQL(data_table, diff.query, diff.affected_keys,
-	                                        AffectedPartitionsTempTable(view_name), partition_cols, publication_scope) +
+	       BuildAffectedPartitionRefreshSQL(view_name, data_table, diff.query, diff.affected_keys, partition_cols,
+	                                        publication_scope, output.cascade_delta) +
 	       diff.cleanup;
 }
 
@@ -825,7 +848,6 @@ static string BuildDuckLakeWindowRefreshWithLineage(
     const string &attached_db_schema_name, const RefreshMetadata::WindowPartitionLineage &lineage,
     const WindowOutput &output, RefreshPublicationScope *publication_scope) {
 	string affected_keys;
-	string qtemp_affected = AffectedPartitionsTempTable(view_name);
 	if (!lineage.ops.empty() &&
 	    BuildLineageDuckLakeAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition_cols,
 	                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
@@ -835,8 +857,8 @@ static string BuildDuckLakeWindowRefreshWithLineage(
 		                    delta_table_names.size());
 		// Conservative lineage can over-include partitions, but must cover every changed source.
 		// If lineage is incomplete, the full logical view diff below preserves correctness.
-		return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, affected_keys, qtemp_affected,
-		                                        partition_cols, publication_scope);
+		return BuildAffectedPartitionRefreshSQL(view_name, data_table, view_query_sql, affected_keys, partition_cols,
+		                                        publication_scope, output.cascade_delta);
 	}
 
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
@@ -860,8 +882,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		*uses_running_suffix = false;
 	}
 	auto dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
-	const WindowOutput output {column_names, column_types, dialect,
-	                           Settings::Get<DefaultCollationSetting>(*con.context)};
+	const WindowOutput output {
+	    column_names, column_types, dialect, Settings::Get<DefaultCollationSetting>(*con.context),
+	    emit_cascade_delta ? internal_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name)) : ""};
 	optional<bool> saved_result_diff;
 	auto partition_cols = metadata.GetWindowPartitionColumns(view_name, &saved_result_diff);
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
